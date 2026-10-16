@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=77.0.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "LunaEquivariance"
+version = "0.1.0"
+description = "High-performance SO(3)-equivariant operators for graph neural networks."
+readme = "README.md"
+authors = [{name = "HPC-AI-Team"}]
+license = "BSD-3-Clause"
+license-files = ["LICENSE", "src/third_party/cutlass/LICENSE.txt"]
+requires-python = ">=3.10"
+dependencies = ["torch>=2.8,<3", "numpy", "ninja", "e3nn>=0.6,<0.7"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/HPC-AI-Team/LunaEquivariance"
+Repository = "https://github.com/HPC-AI-Team/LunaEquivariance"
+Documentation = "https://hpc-ai-team.github.io/LunaEquivariance/"
+Issues = "https://github.com/HPC-AI-Team/LunaEquivariance/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=7,<9"]
+dev = ["LunaEquivariance[test]", "mypy>=1.10,<2", "build>=1,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["cuda: requires an NVIDIA GPU, CUDA toolkit and compiled kernels"]
+addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+follow_imports = "skip"
+ignore_missing_imports = true
+files = ["src/lunatp/utils/layout.py"]
+
+[tool.setuptools]
+package-dir = {LunaEquivariance = "src"}
+packages = [
+    "LunaEquivariance.nn.varlen_attention_conv",
+    "LunaEquivariance.nn.varlen_attention_conv.kernels",
+    "LunaEquivariance",
+    "LunaEquivariance.modules",
+    "LunaEquivariance.lunatp",
+    "LunaEquivariance.lunatp.utils",
+    "LunaEquivariance.lunatp.uuu",
+    "LunaEquivariance.lunatp.uuu.kernels",
+    "LunaEquivariance.lunatp.uuu_conv",
+    "LunaEquivariance.lunatp.uuu_conv.kernels",
+    "LunaEquivariance.lunatp.uvu",
+    "LunaEquivariance.lunatp.uvu.kernels",
+    "LunaEquivariance.lunatp.uvu_conv",
+    "LunaEquivariance.lunatp.uvu_conv.kernels",
+    "LunaEquivariance.lunatp.uvw",
+    "LunaEquivariance.lunatp.uvw.kernels",
+    "LunaEquivariance.lunatp.uvw_conv",
+    "LunaEquivariance.lunatp.uvw_conv.kernels",
+    "LunaEquivariance.nn",
+    "LunaEquivariance.nn.activation",
+    "LunaEquivariance.nn.activation.kernels",
+    "LunaEquivariance.nn.dropout",
+    "LunaEquivariance.nn.dropout.kernels",
+    "LunaEquivariance.nn.equ_norm",
+    "LunaEquivariance.nn.equ_norm.kernels",
+    "LunaEquivariance.nn.graph_softmax",
+    "LunaEquivariance.nn.graph_softmax.kernels",
+    "LunaEquivariance.nn.varlen_attention",
+    "LunaEquivariance.nn.varlen_attention.kernels",
+    "LunaEquivariance.nn.gate",
+    "LunaEquivariance.nn.gate.kernels",
+    "LunaEquivariance.nn.norm_activation",
+    "LunaEquivariance.nn.norm_activation.kernels",
+    "LunaEquivariance.o3",
+    "LunaEquivariance.o3.linear",
+    "LunaEquivariance.o3.linear.kernels",
+    "LunaEquivariance.o3.norm",
+    "LunaEquivariance.o3.norm.kernels",
+    "LunaEquivariance.o3.spherical_harmonics",
+    "LunaEquivariance.o3.spherical_harmonics.kernels",
+    "LunaEquivariance.utils",
+]
+include-package-data = false
+
+[tool.setuptools.package-data]
+"LunaEquivariance" = [
+    "third_party/cutlass/LICENSE.txt",
+    "third_party/cutlass/include/**/*.h",
+    "third_party/cutlass/include/**/*.hpp",
+    "third_party/cutlass/include/**/*.inl",
+]

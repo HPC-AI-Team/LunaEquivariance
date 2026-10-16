@@ -1,0 +1,12 @@
+include README.md LICENSE pyproject.toml MANIFEST.in
+recursive-include src *.py
+recursive-include src/third_party/cutlass *.h *.hpp *.inl *.txt
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include docs *.md *.rst *.py *.txt *.html
+recursive-include docs/_static *.svg *.png
+recursive-include docs/assets *.png
+prune docs/_build
+prune build
+prune dist
+global-exclude __pycache__ *.py[cod] *.so *.o *.ptx *.cubin

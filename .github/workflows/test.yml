@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: Run on a trusted self-hosted GPU runner
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install 'torch>=2.8,<3' --index-url https://download.pytorch.org/whl/cpu
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest tests -m 'not cuda' -q
+      - run: python -m mypy
+      - run: python -m build
+      - run: python -m pip install -r docs/requirements.txt
+      - run: python -m sphinx -b html -W --keep-going docs docs/_build/html
+  gpu:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_gpu
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 90
+    env:
+      MAX_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install -e '.[test]'
+      - run: python -c "import torch; assert torch.cuda.is_available(), 'GPU runner requires CUDA'"
+      - run: python -m pytest tests -q
