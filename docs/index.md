@@ -1,4 +1,4 @@
-# LunaEquivariance
+# Luna<wbr>Equivariance
 
 High-performance SO(3)-equivariant operators for graph neural networks.
 
@@ -21,7 +21,7 @@ See the [installation guide](installation.md) for requirements and setup.
 
 - [Supported operations](operators.rst): available operators and supported configurations.
 - [Public API](api.md): formulas, parameters and tensor shapes.
-- [Usage](usage.md): examples, testing and benchmarking.
+- [Usage](usage.md): examples and model integration.
 
 ```{toctree}
 :hidden:

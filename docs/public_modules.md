@@ -48,8 +48,14 @@ reference.load_state_dict(linear.state_dict(), strict=True)
 or a `TensorProductConfig`, preserving its weights:
 
 ```python
+from e3nn import o3 as e3nn_o3
 from LunaEquivariance import TensorProduct, TensorProductConv
 
+e3nn_tp = e3nn_o3.TensorProduct(
+    "8x1o", "2x1o", "8x0e",
+    [(0, 0, 0, "uvu", True)],
+    internal_weights=False, shared_weights=False,
+)
 product = TensorProduct(e3nn_tp)
 convolution = TensorProductConv(e3nn_tp)
 ```
@@ -63,7 +69,6 @@ For convolution, pass source-node features and edge features separately, and
 provide the connectivity with `graph=`.
 
 Internal weights are available as `module.weight`; checkpoint keys use the
-`tp.` prefix. When loading an older checkpoint with `op.tp.` keys, rename that
-prefix to `tp.` before loading.
+`tp.` prefix.
 
 For functional calls with explicit weights, see [Functions](quickstart.md#functions).

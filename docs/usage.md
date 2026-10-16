@@ -9,5 +9,4 @@ for model integration. Operator-specific examples are in the [Public API](api.md
 quickstart
 training
 public_modules
-benchmarks
 ```

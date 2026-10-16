@@ -33,8 +33,6 @@ An existing e3nn Activation can be passed as the first argument instead.
 ```
 ````
 
-Supports FP32 and FP64 on CUDA; CPU and FP16/BF16 inputs fall back to PyTorch.
-
 ## Function
 
 ```{py:function} LunaEquivariance.activation(features, irreps_in=None, acts=None, dim=-1)
@@ -56,7 +54,6 @@ num_atoms = 1024
 # x: (num_atoms, activation.irreps_in.dim)
 x = torch.randn(num_atoms, activation.irreps_in.dim, device="cuda", requires_grad=True)
 y = activation(x)  # (num_atoms, activation.irreps_out.dim)
-assert y.shape == x.shape
 y.square().mean().backward()
 ```
 
@@ -72,5 +69,6 @@ example `partial(torch.nn.functional.softplus, beta=2.0, threshold=10.0)`.
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
-- Only the [listed activation functions](#supported-activations) are supported; custom functions and in-place activations are not supported.
+- GPU acceleration requires compute capability 8.0 or later.
+- Only the [listed activation functions](#supported-activations) are supported. Custom functions and in-place activations are not supported.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

@@ -62,8 +62,6 @@ An existing e3nn Linear can be passed instead of the irrep arguments.
 ```
 ````
 
-Supports FP32 and FP64 on CUDA; CPU and FP16/BF16 inputs fall back to PyTorch.
-
 ## Function
 
 ```{py:function} LunaEquivariance.linear(features, weight=None, bias=None, *, irreps_in=None, irreps_out=None, f_in=None, f_out=None, shared_weights=True, instructions=None, biases=False, path_normalization="element", dtype=None, config=None)
@@ -95,11 +93,10 @@ num_atoms = 1024
 # x: (num_atoms, linear.irreps_in.dim)
 x = torch.randn(num_atoms, linear.irreps_in.dim, device="cuda", requires_grad=True)
 y = linear(x)  # (num_atoms, linear.irreps_out.dim)
-assert y.shape == (num_atoms, linear.irreps_out.dim)
 y.square().mean().backward()
-assert linear.weight.grad is not None
 ```
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
+- GPU acceleration requires compute capability 8.0 or later.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

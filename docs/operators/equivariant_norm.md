@@ -91,8 +91,6 @@ Grouping changes the denominator; scalar means are computed separately per block
 ```
 ````
 
-Supports FP32 and FP64 on CUDA. CPU and FP16/BF16 inputs use the PyTorch implementation.
-
 ## Function
 
 ```{py:function} LunaEquivariance.equivariant_norm(x, irreps, weight=None, bias=None, *, norm="layer", grouping="merged", weighting="component", layout="mul_ir", eps=None, stat_weights=None, config=None)
@@ -120,9 +118,7 @@ normalization = nn.EquivariantNorm(irreps, norm="layer").cuda()
 num_atoms = 1024
 x = torch.randn(num_atoms, irreps.dim, device="cuda", requires_grad=True)  # (num_atoms, irreps.dim)
 y = normalization(x)  # (num_atoms, irreps.dim)
-assert y.shape == x.shape
 y.square().mean().backward()
-assert normalization.weight.grad is not None
 ```
 
 For a single `0e` block with `weighting="component"`,
@@ -143,3 +139,7 @@ for mode in ("layer", "rms"):
         normalization(x), reference(x, (num_channels,), eps=eps),
     )
 ```
+
+## Limitations
+
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

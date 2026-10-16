@@ -45,7 +45,6 @@ and `value_dim` are the query/key and value dimensions per head.
 ```
 ````
 
-Supports FP32, FP16 and BF16 on CUDA.
 Q, K and V use the same dtype. Outputs retain V's dtype, and gradients retain
 the dtype of their corresponding inputs. Computation uses FP32 accumulation.
 
@@ -77,7 +76,6 @@ k = torch.randn_like(q, requires_grad=True)  # (num_edges, num_heads * head_dim)
 # v: (num_edges, num_heads * value_dim)
 v = torch.randn(num_edges, num_heads * value_dim, device="cuda", dtype=dtype, requires_grad=True)
 out = attention(q, k, v, csr)  # (num_edges, num_heads * value_dim)
-assert out.shape == v.shape
 out.square().mean().backward()
 ```
 
@@ -119,5 +117,6 @@ the same permutation to both position axes of pair bias.
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
-- CPU and FP64 inputs are not supported.
+- Requires an NVIDIA GPU with compute capability 8.0 or later.
+- Rows in each CSR sequence are contiguous, with `q`, `k`, `v` and key bias in the same order. Inputs are not sorted internally.
+- Supported dtypes: FP32, FP16 and BF16.

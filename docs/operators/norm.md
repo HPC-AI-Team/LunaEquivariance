@@ -31,8 +31,6 @@ An existing e3nn Norm can be passed instead of `irreps_in`.
 ```
 ````
 
-Supports FP32 and FP64 on CUDA; CPU and FP16/BF16 inputs fall back to PyTorch.
-
 ## Function
 
 ```{py:function} LunaEquivariance.norm(features, irreps_in, squared=False, *, config=None)
@@ -56,11 +54,10 @@ num_atoms = 1024
 # x: (num_atoms, norm.irreps_in.dim)
 x = torch.randn(num_atoms, norm.irreps_in.dim, device="cuda", requires_grad=True)
 y = norm(x)  # (num_atoms, norm.irreps_in.num_irreps)
-assert y.shape == (num_atoms, norm.irreps_in.num_irreps)
 y.sum().backward()
-assert x.grad is not None
 ```
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
+- GPU acceleration requires compute capability 8.0 or later.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

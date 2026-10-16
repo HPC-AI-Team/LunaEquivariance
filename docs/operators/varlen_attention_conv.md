@@ -54,7 +54,6 @@ All floating inputs support derivatives through third order.
 ```
 ````
 
-Supports FP32, FP16 and BF16 on CUDA.
 Q, K and V use the same dtype. Outputs retain V's dtype, and gradients retain
 the dtype of their corresponding inputs. Computation uses FP32 accumulation.
 
@@ -112,6 +111,6 @@ out.index_add_(0, dst, messages)  # Sum incoming edge messages at each atom.
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
-- Edges in each CSR segment are contiguous, with `q`, `k`, `v`, `envelope` and key bias in the same order.
-- CPU and FP64 inputs are not supported.
+- Requires an NVIDIA GPU with compute capability 8.0 or later.
+- Edges in each CSR segment are contiguous, with `q`, `k`, `v`, `envelope` and key bias in the same order. Inputs are not sorted internally.
+- Supported dtypes: FP32, FP16 and BF16.

@@ -1,0 +1,6 @@
+{% set page_toc = generate_toc_html() %}
+{% if page_toc %}
+<nav id="pst-page-toc-nav" class="page-toc" aria-label="On this page">
+  {{ page_toc }}
+</nav>
+{% endif %}

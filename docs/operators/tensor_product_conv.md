@@ -80,6 +80,23 @@ See the module parameters above.
 
 ```
 
+## Graph construction
+
+```{py:function} LunaEquivariance.make_graph(src, dst, num_nodes=None)
+
+Build a graph once and reuse it across convolution layers with the same connectivity.
+`TensorProductConv.create_graph(src, dst, num_nodes)` is an equivalent entry point.
+
+:param src: Source-node indices of shape `(num_edges,)` or `(num_edges, 1)`, with dtype `torch.int32` or `torch.int64`.
+:type src: `torch.Tensor`
+:param dst: Destination-node indices with the same shape options and integer dtypes as `src`, sorted in ascending order. Keep `src`, edge features, per-edge weights and envelopes in the corresponding order.
+:type dst: `torch.Tensor`
+:param num_nodes: Total number of nodes, including isolated nodes. If omitted, inferred as the largest index in `src` or `dst` plus one, or zero for an empty graph.
+:type num_nodes: `int or None`
+:returns: A `LunaTPGraph` passed as `graph=` to the convolution.
+
+```
+
 ## Weight configuration
 
 The combinations below apply to weighted paths.
@@ -137,8 +154,6 @@ w = torch.randn(num_edges, cfg.weight_numel, device="cuda")  # (num_edges, cfg.w
 env = torch.ones(num_edges, 1, device="cuda")  # (num_edges, 1)
 # out: (num_atoms, cfg.irreps_out.dim); l0: (num_edges, l0_dim)
 out, l0 = conv(x, y, w, graph=graph, env=env, return_l0_feat=True)
-assert out.shape == (num_atoms, cfg.irreps_out.dim)
-assert l0.shape == (num_edges, cfg.irreps_out.num_irreps)
 ```
 
 ### UVU
@@ -176,7 +191,6 @@ y = torch.randn(num_edges, cfg.irreps_in2.dim, device="cuda")  # (num_edges, cfg
 w = torch.randn(num_edges, cfg.weight_numel, device="cuda")  # (num_edges, cfg.weight_numel)
 env = torch.ones(num_edges, 1, device="cuda")  # (num_edges, 1)
 out = conv(x, y, w, graph=graph, env=env)
-assert out.shape == (num_atoms, cfg.irreps_out.dim)
 # With return_l0_feat=True: out, l0 = conv(..., return_l0_feat=True)
 # l0: (num_edges, l0_dim), before envelope scaling and aggregation.
 ```
@@ -216,10 +230,9 @@ y = torch.randn(num_edges, cfg.irreps_in2.dim, device="cuda")  # (num_edges, cfg
 w = torch.randn(num_edges, cfg.weight_numel, device="cuda")  # (num_edges, cfg.weight_numel)
 env = torch.ones(num_edges, 1, device="cuda")  # (num_edges, 1)
 out = conv(x, y, w, graph=graph, env=env)  # (num_atoms, cfg.irreps_out.dim)
-assert out.shape == (num_atoms, cfg.irreps_out.dim)
 ```
 
-## Examples
+## Equivalent e3nn computation
 
 For an e3nn tensor product `tp` configured
 with the same paths, normalization and weights, the node output is:
@@ -248,6 +261,8 @@ the input edge order.
 
 ## Limitations
 
-- Multiplicities are constrained per path: UUU requires `mul_in1 = mul_in2 = mul_out`; UVU requires `mul_in1 = mul_out`; UVW allows independent multiplicities.
-- Building convolution graphs on the GPU requires compute capability 8.0 or later for all three connection modes.
-- Only CUDA FP32 and FP64 are supported.
+- `internal_weights` and `shared_weights` have mode-specific restrictions; see [Weight configuration](#weight-configuration).
+- For each path, UUU requires `mul_in1 = mul_in2 = mul_out`; UVU requires `mul_in1 = mul_out`.
+- Input edges need to be sorted by destination; see [Graph construction](#graph-construction).
+- NVIDIA GPUs only; UVW and GPU graph construction require compute capability 8.0 or later.
+- Supported dtypes: FP32 and FP64.

@@ -133,7 +133,6 @@ y = torch.randn(1, num_items, cfg.irreps_in2.dim, device="cuda")  # (1, num_item
 # w: (batch_size, num_items, cfg.weight_numel)
 w = torch.randn(batch_size, num_items, cfg.weight_numel, device="cuda")
 out = op(x, y, w)  # (batch_size, num_items, cfg.irreps_out.dim)
-assert out.shape == (batch_size, num_items, cfg.irreps_out.dim)
 ```
 
 ### UVU
@@ -169,7 +168,6 @@ x = torch.randn(num_edges, cfg.irreps_in1.dim, device="cuda")  # (num_edges, cfg
 y = torch.randn(num_edges, cfg.irreps_in2.dim, device="cuda")  # (num_edges, cfg.irreps_in2.dim)
 w = torch.randn(num_edges, cfg.weight_numel, device="cuda")  # (num_edges, cfg.weight_numel)
 out = op(x, y, w)  # (num_edges, cfg.irreps_out.dim)
-assert out.shape == (num_edges, cfg.irreps_out.dim)
 ```
 
 ### UVW
@@ -209,7 +207,6 @@ y = torch.randn(num_edges, cfg.irreps_in2.dim, device="cuda")  # (num_edges, cfg
 
 # Internal shared weights: (cfg.weight_numel,).
 out = op(x, y)  # (num_edges, cfg.irreps_out.dim)
-assert out.shape == (num_edges, cfg.irreps_out.dim)
 ```
 
 ## TensorProductConfig
@@ -219,38 +216,8 @@ assert out.shape == (num_edges, cfg.irreps_out.dim)
 Stores tensor-product instructions, normalization and optional learnable weights.
 Pass this object to `TensorProduct` or `TensorProductConv`; it does not implement `forward`.
 
-:param irreps_in1: Representations of the first input.
-:type irreps_in1: `str or Irreps`
-:param irreps_in2: Representations of the second input.
-:type irreps_in2: `str or Irreps`
-:param irreps_out: Representations of the output.
-:type irreps_out: `str or Irreps`
-:param instructions: Paths `(i_in1, i_in2, i_out, connection_mode, has_weight[, path_weight])`. The three indices select irrep blocks. `connection_mode` is `"uuu"`, `"uvu"` or `"uvw"`; a fused operator requires one mode across all paths. `has_weight` is a bool. The optional nonnegative `path_weight` defaults to `1.0` and enters the instruction normalization.
-:type instructions: `list of tuple`
-:param in1_var: One variance per block in `irreps_in1`, with length `len(irreps_in1)`. `None` uses `1.0` for every block.
-:type in1_var: `sequence of float or None`
-:param in2_var: One variance per block in `irreps_in2`, with length `len(irreps_in2)`. `None` uses `1.0` for every block.
-:type in2_var: `sequence of float or None`
-:param out_var: One variance per block in `irreps_out`, with length `len(irreps_out)`. `None` uses `1.0` for every block.
-:type out_var: `sequence of float or None`
-:param irrep_normalization: Irrep normalization. `None` selects `"component"`.
-
-    - `"component"`: Assume unit variance per input component; scale the output to the same convention.
-    - `"norm"`: Assume unit expected squared norm per input irrep copy; scale the output to the same convention.
-    - `"none"`: Do not apply irrep normalization.
-
-:type irrep_normalization: `{"component", "norm", "none"} or None`
-:param path_normalization: Path normalization. `None` selects `"element"`.
-
-    - `"element"`: Normalize each output over all contributing input elements.
-    - `"path"`: Normalize each path over its input elements, then normalize over paths.
-    - `"none"`: Do not apply path normalization.
-
-:type path_normalization: `{"element", "path", "none"} or None`
-:param internal_weights: Store learnable weights in the module. Defaults to `True` when weights are shared and weighted paths exist.
-:type internal_weights: `bool or None`
-:param shared_weights: Use one weight tensor for all batch elements. `None` selects `True`.
-:type shared_weights: `bool or None`
+Parameters have the same meanings and defaults as
+{py:class}`TensorProduct <LunaEquivariance.TensorProduct>`.
 
 ```
 
@@ -295,7 +262,7 @@ take an explicit graph.
 
 ## Limitations
 
-- Supported combinations of `internal_weights` and `shared_weights` are listed in [Weight configuration](#weight-configuration).
-- Multiplicities are constrained per path: UUU requires `mul_in1 = mul_in2 = mul_out`; UVU requires `mul_in1 = mul_out`; UVW allows independent multiplicities.
-- UVW requires compute capability 8.0 or later.
-- Only CUDA FP32 and FP64 are supported.
+- `internal_weights` and `shared_weights` have mode-specific restrictions; see [Weight configuration](#weight-configuration).
+- For each path, UUU requires `mul_in1 = mul_in2 = mul_out`; UVU requires `mul_in1 = mul_out`.
+- NVIDIA GPUs only; UVW requires compute capability 8.0 or later.
+- Supported dtypes: FP32 and FP64.

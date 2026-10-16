@@ -40,8 +40,6 @@ activations. An existing e3nn Gate can be passed as the first argument or as `ga
 ```
 ````
 
-Supports FP32 and FP64 on CUDA; CPU and FP16/BF16 inputs fall back to PyTorch.
-
 ## Function
 
 ```{py:function} LunaEquivariance.gate(features, irreps_scalars=None, act_scalars=None, irreps_gates=None, act_gates=None, irreps_gated=None)
@@ -64,11 +62,11 @@ num_atoms = 1024
 # x: (num_atoms, gate.irreps_in.dim)
 x = torch.randn(num_atoms, gate.irreps_in.dim, device="cuda", requires_grad=True)
 y = gate(x)  # (num_atoms, gate.irreps_out.dim)
-assert y.shape == (num_atoms, gate.irreps_out.dim)
 y.square().mean().backward()
 ```
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
-- Scalar and gate activations use the [supported activation functions](activation.md#supported-activations). Custom functions and in-place activations are not supported.
+- GPU acceleration requires compute capability 8.0 or later.
+- Scalar and gate activations are limited to the [supported activation functions](activation.md#supported-activations). Custom functions and in-place activations are not supported.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

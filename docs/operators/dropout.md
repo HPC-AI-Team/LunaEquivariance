@@ -32,8 +32,6 @@ An existing e3nn Dropout can be passed instead of `irreps` and `p`.
 ```
 ````
 
-Supports FP32 and FP64 on CUDA; CPU and FP16/BF16 inputs fall back to PyTorch.
-
 ## Function
 
 ```{py:function} LunaEquivariance.dropout(x, irreps, p, training=True, *, config=None)
@@ -61,7 +59,6 @@ batch_size, num_atoms = 32, 128
 # x: (batch_size, num_atoms, dropout.irreps.dim)
 x = torch.randn(batch_size, num_atoms, dropout.irreps.dim, device="cuda", requires_grad=True)
 y = dropout(x)  # (batch_size, num_atoms, dropout.irreps.dim)
-assert y.shape == x.shape
 y.square().mean().backward()
 
 dropout.eval()
@@ -70,4 +67,5 @@ assert dropout(x) is x
 
 ## Limitations
 
-- CUDA kernels require compute capability 8.0 or later. On older GPUs, eager execution falls back to PyTorch.
+- GPU acceleration requires compute capability 8.0 or later. On older GPUs, eager execution falls back to PyTorch.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

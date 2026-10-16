@@ -35,8 +35,6 @@ and {math}`b_i` is its optional scalar bias (zero when omitted). The batch index
 ```
 ````
 
-Supports FP32 and FP64 on CUDA; CPU and FP16/BF16 inputs fall back to PyTorch. CUDA FP32 inputs also use PyTorch when autocast is enabled.
-
 ## Function
 
 ```{py:function} LunaEquivariance.norm_activation(features, irreps_in, scalar_nonlinearity, normalize=True, epsilon=None, bias=None, *, config=None)
@@ -62,12 +60,11 @@ num_atoms = 1024
 # x: (num_atoms, activation.irreps_in.dim)
 x = torch.randn(num_atoms, activation.irreps_in.dim, device="cuda", requires_grad=True)
 y = activation(x)  # (num_atoms, activation.irreps_out.dim)
-assert y.shape == x.shape
 y.square().mean().backward()
-assert activation.biases.grad is not None
 ```
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
-- Only the [listed scalar nonlinearities](activation.md#supported-activations) are supported. Activation and normalization settings are fixed when the module is created.
+- GPU acceleration requires compute capability 8.0 or later.
+- Scalar nonlinearities are limited to the [supported activation functions](activation.md#supported-activations). Custom functions and in-place activations are not supported.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

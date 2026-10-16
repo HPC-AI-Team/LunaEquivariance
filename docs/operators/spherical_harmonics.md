@@ -17,7 +17,7 @@ evaluated directly on the input vectors. The output normalization is set by
 Repeated degrees are returned in the requested order. An existing e3nn
 SphericalHarmonics module can be passed as the first argument.
 
-:param irreps_out: Requested degrees or output representations. Degrees 0 through 12 are supported.
+:param irreps_out: Requested degrees or output representations.
 :type irreps_out: `int, list of int, str or Irreps`
 :param normalize: Normalize input vectors before evaluating the spherical harmonics.
 :type normalize: `bool`
@@ -41,8 +41,6 @@ SphericalHarmonics module can be passed as the first argument.
 
 ```
 ````
-
-Supports FP32 and FP64 on CUDA; CPU and FP16/BF16 inputs fall back to PyTorch.
 
 ## Function
 
@@ -68,7 +66,6 @@ num_edges = 1024
 x = torch.randn(num_edges, 3, device="cuda", requires_grad=True)  # (num_edges, 3): Cartesian edge vectors
 sh = o3.SphericalHarmonics([0, 1, 2, 3], normalize=True, normalization="component").cuda()
 y = sh(x)  # (num_edges, sh.irreps_out.dim)
-assert y.shape == (num_edges, sh.irreps_out.dim)
 y.square().mean().backward()
 
 functional = o3.spherical_harmonics([0, 1, 2, 3], x, True, "component")  # (num_edges, sh.irreps_out.dim)
@@ -77,4 +74,6 @@ torch.testing.assert_close(functional, y)
 
 ## Limitations
 
-- CUDA execution requires compute capability 8.0 or later.
+- GPU acceleration requires compute capability 8.0 or later.
+- Maximum degree: `l = 12`.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

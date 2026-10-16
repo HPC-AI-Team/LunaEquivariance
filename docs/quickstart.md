@@ -40,8 +40,8 @@ y.square().mean().backward()
 model.eval()  # Disables dropout.
 ```
 
-See [Training and integration](training.md) for optimizers, checkpoints and
-`torch.compile`.
+See [Training and integration](training.md) for optimizers and `torch.compile`,
+and [Checkpoints](public_modules.md#checkpoints) for loading e3nn weights.
 
 ## Tensor product
 
@@ -65,7 +65,7 @@ out = product(x, y, weight)  # (num_edges, product.irreps_out.dim)
 assert out.shape == (16, 8)
 ```
 
-Use `uuu` to multiply matching channels, or `uvw` to combine all input channels. The [supported-operations table](operators.rst) compares their weight modes.
+Use `uuu` to multiply matching channels, or `uvw` to combine all input channels. See [Weight configuration](operators/tensor_product.md#weight-configuration) for supported weight modes.
 
 ## Fused graph convolution
 

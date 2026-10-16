@@ -48,8 +48,6 @@ gradients, as in the PyTorch example below.
 ```
 ````
 
-Supports FP32 and FP64 on CUDA. CPU and FP16/BF16 inputs use the PyTorch implementation.
-
 ## Functions
 
 ```{py:function} LunaEquivariance.graph_softmax(data, csr, *, env=None, eps=1e-8, smooth_out=False)
@@ -91,7 +89,6 @@ data = torch.randn(num_edges, dim, device="cuda", requires_grad=True)
 env = torch.rand(num_edges, 1, device="cuda", requires_grad=True)
 softmax = nn.GraphSoftmax()
 out = softmax(data, csr, env=env)  # (num_edges, dim)
-assert out.shape == data.shape
 out.square().sum().backward()
 ```
 
@@ -109,4 +106,5 @@ if softmax.smooth_out:
 
 ## Limitations
 
-- Rows belonging to each segment are contiguous, with `data` and `env` in the same order. Neither the operator nor the CSR builder sorts input rows.
+- Rows in each CSR segment are contiguous, with `data` and `env` in the same order. Neither the operator nor the CSR builder sorts input rows.
+- FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.
