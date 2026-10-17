@@ -4,7 +4,7 @@ recursive-include src/third_party/cutlass *.h *.hpp *.inl *.txt
 recursive-include examples *.py
 recursive-include tests *.py
 recursive-include docs *.md *.rst *.py *.txt *.html
-recursive-include docs/_static *.svg *.png
+recursive-include docs/_static *.svg *.css *.js
 recursive-include docs/assets *.png
 prune docs/_build
 prune build
