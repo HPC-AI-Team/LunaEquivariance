@@ -9,19 +9,15 @@ from ....utils.precision import float_literal
 from ...activation.kernels.scalar import scalar_literal, emit_activation_aten_scalar
 
 from ....utils.extension import get_cuda_arch, combine_cuda_sources, load_cuda_extension
-
-ROLES = ("x", "bias", "grad_out", "rx", "rb", "bx", "bb", "bg")
-OUTPUTS = (
-    ("out",),
-    ("dx", "db"),
-    ("sx", "sb", "sg"),
-    ("tx", "tb", "tg", "trx", "trb"),
+from .graph import (
+    OUTPUTS, INPUT_ROLES, VECTOR_INPUTS, VECTOR_OUTPUTS, BIAS_OUTPUTS,
+    build_program, build_irrep_program,
 )
-INPUT_ROLES = (ROLES[:2], ROLES[:3], ROLES[:5], ROLES)
 
-VECTOR_INPUTS = frozenset(("x", "rx", "bx"))
-VECTOR_OUTPUTS = frozenset(("dx", "sx", "tx", "trx"))
-BIAS_OUTPUTS = frozenset(("db", "sb", "tb", "trb"))
+
+MAX_SHARED_BYTES = 48 * 1024
+FORWARD_BLOCK_SIZE = 128
+FORWARD_MIN_BLOCKS = 12
 
 COMPUTATION_NAMES = ('forward', 'backward', 'double_backward', 'triple_backward')
 
@@ -33,72 +29,6 @@ CUDA_HEADERS = (
     "#include <cuda_runtime.h>",
     "#include <algorithm>",
 )
-
-
-class ScalarNode:
-    __slots__ = ("index", "op", "args", "value")
-
-    def __init__(self, index, op, args, value):
-        self.index, self.op, self.args, self.value = index, op, args, value
-
-
-class Graph:
-    def __init__(self):
-        self.nodes, self.cache = [], {}
-        self.zero, self.one = self.constant(0.0), self.constant(1.0)
-
-    def node(self, op, *args, value=None):
-        key = op, tuple(arg.index for arg in args), value
-        if key not in self.cache:
-            node = ScalarNode(len(self.nodes), op, args, value)
-            self.nodes.append(node)
-            self.cache[key] = node
-        return self.cache[key]
-
-    def constant(self, value):
-        return self.node("constant", value=float(value).hex())
-
-    def input(self, role, column):
-        return self.node("input", value=(role, column))
-
-    @staticmethod
-    def ancestors(outputs):
-        visited = set()
-        pending = list(outputs)
-        while pending:
-            node = pending.pop()
-            if node.index not in visited:
-                visited.add(node.index)
-                pending.extend(node.args)
-        return visited
-
-
-def copy_field(node, clone, memo, maps):
-    if node.index not in memo:
-        value = node.value
-        if node.op == "input":
-            role, column = value
-            if column not in maps[role]:
-                raise ValueError(f"Cross-task scalar dependency: {role}/{column}")
-            value = role, maps[role][column]
-        memo[node.index] = clone.node(node.op, *(copy_field(arg, clone, memo, maps) for arg in node.args), value=value)
-    return memo[node.index]
-
-
-def field_signature(node, signatures):
-    if node.index not in signatures:
-        signatures[node.index] = node.op, node.value, tuple(field_signature(arg, signatures) for arg in node.args)
-    return signatures[node.index]
-
-
-def clone_fields(roots, columns):
-    clone, memo = Graph(), {}
-    maps = {
-        role: {column: i for i, column in enumerate(values)} for role, values in columns.items()
-    }
-
-    fields = {name: tuple(copy_field(root, clone, memo, maps) for root in values) for name, values in roots.items()}
-    return clone, fields
 
 
 def output_width(meta, name):
@@ -119,9 +49,9 @@ def input_width(meta, role):
 
 def emit_copy_program(
     meta, program, *, strided=False, generic=False, save_bias=False,
-    path_major=False, expression_source=None,
+    shared_outputs=False, expression_source=None,
 ):
-    """Lower each irrep copy without changing its registered operation order."""
+    """Emit each irrep copy in scalar-graph order."""
     count = sum(path["copies"] for path in meta["paths"])
     lines = [f"const Index row=item/{count};"]
     if generic:
@@ -131,7 +61,7 @@ def emit_copy_program(
         address = "bias[(group)*bias_stride]" if strided or generic else "bias[group]"
         lines.append(f"if(row==0) saved_state[group]={address};")
 
-    path_lines = [] if path_major else None
+    copy_programs = []
     atoms = []
     begin = 0
     for path in meta["paths"]:
@@ -139,40 +69,10 @@ def emit_copy_program(
         if not copies:
             continue
 
-        graph = fields = signature = None
-        for copy in range(copies):
-            columns = {}
-            for role in program["inputs"]:
-                vector = role in VECTOR_INPUTS or (
-                    role in ("grad_out", "bg") and meta["kind"] == "norm_activation"
-                )
-                start = path["input_offset"] + copy * components if vector else path["scalar_offset"] + copy
-                columns[role] = tuple(range(start, start + (components if vector else 1)))
-            roots = {}
-            for name in program["active_outputs"]:
-                vector = name in VECTOR_OUTPUTS or (
-                    name in ("out", "sg", "tg") and meta["kind"] == "norm_activation"
-                )
-                start = path["input_offset"] + copy * components if vector else path["scalar_offset"] + copy
-                roots[name] = tuple(
-                    program["fields"][name][column]
-                    for column in range(start, start + (components if vector else 1))
-                )
-            copy_graph, copy_fields = clone_fields(roots, columns)
-            signatures = {}
-            copy_signature = tuple(
-                (name, tuple(field_signature(root, signatures) for root in values))
-                for name, values in copy_fields.items()
-            )
-            if copy == 0:
-                graph, fields, signature = copy_graph, copy_fields, copy_signature
-            elif copy_signature != signature:
-                raise ValueError("Norm copy program structure differs within an irrep group")
-
-        local = {**program, "graph": graph, "fields": fields}
+        local = build_irrep_program(meta, program, path, check_copies=True)
         lines.extend((
             f"if(group>={begin} && group<{begin + copies}) {{",
-            f"const Index copy=group-{begin};",
+            f"    const Index copy=group-{begin};",
         ))
 
         input_address = partial(
@@ -180,25 +80,20 @@ def emit_copy_program(
             strided=strided, generic=generic,
         )
         output_address = partial(
-            copy_output_address, meta=meta, path=path, components=components
+            copy_output_address, meta=meta, path=path, components=components,
+            shared=shared_outputs and components * (8 if meta["dtype"] == torch.float64 else 4) > 16,
         )
 
         local_lines, local_atoms = emit_scalar_lines(
             meta["dtype"], local, input_address, output_address,
             expression_source=expression_source,
         )
-        lines.extend((*local_lines, "}"))
-        if path_lines is not None:
-            path_lines.extend((
-                f"if(item>=num_items*{begin} && item<num_items*{begin+copies}) {{",
-                f"const Index local=item-num_items*{begin};",
-                f"const Index row=local/{copies};",
-                f"const Index copy=local%{copies};",
-                *local_lines, "}",
-            ))
+        lines.extend((*("    " + line for line in local_lines), "}"))
+        if shared_outputs:
+            copy_programs.append((path, local_lines))
         atoms.extend(local_atoms)
         begin += copies
-    return lines, atoms, count, path_lines
+    return lines, atoms, count, copy_programs
 
 
 def copy_input_address(role, column, *, meta, path, components, strided, generic):
@@ -219,7 +114,9 @@ def copy_input_address(role, column, *, meta, path, components, strided, generic
     return f"{role}[row*{width}+{start}+copy*{step}+{column}]"
 
 
-def copy_output_address(name, column, *, meta, path, components):
+def copy_output_address(name, column, *, meta, path, components, shared=False):
+    if shared:
+        return f"values[lane*{components}+{column}]"
     vector = (
         name in VECTOR_OUTPUTS
         or (name == "out" and meta["kind"] == "norm_activation")
@@ -234,14 +131,7 @@ def load_forward_backward(
     op, *, arch, index_bits, needs, available, strided=False, generic=False,
     save_bias=False, shared_bias=False,
 ):
-    """Compile the forward and its two first-backward modes together.
-
-    The selected input/bias gradients are fixed by the autograd inputs. Higher
-    orders keep their own on-demand extensions. Namespaces isolate the existing
-    CUDA sources without changing their arithmetic or launch configuration.
-    """
-    from .graph import build_program
-
+    """Compile forward and both create_graph modes of backward together."""
     forward_available = tuple(role for role in available if role in INPUT_ROLES[0])
     forward_key = (0, None, forward_available, False, None)
     forward_program = op.programs.get(forward_key)
@@ -252,14 +142,10 @@ def load_forward_backward(
     if forward_source is None:
         from .forward import make_forward_source
         forward_source = make_forward_source
-    if shared_bias:
+    backward_source = None if shared_bias else op.backward_source
+    if backward_source is None:
         from .backward import make_backward_source
         backward_source = make_backward_source
-    else:
-        backward_source = op.backward_source
-        if backward_source is None:
-            from .backward import make_backward_source
-            backward_source = make_backward_source
 
     sources = {
         "forward": forward_source(
@@ -275,8 +161,6 @@ def load_forward_backward(
         )
         program = op.programs.get(program_key)
         if program is None:
-            from .graph import build_program
-
             program = build_program(
                 op.meta, 1, needs=needs, available=backward_available, grad_mode=grad_mode
             )
@@ -307,12 +191,7 @@ def load_forward_backward(
 
 
 class NormActivationKernels:
-    """Execute a fixed expression with independent metadata and launch caches.
-
-    Outstanding autograd contexts retain these caches and metadata after the
-    Module changes dtype or squared mode. The object also owns actual launches;
-    it is not a container for saved tensors.
-    """
+    """Retain configuration and compiled launches for pending autograd contexts."""
 
     def __init__(
         self, *, meta, compute_dtype, index_bits, kernels, programs,
@@ -391,8 +270,6 @@ class NormActivationKernels:
         )
         program = self.programs.get(key)
         if program is None:
-            from .graph import build_program
-
             program = build_program(
                 self.meta,
                 order,
@@ -516,11 +393,7 @@ class NormActivationKernels:
 
 
 def run_backward(op, order, inputs, *, needs, grad_mode=False, lower_seeds=None):
-    """Launch native partials and reduce each shared bias vector.
-
-    Feature operands preserve their batch layout; bias, RB and BB are shared
-    vectors. The rowwise kernel executor is used only for direct comparisons.
-    """
+    """Launch the requested gradients with shared-bias reduction."""
     values = dict(zip(INPUT_ROLES[order], inputs))
     x = values["x"]
     batch = x.shape[:-1]
@@ -535,8 +408,6 @@ def run_backward(op, order, inputs, *, needs, grad_mode=False, lower_seeds=None)
     )
     program = op.programs.get(key)
     if program is None:
-        from .graph import build_program
-
         program = build_program(
             op.meta,
             order,
@@ -640,7 +511,7 @@ def emit_scalar_lines(
     dtype, program, input_address, output_address, *,
     expression_source=None, approximate_tanh=False,
 ):
-    """Render an already resolved scalar program without changing arithmetic."""
+    """Emit CUDA scalar expressions in graph order."""
     graph, fields = program["graph"], program["fields"]
     names = tuple(program["active_outputs"])
     if any(fields[name] is None for name in names):
@@ -672,8 +543,7 @@ def emit_scalar_lines(
                 )
         args = tuple(arguments)
         type_ = "bool" if node.op in ("eq", "ne", "lt", "le", "gt", "ge") else "Element"
-        # A caller may own its CUDA arithmetic in its phase source. This hook
-        # runs only while compiling static graphs, never during a warm launch.
+        # Use the caller's rounding rules when supplied.
         expression = expression_source(node, args, dtype) if expression_source is not None else None
         if expression is None:
             if node.op == "input":

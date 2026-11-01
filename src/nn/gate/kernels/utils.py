@@ -1,10 +1,54 @@
 """Gate's shared physical paths, operand dependencies, and native binding."""
 
+from math import prod
+from textwrap import indent
+
 import torch
 
+from ....utils.extension import get_cuda_arch, load_cuda_extension
 from ....utils.indexing import LAYOUT_HOST, LAYOUT_SOURCE
 from ...activation.kernels.scalar import scalar_literal
-from ...activation.kernels.utils import CUDA_INPUT_NAMES, INPUT_NAMES, OUTPUT_NAMES
+from ...activation.kernels.utils import CUDA_HEADERS, CUDA_INPUT_NAMES, INPUT_NAMES, OUTPUT_NAMES
+
+
+WARP_SIZE = 32
+SHARED_MEMORY_LIMIT = 48 * 1024
+MIN_COPY_TILE = 8
+DIRECT_STORE_BYTES = 16
+FORWARD_THREADS = 128
+FORWARD_MIN_BLOCKS = 16
+BACKWARD_THREADS = 128
+DOUBLE_BACKWARD_THREADS = 128
+TRIPLE_BACKWARD_THREADS = 128
+
+
+GATE_STORES = r'''template<auto Width, auto Offset, int Components, int Copies, int CopyTile>
+__device__ __forceinline__ void gate_store_components(
+    const Element* values, Element* out, Index row, Index copy_base, Index num_items) {
+    if (row >= num_items) return;
+    const int lane = threadIdx.x % CopyTile;
+    values += ((threadIdx.x % 32) / CopyTile) * CopyTile * Components;
+    constexpr int VectorWidth = sizeof(Element) == 8 ? 2 : 4;
+    if constexpr (Copies % VectorWidth == 0 && Width % VectorWidth == 0 &&
+                  Offset % VectorWidth == 0) {
+        using Vector = std::conditional_t<sizeof(Element) == 8, double2, float4>;
+        #pragma unroll
+        for (int column = lane; column < CopyTile * Components / VectorWidth; column += CopyTile) {
+            if (column < (Copies - copy_base) * Components / VectorWidth) {
+                reinterpret_cast<Vector*>(out + row * Width + Offset + copy_base * Components)[column] =
+                    reinterpret_cast<const Vector*>(values)[column];
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int chunk = 0; chunk < Components; ++chunk) {
+            const int column = chunk * CopyTile + lane;
+            if (column < (Copies - copy_base) * Components) {
+                out[row * Width + Offset + copy_base * Components + column] = values[column];
+            }
+        }
+    }
+}'''
 
 
 GATE_ARITHMETIC = r'''__device__ __forceinline__ float gate_multiply(float a, float b) {
@@ -37,7 +81,7 @@ __device__ __forceinline__ Element gate_component_sum(const Element (&values)[Co
 
 
 def make_path_types(meta, dtype):
-    """Declare only fixed scalar/product addresses and activation parameters."""
+    """Declare scalar/product offsets and activation parameters."""
     from ...activation.kernels.forward import ACTIVATION_TYPES, FORWARD_FUNCTIONS, FORWARD_MATH
 
     declarations = [ACTIVATION_TYPES]
@@ -72,27 +116,28 @@ def make_path_types(meta, dtype):
     return declarations, paths
 
 
-def make_schedule(paths, scalar_call, product_call):
-    """Use one thread per scalar or vector copy, matching the original launch."""
+def make_schedule(paths, scalar_call, product_call, *, warp_groups=False, copy_tile=WARP_SIZE):
+    """Assign path ranges to copies or equal-sized warp subgroups."""
     statements = []
     begin = 0
     for name, product, copies in paths:
-        end = begin + copies
+        end = begin + ((copies + copy_tile - 1) // copy_tile if warp_groups else copies)
         call = product_call if product else scalar_call
+        indices = (f"    const Index copy_base = (group - {begin}) * {copy_tile};\n"
+                   f"    const Index copy = copy_base + lane % {copy_tile};\n" if warp_groups else
+                   f"    const Index copy = group - {begin};\n")
         statements.append(
             f"if (group >= {begin} && group < {end}) {{\n"
-            f"    const Index copy = group - {begin};\n"
-            f"    {call.format(path=name)}\n}}"
+            f"{indices}"
+            f"{indent(call.format(path=name, copies=copies), '    ')}\n}}"
         )
         begin = end
-    return begin or 1, "\n".join(statements)
+    return begin or 1, indent("\n".join(statements), "        ")
 
 
 def make_binding(meta, config, *, declarations, kernel_body, binding, module_binding,
                  launch, strided=False, tensor_only=False, fragments=False):
-    """Allocate requested outputs and bind one phase's actual CUDA kernel."""
-    from ...activation.kernels.forward import CUDA_HEADERS
-
+    """Emit the CUDA binding and requested output allocations."""
     names = config["active_outputs"]
     allocations = "\n".join(
         f"auto result_{name}=torch::empty({{num_items,int64_t({meta['out_dim'] if name in ('out', 'sg', 'tg') else meta['in_dim']})}},options);"
@@ -113,7 +158,7 @@ def make_binding(meta, config, *, declarations, kernel_body, binding, module_bin
         declarations="\n".join(declarations), kernel_body=kernel_body,
         result_type="torch::Tensor" if tensor_only else "pybind11::tuple",
         tensor_parameters=",".join(f"torch::Tensor {role}" for role in config["inputs"]),
-        first=config["inputs"][0], allocations=allocations,
+        first=config["inputs"][0], allocations=indent(allocations, "    "),
         layout_host=LAYOUT_HOST if strided else "", launch=launch,
         result_return=result_return,
     )
@@ -125,7 +170,7 @@ def make_binding(meta, config, *, declarations, kernel_body, binding, module_bin
 
 def get_kernel_config(meta, kernel_cache, order, *, needs=None, available=None,
                       grad_mode=False, dtype=None):
-    """Cache live operands and connected outputs without tracing or saved graphs."""
+    """Cache input dependencies and requested output names."""
     dtype = meta["dtype"] if dtype is None else dtype
     needs = tuple(needs) if needs is not None else None
     available = tuple(available) if available is not None else None
@@ -176,3 +221,104 @@ def get_kernel_config(meta, kernel_cache, order, *, needs=None, available=None,
     if len(kernel_cache) > 512:
         kernel_cache.popitem(last=False)
     return config
+
+
+def launch_kernel(inputs, config, meta, index_bits, kernel_cache, source):
+    """Load the kernel and return the requested output tensors."""
+    order = config["order"]
+    dtype = config["dtype"]
+    input_names = INPUT_NAMES[order]
+    available = config["available"]
+    first = next((value for value in inputs if value is not None), None)
+    if first is None:
+        return tuple(None for _ in config["outputs"])
+    shape, device = first.shape, first.device
+    in_dim, out_dim = meta["in_dim"], meta["out_dim"]
+    batch = shape[:-1]
+    for role, value in zip(input_names, inputs):
+        if value is None:
+            continue
+        width = out_dim if role in ("grad_out", "bg") else in_dim
+        if value.dtype != dtype:
+            raise ValueError(
+                "Activation/Gate operands must match the computation dtype"
+            )
+        if value.shape != (*batch, width):
+            raise ValueError(f"Activation/Gate operand {role} has an incorrect shape")
+
+    n = prod(batch)
+    bound = n * max(in_dim, out_dim, 1) + 65535 * 128
+    strided_forward = order == 0 and n > 0 and first.ndim <= 64 and not first.is_contiguous()
+    if strided_forward:
+        physical = sum((size - 1) * stride for size, stride in zip(first.shape, first.stride()))
+        bound = max(bound, physical)
+    if bound > (1 << 63) - 1:
+        raise OverflowError("Activation/Gate offsets exceed signed int64 capacity")
+    index_bits = 64 if bound > (1 << 31) - 1 else index_bits
+    key = ("kernel", order, config["active_outputs"], config["inputs"], available,
+           config["grad_mode"], index_bits, device, dtype)
+    if strided_forward:
+        key += ("strided_forward",)
+    entry = kernel_cache.get(key)
+    if entry is None:
+        launch = None
+        if config["active_outputs"] and config["inputs"]:
+            extension = kernel_cache.get(("forward_backward_module", dtype, device, index_bits))
+            if extension is not None and order == 0:
+                launch = (extension.strided_forward if strided_forward else extension.forward).launch
+            elif extension is not None and order == 1:
+                if config["grad_mode"]:
+                    launch = extension.differentiable_backward.launch
+                elif hasattr(extension, "training"):
+                    launch = extension.training.launch_backward_tuple
+                else:
+                    launch = extension.backward.launch
+            else:
+                cuda_source = (
+                    source({**meta, "dtype": dtype}, config, strided=True)
+                    if strided_forward else source({**meta, "dtype": dtype}, config)
+                )
+            if launch is None:
+                precision = "fp64" if dtype == torch.float64 else "fp32"
+                name = (
+                    f"lunaeq_gate_strided_fwd" if strided_forward
+                    else f"lunaeq_gate_{order}_{precision}"
+                )
+                launch = load_cuda_extension(
+                    name, cuda_source, arch=get_cuda_arch(device), index_bits=index_bits,
+                    use_fast_math=False, minimal_headers=True,
+                ).launch
+        entry = config, launch
+        kernel_cache[key] = entry
+        if len(kernel_cache) > 512:
+            kernel_cache.popitem(last=False)
+
+    config, launch = entry
+    if not config["active_outputs"]:
+        result = tuple(None for _ in config["outputs"])
+    elif n == 0 or launch is None:
+        result = tuple(
+            (
+                torch.zeros(
+                    (
+                        *batch,
+                        out_dim if name in ("out", "sg", "tg") else in_dim,
+                    ),
+                    device=device,
+                    dtype=dtype,
+                )
+                if name in config["active_outputs"]
+                else None
+            )
+            for name in config["outputs"]
+        )
+    else:
+        operands = [
+            value if strided_forward else value.reshape(n, value.shape[-1]).contiguous()
+            for role, value in zip(input_names, inputs) if role in config["inputs"]
+        ]
+        result = tuple(
+            value.reshape(*batch, value.shape[-1]) if value is not None else None
+            for value in launch(*operands, n)
+        )
+    return result

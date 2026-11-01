@@ -49,9 +49,9 @@ def emit_contraction(
             )
             for i in range(dims["x"]):
                 lines.append(r"""{{
-{scalar} source_base = 0.0;
-{scalar} source_direction = 0.0;
-const {scalar} edge_basis = scale * rx{i} + direction * x{i};""".format(scalar=scalar, i=i))
+    {scalar} source_base = 0.0;
+    {scalar} source_direction = 0.0;
+    const {scalar} edge_basis = scale * rx{i} + direction * x{i};""".format(scalar=scalar, i=i))
                 for pairs in classes:
                     members = [member for member in pairs.members if member.i_idx == i]
                     if not members:
@@ -60,20 +60,20 @@ const {scalar} edge_basis = scale * rx{i} + direction * x{i};""".format(scalar=s
                         f"{float_literal(coefficient, dtype)} * g{k}"
                         for _i, _j, k, coefficient in pairs.members[0].terms
                     )
-                    lines += ["{", f"const {scalar} projection = {projection};"]
+                    lines += ["    {", f"        const {scalar} projection = {projection};"]
                     for member in members:
                         operation = "+=" if member.relative_sign > 0 else "-="
                         j = member.j_name
                         lines.append(
-                            r"""source_base {operation} y{j} * projection;
-source_direction {operation} ry{j} * projection;
-{edge_gradient} {operation} edge_basis * projection;""".format(
+                            r"""        source_base {operation} y{j} *projection;
+        source_direction {operation} ry{j} *projection;
+        {edge_gradient} {operation} edge_basis *projection;""".format(
                                 operation=operation,
                                 j=j,
                                 edge_gradient=targets["gy"][j],
                             )
                         )
-                    lines.append("}")
+                    lines.append("    }")
                 updates = f"""{targets["gx"][i]} += scale * source_direction + direction * source_base;\n{(targets["gw"] if "gw" in selected else "")} += rx{i} * source_base + x{i} * source_direction;""".splitlines()
                 lines.append(updates[0])
                 if "gw" in selected:
@@ -82,9 +82,9 @@ source_direction {operation} ry{j} * projection;
             lines.append("}")
             return "\n".join(lines)
         for j in range(dims["y"]):
-            basis = r"""{scalar} edge_base{j} = 0.0;
-{scalar} edge_direction{j} = 0.0;
-const {scalar} node_basis{j} = ry{j} * scale + y{j} * direction;""".format(scalar=scalar, j=j).splitlines()
+            basis = r"""        {scalar} edge_base{j} = 0.0;
+        {scalar} edge_direction{j} = 0.0;
+        const {scalar} node_basis{j} = ry{j} * scale + y{j} * direction;""".format(scalar=scalar, j=j).splitlines()
             lines.extend(basis[:3] if "gx" in selected else basis[:2])
         for pairs in build_signed_ij_classes(
             spec["terms"], spec_y_offset=0, y_name_base=0
@@ -93,12 +93,12 @@ const {scalar} node_basis{j} = ry{j} * scale + y{j} * direction;""".format(scala
                 f"{float_literal(coefficient, dtype)} * g{k}"
                 for _i, _j, k, coefficient in pairs.members[0].terms
             )
-            lines += ["{", f"const {scalar} projection = {projection};"]
+            lines += ["{", f"    const {scalar} projection = {projection};"]
             for member in pairs.members:
                 operation = "+=" if member.relative_sign > 0 else "-="
-                projection_updates = r"""edge_base{j} {operation} x{i} * projection;
-edge_direction{j} {operation} rx{i} * projection;
-{source_gradient} {operation} node_basis{j} * projection;""".format(
+                projection_updates = r"""    edge_base{j} {operation} x{i} *projection;
+    edge_direction{j} {operation} rx{i} *projection;
+    {source_gradient} {operation} node_basis{j} *projection;""".format(
                     j=member.j_name,
                     i=member.i_idx,
                     operation=operation,
@@ -138,25 +138,25 @@ edge_direction{j} {operation} rx{i} * projection;
 DESTINATION_DERIVATIVE_KERNEL = r"""__global__ __launch_bounds__({threads}, 2)
 void {name}({parameters}) {{
 {null_declarations}
-const Index task = Index(blockIdx.x);
-if (task >= Index(num_nodes) * {tiles}) return;
-const int lane = threadIdx.x & 31;
-const int neighbor_worker = threadIdx.x >> 5;
-const int tile = int(task % {tiles});
-const int u = tile * 32 + lane;
-const int rank = int(task / {tiles});
-const int d = node_order ? __ldg(node_order + rank) : rank;
-__shared__ {scalar} neighbor_sums[{shared_width}];
-{initialize_sums}
-for (Index p = Index(dst_rowptr[d]) + neighbor_worker; p < dst_rowptr[d + 1]; p += {workers}) {{
-const Index edge = Index(p);
-const int s = __ldg(src + edge);
+    const Index task = Index(blockIdx.x);
+    if (task >= Index(num_nodes) * {tiles}) return;
+    const int lane = threadIdx.x & 31;
+    const int neighbor_worker = threadIdx.x >> 5;
+    const int tile = int(task % {tiles});
+    const int u = tile * 32 + lane;
+    const int rank = int(task / {tiles});
+    const int d = node_order ? __ldg(node_order + rank) : rank;
+    __shared__ {scalar} neighbor_sums[{shared_width}];
+    {initialize_sums}
+    for (Index p = Index(dst_rowptr[d]) + neighbor_worker; p < dst_rowptr[d + 1]; p += {workers}) {{
+        const Index edge = Index(p);
+        const int s = __ldg(src + edge);
 
 {edge_contractions}
-}}
-__syncthreads();
-if (neighbor_worker == 0) {{
+    }}
+    __syncthreads();
+    if (neighbor_worker == 0) {{
 {output_reductions}
-}}
+    }}
 }}
 """

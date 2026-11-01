@@ -95,17 +95,17 @@ const {scalar} envelope_cross = rw_value * {env_seed} + bw * {env_direction};"""
                             for _i, _j, k, coefficient in pairs.members[0].terms
                         )
                         lines.append(
-                            f"const {scalar} projection_{gradient} = {expression};"
+                            f"    const {scalar} projection_{gradient} = {expression};"
                         )
                     for member in members:
                         operation = "+=" if member.relative_sign > 0 else "-="
                         i, j = member.i_idx, member.j_name
-                        projection_updates = r"""source_base{i} {operation} y{j} * projection_g;
-source_direction{i} {operation} ry{j} * projection_g;
-source_mixed{i} {operation} by{j} * projection_g + y{j} * projection_bg;
-source_cross{i} {operation} ry{j} * projection_bg;
-{edge_gradient} {operation} edge_g{i} * projection_g + edge_bg{i} * projection_bg;
-{edge_direction_gradient} {operation} edge_rg{i} * projection_g + edge_rbg{i} * projection_bg;""".format(
+                        projection_updates = r"""    source_base{i} {operation} y{j} * projection_g;
+    source_direction{i} {operation} ry{j} * projection_g;
+    source_mixed{i} {operation} by{j} * projection_g + y{j} * projection_bg;
+    source_cross{i} {operation} ry{j} * projection_bg;
+    {edge_gradient} {operation} edge_g{i} * projection_g + edge_bg{i} * projection_bg;
+    {edge_direction_gradient} {operation} edge_rg{i} * projection_g + edge_rbg{i} * projection_bg;""".format(
                             i=i,
                             j=j,
                             operation=operation,
@@ -128,11 +128,11 @@ source_cross{i} {operation} ry{j} * projection_bg;
                         lines.append(updates[1])
                     if with_env:
                         lines.append(r"""{{
-const {scalar} scalar_cross = bx{i} * source_direction{i} + rx{i} * source_mixed{i} + x{i} * source_cross{i};
-const {scalar} scalar_mixed = x{i} * source_mixed{i} + bx{i} * source_base{i};""".format(scalar=scalar, i=i))
+    const {scalar} scalar_cross = bx{i} * source_direction{i} + rx{i} * source_mixed{i} + x{i} * source_cross{i};
+    const {scalar} scalar_mixed = x{i} * source_mixed{i} + bx{i} * source_base{i};""".format(scalar=scalar, i=i))
                         if need_grad_env:
                             lines.append(
-                                f"const {scalar} scalar_direction = rx{i} * source_base{i} + x{i} * source_direction{i};\nconst {scalar} scalar_base = x{i} * source_base{i};"
+                                f"    const {scalar} scalar_direction = rx{i} * source_base{i} + x{i} * source_direction{i};\n    const {scalar} scalar_base = x{i} * source_base{i};"
                             )
                         cross = (
                             " + be * scalar_direction + re_value * scalar_mixed"
@@ -141,9 +141,9 @@ const {scalar} scalar_mixed = x{i} * source_mixed{i} + bx{i} * source_base{i};""
                         )
                         seed = " + be * scalar_base" if need_grad_env else ""
                         lines.append(
-                            f"""{targets["gw"]} += e * scalar_cross{cross};\n{targets["grw"]} += e * scalar_mixed{seed};"""
+                            f"""    {targets["gw"]} += e * scalar_cross{cross};\n{targets["grw"]} += e * scalar_mixed{seed};"""
                         )
-                        envelope_updates = f"""{(targets["ge"] if "ge" in selected else "")} += w * scalar_cross + bw * scalar_direction + rw_value * scalar_mixed;\n{(targets["gre"] if "gre" in selected else "")} += w * scalar_mixed + bw * scalar_base;""".splitlines()
+                        envelope_updates = f"""    {(targets["ge"] if "ge" in selected else "")} += w * scalar_cross + bw * scalar_direction + rw_value * scalar_mixed;\n{(targets["gre"] if "gre" in selected else "")} += w * scalar_mixed + bw * scalar_base;""".splitlines()
                         if "ge" in selected:
                             lines.append(envelope_updates[0])
                         if "gre" in selected:
@@ -180,16 +180,16 @@ const {scalar} scalar_mixed = x{i} * source_mixed{i} + bx{i} * source_base{i};""
                     f"{float_literal(coefficient, dtype)} * {gradient}{k}"
                     for _i, _j, k, coefficient in pairs.members[0].terms
                 )
-                lines.append(f"const {scalar} projection_{gradient} = {expression};")
+                lines.append(f"    const {scalar} projection_{gradient} = {expression};")
             for member in pairs.members:
                 operation = "+=" if member.relative_sign > 0 else "-="
                 i, j = member.i_idx, member.j_name
-                projection_updates = r"""edge_base{j} {operation} x{i} * projection_g;
-edge_direction{j} {operation} rx{i} * projection_g;
-edge_mixed{j} {operation} bx{i} * projection_g + x{i} * projection_bg;
-edge_cross{j} {operation} rx{i} * projection_bg;
-{source_gradient} {operation} node_g{j} * projection_g + node_bg{j} * projection_bg;
-{source_direction_gradient} {operation} direction_g{j} * projection_g + direction_bg{j} * projection_bg;""".format(
+                projection_updates = r"""    edge_base{j} {operation} x{i} * projection_g;
+    edge_direction{j} {operation} rx{i} * projection_g;
+    edge_mixed{j} {operation} bx{i} * projection_g + x{i} * projection_bg;
+    edge_cross{j} {operation} rx{i} * projection_bg;
+    {source_gradient} {operation} node_g{j} * projection_g + node_bg{j} * projection_bg;
+    {source_direction_gradient} {operation} direction_g{j} * projection_g + direction_bg{j} * projection_bg;""".format(
                     i=i,
                     j=j,
                     operation=operation,
@@ -212,11 +212,11 @@ edge_cross{j} {operation} rx{i} * projection_bg;
                 lines.append(updates[1])
             if with_env:
                 lines.append(r"""{{
-const {scalar} scalar_cross = by{j} * edge_direction{j} + ry{j} * edge_mixed{j} + y{j} * edge_cross{j};
-const {scalar} scalar_mixed = y{j} * edge_mixed{j} + by{j} * edge_base{j};""".format(scalar=scalar, j=j))
+    const {scalar} scalar_cross = by{j} * edge_direction{j} + ry{j} * edge_mixed{j} + y{j} * edge_cross{j};
+    const {scalar} scalar_mixed = y{j} * edge_mixed{j} + by{j} * edge_base{j};""".format(scalar=scalar, j=j))
                 if need_grad_env:
                     lines.append(
-                        f"const {scalar} scalar_direction = y{j} * edge_direction{j} + ry{j} * edge_base{j};\nconst {scalar} scalar_base = y{j} * edge_base{j};"
+                        f"    const {scalar} scalar_direction = y{j} * edge_direction{j} + ry{j} * edge_base{j};\n    const {scalar} scalar_base = y{j} * edge_base{j};"
                     )
                 cross = (
                     " + be * scalar_direction + re_value * scalar_mixed"
@@ -225,9 +225,9 @@ const {scalar} scalar_mixed = y{j} * edge_mixed{j} + by{j} * edge_base{j};""".fo
                 )
                 seed = " + be * scalar_base" if need_grad_env else ""
                 lines.append(
-                    f"""{targets["gw"]} += e * scalar_cross{cross};\n{targets["grw"]} += e * scalar_mixed{seed};"""
+                    f"""    {targets["gw"]} += e * scalar_cross{cross};\n{targets["grw"]} += e * scalar_mixed{seed};"""
                 )
-                envelope_updates = f"""{(targets["ge"] if "ge" in selected else "")} += w * scalar_cross + bw * scalar_direction + rw_value * scalar_mixed;\n{(targets["gre"] if "gre" in selected else "")} += w * scalar_mixed + bw * scalar_base;""".splitlines()
+                envelope_updates = f"""    {(targets["ge"] if "ge" in selected else "")} += w * scalar_cross + bw * scalar_direction + rw_value * scalar_mixed;\n{(targets["gre"] if "gre" in selected else "")} += w * scalar_mixed + bw * scalar_base;""".splitlines()
                 if "ge" in selected:
                     lines.append(envelope_updates[0])
                 if "gre" in selected:
@@ -242,26 +242,33 @@ const {scalar} scalar_mixed = y{j} * edge_mixed{j} + by{j} * edge_base{j};""".fo
     return None
 
 
-BOUNDED_EDGE_SOURCE = r"""struct {result_type} {{ {fields} }};
+BOUNDED_EDGE_SOURCE = r"""struct {result_type} {{
+{fields}
+}};
 __device__ __noinline__ {result_type} {helper}({input_params}, Index edge, int s, int d, int u) {{
 {nulls}
-{result_type} result{{}};
+    {result_type} result{{}};
 {body}
-return result;
+    return result;
 }}
 """
 
 
-BOUNDED_NODE_SOURCE = r"""struct {result_type} {{ {fields} }};
-__device__ __noinline__ {result_type} {helper}({input_params}, const EdgeIndex* __restrict__ src_rowptr, const EdgeIndex* __restrict__ edge_ids, const int32_t* __restrict__ dst, int s, int u, int neighbor_worker) {{
+BOUNDED_NODE_SOURCE = r"""struct {result_type} {{
+{fields}
+}};
+__device__ __noinline__ {result_type} {helper}({input_params}, const EdgeIndex *__restrict__ src_rowptr,
+                                                    const EdgeIndex *__restrict__ edge_ids,
+                                                    const int32_t *__restrict__ dst, int s, int u,
+                                                    int neighbor_worker) {{
 {nulls}
-{result_type} result{{}};
-for (Index p = src_rowptr[s] + neighbor_worker; p < src_rowptr[s + 1]; p += {workers}) {{
-const Index edge = __ldg(edge_ids + p);
-const int d = __ldg(dst + edge);
+    {result_type} result{{}};
+    for (Index p = src_rowptr[s] + neighbor_worker; p < src_rowptr[s + 1]; p += {workers}) {{
+        const Index edge = __ldg(edge_ids + p);
+        const int d = __ldg(dst + edge);
 
 {body}
-}}
-return result;
+    }}
+    return result;
 }}
 """

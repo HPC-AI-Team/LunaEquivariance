@@ -1,6 +1,7 @@
 """UUU forward CUDA templates."""
 
 from collections.abc import Mapping
+from textwrap import indent
 import torch
 from ....utils.precision import float_literal, cuda_source_for_dtype
 from ....utils.extension import load_tp_extension
@@ -8,7 +9,7 @@ from .utils import (
     UUU_THREADS,
     CUDA_HEADERS,
     make_channel_schedule,
-    find_root,
+    connected_path_groups,
     prepare_fused_group,
     build_uuu_groups,
 )
@@ -17,27 +18,8 @@ from .utils import (
 def make_source(meta: Mapping[str, object]) -> str:
     """Generate forward kernels and their current-stream tensor binding."""
     outputs = ["out"]
-    specs = meta["generated_specs"]
-    parent = list(range(len(specs)))
-
-    owners = {}
-    for index, spec in enumerate(specs):
-        for layout, offset, width in (
-            ("x", spec["x_offset"], spec["d1"]),
-            ("y", spec["y_offset"], spec["d2"]),
-            ("output", spec["out_offset"], spec["d3"]),
-        ):
-            key = (layout, offset, width, spec["channels"])
-            if key in owners:
-                parent[find_root(parent, index)] = find_root(parent, owners[key])
-            else:
-                owners[key] = index
-    components = {}
-    for index, spec in enumerate(specs):
-        components.setdefault(find_root(parent, index), []).append(spec)
-
     groups = []
-    for paths in components.values():
+    for paths in connected_path_groups(meta["generated_specs"]):
         fused = prepare_fused_group(0, meta.get("dtype"), paths, outputs)
         if fused is not None:
             groups.append(fused)
@@ -45,13 +27,11 @@ def make_source(meta: Mapping[str, object]) -> str:
         groups.extend(build_uuu_groups({**meta, "generated_specs": paths}, outputs))
     bodies = []
     for group in groups:
+        lines = [f"""if (u >= {group["channels"]}) return;"""]
         if group["layout"] == "fused":
-            group_outputs = group["outputs"]
-            lines = [f"""if (u >= {group["channels"]}) return;"""]
-            for output in group_outputs:
-                for offset, dim in group["output_slices"][output]:
-                    for component in range(dim):
-                        lines.append(f"float {output}_{offset}_{component} = 0.0f;")
+            for offset, dim in group["output_slices"]["out"]:
+                for component in range(dim):
+                    lines.append(f"float out_{offset}_{component} = 0.0f;")
             for role in ("x", "y"):
                 for value_role, offset, component, dim in sorted(
                     group["cached_values"]
@@ -78,25 +58,21 @@ def make_source(meta: Mapping[str, object]) -> str:
                     lines.append(
                         f"""    q0_{k} = fmaf({float_literal(coefficient)}, xv_{spec["x_offset"]}_{i} * yv_{spec["y_offset"]}_{j}, q0_{k});"""
                     )
-                for output in group_outputs:
-                    for k in components[2]:
-                        accumulator = f"""{output}_{spec["out_offset"]}_{k}"""
-                        lines.append(
-                            f"    {accumulator} = fmaf(q0_{k}, wv, {accumulator});"
-                        )
+                for k in components[2]:
+                    accumulator = f"""out_{spec["out_offset"]}_{k}"""
+                    lines.append(
+                        f"    {accumulator} = fmaf(q0_{k}, wv, {accumulator});"
+                    )
                 lines.append("}")
-            for output in group_outputs:
-                for offset, dim in group["output_slices"][output]:
-                    for component in range(dim):
-                        lines.append(
-                            f"{output}_out[item_g + {offset} + u * {dim} + {component}] = {output}_{offset}_{component};"
-                        )
-        else:
-            names, dim = group["outputs"], group["dim"]
-            lines = [f"""if (u >= {group["channels"]}) return;"""]
-            for output in names:
+            for offset, dim in group["output_slices"]["out"]:
                 for component in range(dim):
-                    lines.append(f"float {output}{component} = 0.0f;")
+                    lines.append(
+                        f"out_out[item_g + {offset} + u * {dim} + {component}] = out_{offset}_{component};"
+                    )
+        else:
+            dim = group["dim"]
+            for component in range(dim):
+                lines.append(f"float out{component} = 0.0f;")
             for spec in group["specs"]:
                 lines.append("{")
                 components = [
@@ -123,31 +99,17 @@ def make_source(meta: Mapping[str, object]) -> str:
                     lines.append(
                         f"        q0_{k} = fmaf({float_literal(coefficient)}, xv{i} * yv{j}, q0_{k});"
                     )
-                for output in names:
-                    for k in components[2]:
-                        lines.append(
-                            f"        {output}{k} = fmaf(q0_{k}, wv, {output}{k});"
-                        )
+                for k in components[2]:
+                    lines.append(f"        out{k} = fmaf(q0_{k}, wv, out{k});")
                 lines.append("    }")
                 lines.append("}")
-            for output in names:
-                for component in range(dim):
-                    lines.append(
-                        f"""{output}_out[item_g + {group["offset"]} + u * {dim} + {component}] = {output}{component};"""
-                    )
+            for component in range(dim):
+                lines.append(
+                    f"""out_out[item_g + {group["offset"]} + u * {dim} + {component}] = out{component};"""
+                )
         bodies.append("\n".join(lines))
-    inputs = ("x", "y", "w")
     entry = f"""lunatp_uuu_fwd_{meta["weight_mode"]}_fp32"""
     kernel = "lunatp_uuu_fwd_fp32"
-    input_names = [
-        "weight" if name == "w" else "grad_out" if name == "g" else name
-        for name in inputs
-    ]
-    declarations = [f"torch::Tensor {name}" for name in input_names]
-    pointers = [f"const float* __restrict__ {name}" for name in input_names]
-    pointers.extend(f"float* __restrict__ {name}_out" for name in outputs)
-    arguments = [f"{name}.data_ptr<float>()" for name in input_names]
-    arguments.extend(f"{name}.data_ptr<float>()" for name in outputs)
     # Scopes bound path-local register lifetimes even in long grouped path lists.
     cases = []
     for index, body in enumerate(bodies):
@@ -156,8 +118,6 @@ def make_source(meta: Mapping[str, object]) -> str:
             + "\n".join("    " + line for line in body.splitlines())
             + "\n    break;\n}"
         )
-    # Large programs traverse one role at a time to keep hot instruction
-    # regions nearby. Short programs retain interleaved feature-row reuse.
     index, grid, constants = make_channel_schedule(groups, cases)
     slices = {
         (spec["out_offset"], spec["channels"] * spec["d3"])
@@ -172,7 +132,7 @@ def make_source(meta: Mapping[str, object]) -> str:
     weight_item = (
         "0" if meta["weight_mode"] == "shared" else "int64_t(n) * GEN_WEIGHT_NUMEL"
     )
-    case_source = "\n".join(cases)
+    case_source = indent("\n".join(cases), "        ")
     headers = CUDA_HEADERS
     source = r"""
 {headers}
@@ -188,7 +148,8 @@ constexpr int GEN_THREADS = {UUU_THREADS};
 
 __global__ __launch_bounds__(GEN_THREADS, 4)
 void {kernel}(
-    {pointers},
+    const float* __restrict__ x, const float* __restrict__ y,
+    const float* __restrict__ weight, float* __restrict__ out_out,
     int64_t num_items) {{
     {index}
     const int64_t item_x = int64_t(n) * GEN_IN1_DIM;
@@ -198,23 +159,22 @@ void {kernel}(
     const int64_t item_partial = int64_t(n) * GEN_WEIGHT_NUMEL;
     switch (group) {{
 {case_source}
-    default: break;
+        default: break;
     }}
 }}
 
-torch::Tensor {entry}({declarations}) {{
+torch::Tensor {entry}(torch::Tensor x, torch::Tensor y, torch::Tensor weight) {{
     c10::cuda::CUDAGuard guard(x.device());
     const int64_t num_items = x.size(0);
     {allocation_source}
     if (num_items == 0) {{
-
         return out;
     }}
     {grid}
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
     {kernel}<<<grid, GEN_THREADS, 0, stream>>>(
-        {arguments}, num_items);
-    
+        x.data_ptr<float>(), y.data_ptr<float>(), weight.data_ptr<float>(), out.data_ptr<float>(), num_items);
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }}
@@ -230,15 +190,12 @@ torch::Tensor {entry}({declarations}) {{
         UUU_THREADS=UUU_THREADS,
         constants=constants,
         kernel=kernel,
-        pointers=", ".join(pointers),
         index=index,
         weight_item=weight_item,
         case_source=case_source,
         entry=entry,
-        declarations=", ".join(declarations),
         allocation_source=allocation_source,
         grid=grid,
-        arguments=", ".join(arguments),
     )
     source += r"""PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     cudaFuncAttributes attributes;

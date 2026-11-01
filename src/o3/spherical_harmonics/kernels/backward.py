@@ -1,112 +1,60 @@
-"""Reverse Cartesian arithmetic, shared by backward through triple-backward.
+"""Cartesian polynomial gradients and the analytic normalization chain.
 
-Each block is parsed into the ordered scalar graph. Reversing the graph
-again produces the higher orders without duplicated polynomial formulas.
-Registered normalized Torch graphs use these same scalar CUDA operations.
+Each order contracts polynomial derivatives before normalization.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 from math import prod
-from threading import Lock
+import math
 
 import torch
-from torch.fx.experimental.proxy_tensor import make_fx
 
 from ....utils.extension import get_cuda_arch, combine_cuda_sources, load_cuda_extension
-from ....utils.torch_scalar import gradient
 from .forward import (
     build_forward_graph,
     build_forward_program,
-    evaluate_polynomial,
     make_scalar_source,
     normalization_layout,
 )
 from .utils import (
-    INPUT_ROLES, BACKWARD_INPUTS, BACKWARD_OUTPUTS,
+    BLOCK_THREADS, BACKWARD_INPUTS, BACKWARD_OUTPUTS,
     TRIPLE_BACKWARD_INPUTS, TRIPLE_BACKWARD_OUTPUTS,
 )
 from .scalar import (
-    HarmonicsScalarizer,
-    ScalarGraph,
-    cuda_assignments,
-    lower_expression,
+    ScalarGraph, harmonic_derivative, cuda_assignments, lower_expression,
 )
 
-REVERSE_RULES = {
-    'add': cuda_assignments(r"""
-const Element grad_a = grad;
-const Element grad_b = grad;
-"""),
-    'sub': cuda_assignments(r"""
-const Element grad_a = grad;
-const Element grad_b = -grad;
-"""),
-    'mul': cuda_assignments(r"""
-const Element grad_a = grad * b;
-const Element grad_b = grad * a;
-"""),
-    'div': cuda_assignments(r"""
-const Element grad_a = grad / b;
-const Element negative_seed = -grad;
-const Element quotient = (a / b) / b;
-const Element grad_b = negative_seed * quotient;
-"""),
-    'neg': cuda_assignments(r"""
-const Element grad_a = -grad;
-"""),
-    'pow': cuda_assignments(r"""
-const Element grad_a = grad * (Element(exponent) * Element(std::pow(a, exponent - 1)));
-"""),
-    'norm': cuda_assignments(r"""
-const bool zero_norm = value == Element(0);
-const Element unit = zero_norm ? Element(0) : a / value;
-const Element grad_a = grad * unit;
-"""),
-    'clamp': cuda_assignments(r"""
-const bool active = a >= b;
-const Element grad_a = active ? grad : Element(0);
-"""),
-    'where': cuda_assignments(r"""
-const Element grad_b = a ? grad : Element(0);
-const Element grad_c = a ? Element(0) : grad;
-"""),
-}
+NORMALIZATION_BACKWARD = r"""
+const Element nv = nx * vx + ny * vy + nz * vz;
+const Element out_x = (vx - nx * (active * nv)) * inv;
+const Element out_y = (vy - ny * (active * nv)) * inv;
+const Element out_z = (vz - nz * (active * nv)) * inv;
+"""
 
+NORMALIZATION_DOUBLE_BACKWARD = r"""
+const Element nv = nx * vx + ny * vy + nz * vz;
+const Element uv = ux * vx + uy * vy + uz * vz;
+const Element factor = Element(3.0) * (nu * nv) - uv;
+const Element out_x = (nx * factor - (vx * nu + ux * nv)) * inv2;
+const Element out_y = (ny * factor - (vy * nu + uy * nv)) * inv2;
+const Element out_z = (nz * factor - (vz * nu + uz * nv)) * inv2;
+"""
 
-def differentiate(graph, outputs, seeds, inputs):
-    ancestors = graph.ancestors(outputs)
-    ordered = [n for n in graph.nodes if n.index in ancestors]
-    adj = {}
-
-    for output, seed in zip(outputs, seeds):
-        graph.accumulate_gradient(adj, output, seed)
-    for n in reversed(ordered):
-        g = adj.get(n.index)
-        if g is None:
-            continue
-        a = n.args
-        rule = REVERSE_RULES.get(n.op)
-        if rule is None:
-            if n.op not in ('input', 'constant', 'eq', 'ge'):
-                raise ValueError(f'Unsupported scalar derivative: {n.op}')
-            continue
-        coordinates = a if n.op == 'norm' else (a[0],)
-        for coordinate in coordinates:
-            variables = {'grad': g, 'value': n, 'a': coordinate}
-            variables.update(zip(('b', 'c'), a[1:]))
-            if n.op == 'pow':
-                variables['exponent'] = graph.constant(n.value)
-            for name, expression in rule:
-                value = lower_expression(graph, expression, variables)
-                variables[name] = value
-                if name.startswith('grad_'):
-                    argument = coordinate if n.op == 'norm' else a[ord(name[-1]) - ord('a')]
-                    graph.accumulate_gradient(adj, argument, value)
-    return tuple(adj.get(n.index, graph.zero) for n in inputs)
+NORMALIZATION_TRIPLE_BACKWARD = r"""
+const Element nv = nx * vx + ny * vy + nz * vz;
+const Element rv = rx * vx + ry * vy + rz * vz;
+const Element bv = bx * vx + by * vy + bz * vz;
+const Element factor_v = Element(3.0) * (nr * nb) - rb;
+const Element factor_r = Element(3.0) * (nv * nb) - bv;
+const Element factor_b = Element(3.0) * (nv * nr) - rv;
+const Element factor_n = Element(3.0) * ((rv * nb + bv * nr) + nv * rb)
+    - Element(15.0) * (nv * (nr * nb));
+const Element out_x = (((vx * factor_v + rx * factor_r) + bx * factor_b) + nx * factor_n) * (inv2 * inv);
+const Element out_y = (((vy * factor_v + ry * factor_r) + by * factor_b) + ny * factor_n) * (inv2 * inv);
+const Element out_z = (((vz * factor_v + rz * factor_r) + bz * factor_b) + nz * factor_n) * (inv2 * inv);
+"""
 
 
 def build_backward_program(
@@ -146,8 +94,6 @@ def build_backward_program(
         "active_outputs": ("dx",) if active else (),
         "zero_outputs": ("dx",) if needs[0] and not active else (),
         "inputs": required if active else (),
-        "terms": {"dx": ("dx_g",)} if active else {},
-        "live_terms": ("dx_g",) if active else (),
     }
 
 
@@ -162,7 +108,7 @@ def build_double_backward_program(meta, *, needs=(True, True), available=None):
         raise ValueError('Unknown spherical-harmonic double-backward inputs')
 
     degrees = tuple(meta['degrees'])
-    terms, inputs = {}, set()
+    active, inputs = set(), set()
     for target, wanted, derivative, base in (
         ('sx', needs[0], 2, ('grad_out', 'rx')),
         ('sg', needs[1], 1, ('rx',)),
@@ -173,16 +119,14 @@ def build_double_backward_program(meta, *, needs=(True, True), available=None):
             *base,
         )
         if wanted and live and set(required).issubset(available):
-            terms[target] = (target + '_rx',)
+            active.add(target)
             inputs.update(required)
     return dict(
         order=2,
         outputs=('sx', 'sg'),
-        active_outputs=tuple(t for t in ('sx', 'sg') if t in terms),
+        active_outputs=tuple(t for t in ('sx', 'sg') if t in active),
         zero_outputs=(),
         inputs=tuple(t for t in roles if t in inputs),
-        terms=terms,
-        live_terms=tuple(t for ts in terms.values() for t in ts),
     )
 
 
@@ -198,8 +142,7 @@ def build_triple_backward_program(
     its polynomial derivative is identically zero or a required value is
     absent. An order-q derivative of an unnormalized degree-q polynomial is
     constant and does not read x; mixed requests read x only if a contributing
-    degree exceeds q. Seed groups select reverse contractions for all seeded outputs;
-    term IDs describe the selected mathematics and do not control execution.
+    degree exceeds q. Only the arguments needed by selected outputs are saved.
     """
     if needs is None:
         needs = (True,) * len(TRIPLE_BACKWARD_OUTPUTS)
@@ -214,13 +157,9 @@ def build_triple_backward_program(
     }
     degrees = tuple(meta["degrees"])
     normalized_positive = bool(meta["normalize"]) and any(degree > 0 for degree in degrees)
-    terms = {}
-    term_inputs = {}
-    derivative_orders = {}
-    seed_groups = {}
-    live_terms = []
+    active, inputs = set(), set()
 
-    def select_contraction(target, name, order, values, seed):
+    def select_contraction(target, order, values):
         if target not in selected:
             return
         exists = normalized_positive or any(degree >= order for degree in degrees)
@@ -230,213 +169,290 @@ def build_triple_backward_program(
         dependencies = (("x",) if needs_x else ()) + values
         if not all(role in live for role in dependencies):
             return
-        terms.setdefault(target, []).append(name)
-        if seed not in seed_groups.setdefault(target, []):
-            seed_groups[target].append(seed)
-        live_terms.append(name)
-        term_inputs[name] = dependencies
-        derivative_orders[name] = order
+        active.add(target)
+        inputs.update(dependencies)
 
     # Input differentiation of double-backward contracts a third derivative
     # with grad_out/rx/bx, and a second derivative with rx/bg.
-    select_contraction('tx', 'tx_bx', 3, ('grad_out', 'rx', 'bx'), 'bx')
-    select_contraction('tx', 'tx_bg', 2, ('rx', 'bg'), 'bg')
+    select_contraction('tx', 3, ('grad_out', 'rx', 'bx'))
+    select_contraction('tx', 2, ('rx', 'bg'))
     # grad_out differentiation contracts only the input-side seed.
-    select_contraction('tg', 'tg_bx', 2, ('rx', 'bx'), 'bx')
+    select_contraction('tg', 2, ('rx', 'bx'))
     # rx differentiation uses grad_out/bx or the first derivative with bg.
-    select_contraction('trx', 'trx_bx', 2, ('grad_out', 'bx'), 'bx')
-    select_contraction('trx', 'trx_bg', 1, ('bg',), 'bg')
+    select_contraction('trx', 2, ('grad_out', 'bx'))
+    select_contraction('trx', 1, ('bg',))
 
-    dependencies = {role for values in term_inputs.values() for role in values}
     return {
         "order": 3,
         "outputs": TRIPLE_BACKWARD_OUTPUTS,
         "active_outputs": tuple(
-            output for output in TRIPLE_BACKWARD_OUTPUTS if output in terms
+            output for output in TRIPLE_BACKWARD_OUTPUTS if output in active
         ),
         "zero_outputs": tuple(
             output
             for output in TRIPLE_BACKWARD_OUTPUTS
-            if output in selected and output not in terms
+            if output in selected and output not in active
         ),
         "inputs": tuple(
-            role for role in TRIPLE_BACKWARD_INPUTS if role in dependencies
+            role for role in TRIPLE_BACKWARD_INPUTS if role in inputs
         ),
-        "terms": {target: tuple(names) for target, names in terms.items()},
-        "live_terms": tuple(live_terms),
-        "term_inputs": term_inputs,
-        "derivative_orders": derivative_orders,
-        "seed_groups": {target: tuple(seeds) for target, seeds in seed_groups.items()},
-        "needs_x": "x" in dependencies,
     }
 
 
-def make_backward_source(meta, program, *, layout_specs=None):
-    """Generate backward, double-backward or triple-backward CUDA.
-
-    Normalized derivatives lower Torch's registered arithmetic. Polynomial
-    derivatives reverse the same ordered graph used by forward.
-    """
-    if program['order'] not in (1, 2, 3):
-        raise ValueError('Expected a spherical-harmonic backward program')
-    if meta['normalize'] and max(meta['degrees']) > 0:
-        graph, outputs = build_registered_graph(meta, program, layout_specs=layout_specs)
-    else:
-        graph, forward_outputs = build_forward_graph(meta)
-        x = tuple(graph.input('x', i) for i in range(3))
-        grad_out = tuple(graph.input('grad_out', i) for i in range(meta['out_dim']))
-        rx = tuple(graph.input('rx', i) for i in range(3))
-        bx = tuple(graph.input('bx', i) for i in range(3))
-        bg = tuple(graph.input('bg', i) for i in range(meta['out_dim']))
-        dx = differentiate(graph, forward_outputs['out'], grad_out, x)
-        outputs = {'dx': dx}
-        if program['order'] >= 2:
-            second = differentiate(graph, dx, rx, (*x, *grad_out))
-            input_width = len(x)
-            sx, sg = second[:input_width], second[input_width:]
-            outputs = {'sx': sx, 'sg': sg}
-        if program['order'] == 3:
-            outputs, groups = {}, {}
-            output_end = input_width + len(grad_out)
-            result_slices = {
-                'tx': slice(0, input_width),
-                'tg': slice(input_width, output_end),
-                'trx': slice(output_end, None),
-            }
-            for target in program['active_outputs']:
-                seed_group = program['seed_groups'][target]
-                if seed_group not in groups:
-                    # Reverse seeded outputs before shared norm/div nodes.
-                    roots = (sx if 'bx' in seed_group else ()) + (sg if 'bg' in seed_group else ())
-                    seeds = (bx if 'bx' in seed_group else ()) + (bg if 'bg' in seed_group else ())
-                    groups[seed_group] = differentiate(graph, roots, seeds, (*x, *grad_out, *rx))
-                outputs[target] = tuple(groups[seed_group][result_slices[target]])
-    return make_scalar_source(meta, program, graph=graph, outputs=outputs)
-
-
-def registered_triple_backward(
-    program, names, input_gradient, x, grad_output, input_direction,
-    grad_input_direction, grad_output_direction,
-):
-    """Differentiate the double-backward using each result's live seed group."""
-    second_input, second_output = gradient(
-        (input_gradient,), (x, grad_output), (input_direction,), create_graph=True
+def make_backward_source(meta, program):
+    """Contract polynomial gradients before applying the normalization chain."""
+    order = program['order']
+    if order < 3:
+        raw, raw_outputs = build_forward_graph({
+            **meta, 'normalize': False, 'normalization': 'component',
+            'degrees': tuple(range(max(meta['degrees']) + 1)),
+        })
+    components = tuple(
+        (degree, component) for degree in meta['degrees']
+        for component in range(2 * degree + 1)
     )
-    targets = {"tx": x, "tg": grad_output, "trx": input_direction}
-    grouped = {}
-    result = {}
-    for name in names:
-        grouped.setdefault(program['seed_groups'][name], []).append(name)
-    for seed_group, output_names in grouped.items():
-        # Combining seeds preserves the registered backward's rounding and pruning.
-        # tx from bg and tg from bx, for example, do not need grad_output.
-        values = ((second_input,) if 'bx' in seed_group else ()) + ((second_output,) if 'bg' in seed_group else ())
-        seeds = ((grad_input_direction,) if 'bx' in seed_group else ()) + ((grad_output_direction,) if 'bg' in seed_group else ())
-        gradients = gradient(
-            values, tuple(targets[name] for name in output_names), seeds, create_graph=False,
-        )
-        result.update(zip(output_names, gradients))
-    return tuple(result[name] for name in names)
-
-
-def trace_registered_graph(meta, program, *, layout_specs=None):
-    """Return the shared scalar DAG and the requested derivative output fields.
-
-    ``layout_specs`` contains only each original role's shape and stride.  No
-    tensor values, Torch derivative graph or FakeTensor are retained afterward.
-    """
     graph = ScalarGraph()
-    names = tuple(program['active_outputs'])
-    if not names:
-        return graph, {}
 
-    run = partial(trace_harmonics_program, meta=meta, program=program, names=names)
+    def scale(v, s):
+        return tuple((graph.binary('mul', x, s) for x in v))
 
-    with torch.enable_grad():
-        # Storage-free leaves retain every supplied batch dimension.
-        width = int(meta['out_dim'])
-        specs = {} if layout_specs is None else layout_specs
-        batch_spec = next((specs[role] for role in INPUT_ROLES if role in specs), None)
-        batch = tuple(batch_spec['shape'][:-1]) if batch_spec is not None else (2,)
-        result = []
-        for role in INPUT_ROLES:
-            dimension = width if role in ('grad_out', 'bg') else 3
-            spec = specs.get(role)
-            if spec is None:
-                shape = (*batch, dimension)
-                stride = []
-                step = 1
-                for size in reversed(shape):
-                    stride.append(step)
-                    step *= max(1, size)
-                stride = tuple(reversed(stride))
-                if layout_specs is None and role == 'x' and meta.get('norm_layout') == 'xy_z':
-                    # Native entry points have no original shape metadata.
-                    stride = (1, 2)
-            else:
-                shape, stride = tuple(spec['shape']), tuple(spec['stride'])
-            if not shape or shape[-1] != dimension or len(shape) != len(stride):
-                raise ValueError(f'Invalid spherical-harmonic layout for {role}: {shape}, {stride}')
-            result.append(
-                torch.empty_strided(
-                    shape,
-                    stride,
-                    device='meta',
-                    dtype=meta['dtype'],
-                    requires_grad=role in ('x', 'grad_out', 'rx'),
-                )
-            )
-        inputs = tuple(result)
-        traced = make_fx(run, tracing_mode='fake')(*inputs)
+    def plus(a, b):
+        return tuple((graph.binary('add', x, y) for x, y in zip(a, b)))
 
-    outputs = HarmonicsScalarizer(graph, meta['dtype']).lower(traced, names)
-    selected = tuple(field for name in names for field in outputs[name])
-    live = graph.ancestors(selected)
-    dependencies = {
-        node.value[0] for node in graph.nodes if node.index in live and node.op == 'input'
-    }
-    omitted = dependencies.difference(program['inputs'])
-    if omitted:
-        raise ValueError(f'Torch graph has omitted runtime dependencies: {sorted(omitted)}')
-    return graph, outputs
+    def minus(a, b):
+        return tuple((graph.binary('sub', x, y) for x, y in zip(a, b)))
 
+    def dot(a, b):
+        value = graph.zero
+        for x, y in zip(a, b):
+            value = graph.binary('add', value, graph.binary('mul', x, y))
+        return value
 
-def build_registered_graph(meta, program, *, layout_specs=None):
-    """Compile static metadata without advancing caller autograd counters.
-
-    A single reusable host worker owns metadata differentiation. The submit
-    lock permits at most one outstanding build; only the returned scalar DAG
-    survives a build. No input values or Tensor derivative graphs are cached.
-    """
-    global metadata_executor
-    if not program['active_outputs']:
-        return trace_registered_graph(meta, program, layout_specs=layout_specs)
-    with metadata_lock:
-        if metadata_executor is None:
-            metadata_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='sh-metadata')
-        return metadata_executor.submit(
-            trace_registered_graph, meta, program, layout_specs=layout_specs
-        ).result()
-
-
-def trace_harmonics_program(x, grad_out, rx, bx, bg, *, meta, program, names):
-    coordinates = torch.nn.functional.normalize(x, dim=-1) if meta['normalize'] else x
-    out = evaluate_polynomial(coordinates, tuple(meta['degrees']), meta['normalization'])
-    if program['order'] == 0:
-        return (out,)
-    (dx,) = gradient((out,), (x,), (grad_out,), create_graph=True)
-    if program['order'] == 1:
-        return (dx,)
-    if program['order'] == 2:
-        targets = {'sx': x, 'sg': grad_out}
-        return gradient(
-            (dx,), tuple(targets[name] for name in names), (rx,), create_graph=False,
+    zero = (graph.zero,) * 3
+    x = (
+        tuple((graph.input('x', i) for i in range(3)))
+        if 'x' in program['inputs']
+        else zero
+    )
+    r = (
+        tuple((graph.input('rx', i) for i in range(3)))
+        if 'rx' in program['inputs']
+        else zero
+    )
+    b = (
+        tuple((graph.input('bx', i) for i in range(3)))
+        if 'bx' in program['inputs']
+        else zero
+    )
+    if meta['normalize']:
+        length = graph.node('norm', *x)
+        denominator = graph.node('clamp', length, graph.constant(1e-12))
+        inv = graph.binary('div', graph.one, denominator)
+        active = graph.node(
+            'where',
+            graph.node('ge', length, graph.constant(1e-12)),
+            graph.one,
+            graph.zero,
         )
-    return registered_triple_backward(program, names, dx, x, grad_out, rx, bx, bg)
+    else:
+        inv, active = (graph.one, graph.zero)
+    n = scale(x, inv)
+    inv2 = graph.binary('mul', active, graph.binary('mul', inv, inv))
+    nr, nb, rb = (dot(n, r), dot(n, b), dot(r, b))
+    # a/d are normalization applied to rx/bx; c is their mixed second derivative.
+    a = scale(minus(r, scale(n, graph.binary('mul', active, nr))), inv)
+    d = scale(minus(b, scale(n, graph.binary('mul', active, nb))), inv)
+    three = graph.constant(3.0)
+    c = scale(
+        minus(
+            scale(
+                n,
+                graph.binary(
+                    'sub', graph.binary('mul', three, graph.binary('mul', nr, nb)), rb
+                ),
+            ),
+            plus(scale(r, nb), scale(b, nr)),
+        ),
+        inv2,
+    )
 
+    def normalization_backward(source, value, direction=None, dot_direction=None):
+        u = zero if direction is None else direction
+        variables = dict(
+            nx=n[0],
+            ny=n[1],
+            nz=n[2],
+            inv=inv,
+            inv2=inv2,
+            active=active,
+            rx=r[0],
+            ry=r[1],
+            rz=r[2],
+            bx=b[0],
+            by=b[1],
+            bz=b[2],
+            nr=nr,
+            nb=nb,
+            rb=rb,
+            vx=value[0],
+            vy=value[1],
+            vz=value[2],
+            ux=u[0],
+            uy=u[1],
+            uz=u[2],
+            nu=dot_direction,
+        )
+        for name, expression in cuda_assignments(source):
+            variables[name] = lower_expression(graph, expression, variables)
+        return tuple((variables[name] for name in ('out_x', 'out_y', 'out_z')))
 
-metadata_lock = Lock()
-metadata_executor = None
+    basis_values = {}
+
+    def harmonic_value(node):
+        if node.index in basis_values:
+            return basis_values[node.index]
+        if node.op == 'input':
+            value = n[node.value[1]]
+        elif node.op == 'constant':
+            value = graph.constant(float.fromhex(node.value))
+        else:
+            args = tuple(harmonic_value(arg) for arg in node.args)
+            if node.op in ('add', 'sub', 'mul', 'div'):
+                value = graph.binary(node.op, *args)
+            elif node.op == 'neg':
+                value = graph.neg(args[0])
+            elif node.op == 'pow':
+                value = graph.power(args[0], node.value)
+            else:
+                value = graph.node(node.op, *args, value=node.value)
+        basis_values[node.index] = value
+        return value
+
+    def polynomial_derivative(component, derivative):
+        degree, column = component
+        divisor = (math.sqrt(4 * math.pi) if meta['normalization'] == 'integral'
+                   else math.sqrt(2 * degree + 1) if meta['normalization'] == 'norm' else 1.0)
+        value = graph.zero
+        for lower_degree, lower_column, coefficient in harmonic_derivative(degree, column, derivative):
+            basis = harmonic_value(raw_outputs['out'][lower_degree * lower_degree + lower_column])
+            value = graph.binary('add', value,
+                                 graph.binary('mul', graph.constant(coefficient / divisor), basis))
+        return value
+
+    weighted_grad = weighted_hess_r = weighted_hess_b = weighted_third = zero
+    weighted_hessian = (graph.zero,) * 6
+    sg, tg = [], []
+    if order == 3:
+        harmonics = {(0, 0): (graph.one, graph.zero, graph.zero, graph.zero)}
+        gradients = {}
+
+        def harmonic_gradients(degree, component):
+            key = (degree, component)
+            if key not in gradients:
+                columns = []
+                for axis in range(3):
+                    values = [graph.zero] * 4
+                    powers = tuple(int(i == axis) for i in range(3))
+                    for l, column, coefficient in harmonic_derivative(degree, component, powers):
+                        lower = harmonic_values(l, column)
+                        for direction in range(4):
+                            values[direction] = graph.binary('add', values[direction],
+                                graph.binary('mul', graph.constant(coefficient), lower[direction]))
+                    columns.append(values)
+                gradients[key] = tuple(tuple(columns[axis][direction] for axis in range(3))
+                                       for direction in range(4))
+            return gradients[key]
+
+        def harmonic_values(degree, component):
+            # a/d/c stay fixed while lowering the raw polynomial. Its input
+            # normalization derivatives are applied once, after contraction.
+            key = (degree, component)
+            if key not in harmonics:
+                grad, grad_a, _, _ = harmonic_gradients(degree, component)
+                harmonics[key] = (graph.binary('mul', dot(n, grad), graph.constant(1.0/degree)),
+                             dot(a, grad), dot(d, grad),
+                             graph.binary('add', dot(d, grad_a), dot(c, grad)))
+            return harmonics[key]
+
+        tg = [graph.zero] * len(components)
+        offset = 0
+        for degree in meta['degrees']:
+            divisor = (math.sqrt(4*math.pi) if meta['normalization'] == 'integral'
+                       else math.sqrt(2*degree+1) if meta['normalization'] == 'norm' else 1.0)
+            factor = graph.constant(1.0/divisor)
+            # Adjacent +/-m components share their lower-degree basis. Keep
+            # that pair close in the CUDA program without changing output slots.
+            component_order = sorted(range(2*degree+1), key=lambda m: abs(m-degree))
+            for component in component_order:
+                column = offset + component
+                grad, grad_a, grad_b, grad_m = harmonic_gradients(degree, component)
+                _, _, _, mixed = harmonic_values(degree, component)
+                g = graph.binary('mul', graph.input('grad_out', column), factor) if 'grad_out' in program['inputs'] else graph.zero
+                h = graph.binary('mul', graph.input('bg', column), factor) if 'bg' in program['inputs'] else graph.zero
+                weighted_grad = plus(weighted_grad, scale(grad, g))
+                weighted_hess_r = plus(weighted_hess_r, scale(grad_a, g))
+                weighted_hess_b = plus(weighted_hess_b, plus(scale(grad_b, g), scale(grad, h)))
+                weighted_third = plus(weighted_third, plus(scale(grad_m, g), scale(grad_a, h)))
+                tg[column] = graph.binary('mul', mixed, factor)
+            offset += 2*degree+1
+    else:
+        for column, component in enumerate(components):
+            grad = tuple(polynomial_derivative(component, tuple(int(k == i) for k in range(3)))
+                         for i in range(3))
+            g = graph.input('grad_out', column) if 'grad_out' in program['inputs'] else graph.zero
+            weighted_grad = plus(weighted_grad, scale(grad, g))
+            if order == 2:
+                hess = [[polynomial_derivative(component,
+                             tuple(int(k == i) + int(k == j) for k in range(3)))
+                         for j in range(3)] for i in range(3)]
+                weighted_hessian = tuple(
+                    graph.binary('add', previous, graph.binary('mul', hess[i][j], g))
+                    for previous, (i, j) in zip(weighted_hessian,
+                                               ((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2))))
+                sg.append(dot(grad, a))
+    if order == 1:
+        outputs = dict(dx=normalization_backward(NORMALIZATION_BACKWARD, weighted_grad))
+    elif order == 2:
+        h00,h01,h02,h11,h12,h22 = weighted_hessian
+        weighted_hess_r = tuple(dot(row, a) for row in (
+            (h00,h01,h02), (h01,h11,h12), (h02,h12,h22),
+        ))
+        outputs = dict(
+            sx=plus(
+                normalization_backward(NORMALIZATION_BACKWARD, weighted_hess_r),
+                normalization_backward(
+                    NORMALIZATION_DOUBLE_BACKWARD, weighted_grad, r, nr
+                ),
+            ),
+            sg=tuple(sg),
+        )
+    else:
+        outputs = dict(
+            tx=plus(
+                plus(
+                    normalization_backward(NORMALIZATION_BACKWARD, weighted_third),
+                    normalization_backward(
+                        NORMALIZATION_DOUBLE_BACKWARD, weighted_hess_b, r, nr
+                    ),
+                ),
+                plus(
+                    normalization_backward(
+                        NORMALIZATION_DOUBLE_BACKWARD, weighted_hess_r, b, nb
+                    ),
+                    normalization_backward(
+                        NORMALIZATION_TRIPLE_BACKWARD, weighted_grad
+                    ),
+                ),
+            ),
+            tg=tuple(tg),
+            trx=plus(
+                normalization_backward(NORMALIZATION_BACKWARD, weighted_hess_b),
+                normalization_backward(
+                    NORMALIZATION_DOUBLE_BACKWARD, weighted_grad, b, nb
+                ),
+            ),
+        )
+    return make_scalar_source(meta, program, graph=graph, outputs=outputs)
 
 
 def program_record(op, order, *, needs=None, available=None):
@@ -468,7 +484,7 @@ def run_backward(
     op, order, x, grad_out, rx=None, bx=None, bg=None,
     *, needs=None, num_items=None, norm_layout=None,
 ):
-    """Run the requested derivative of the same ordered scalar polynomial."""
+    """Run the fused polynomial contraction for the requested backward order."""
     values = {'x': x, 'grad_out': grad_out}
     if order >= 2:
         values['rx'] = rx
@@ -490,48 +506,28 @@ def run_backward(
             for name in program['outputs']
         )
 
-    bound = max(3, op.meta['out_dim']) * num_items + 65535 * 128
+    bound = max(3, op.meta['out_dim']) * num_items + 65535 * BLOCK_THREADS
     if bound > (1 << 63) - 1:
         raise OverflowError('SphericalHarmonics offsets exceed signed int64 capacity')
     index_bits = 64 if bound > (1 << 31) - 1 else op.index_bits
     arch = get_cuda_arch(first.device)
-    layout_specs = None
-    layout_key = None
     if op.normalize and op._lmax > 0:
         norm_layout = normalization_layout(x) if norm_layout is None else norm_layout
-        if all(
-            value.is_contiguous() and value.shape[:-1] == batch
-            for value in values.values() if value is not None
-        ):
-            # Feature reductions share one metadata trace across contiguous batch shapes.
-            layout_key = 'contiguous'
-        else:
-            layout_key = tuple(
-                (name, tuple(value.shape), tuple(value.stride()))
-                for name, value in values.items() if value is not None
-            )
     else:
         norm_layout = None
 
     key = (
         order, tuple(needs) if needs is not None else None, available,
-        index_bits, arch, norm_layout, layout_key, None,
+        index_bits, arch, norm_layout,
     )
     launch_record = op.kernels.get(key)
     if launch_record is None:
         meta = op.meta
         if norm_layout is not None:
             meta = {**meta, 'norm_layout': norm_layout}
-            if layout_key == 'contiguous':
-                layout_specs = {
-                    name: dict(shape=(2, value.shape[-1]), stride=(value.shape[-1], 1))
-                    for name, value in values.items() if value is not None
-                }
-            else:
-                layout_specs = {name: dict(shape=shape, stride=stride) for name, shape, stride in layout_key}
         precision = 'fp64' if meta['dtype'] == torch.float64 else 'fp32'
         phase = ('backward', 'double_backward', 'triple_backward')[order - 1]
-        source = make_backward_source(meta, program, layout_specs=layout_specs)
+        source = make_backward_source(meta, program)
         if order == 1:
             source = combine_cuda_sources({
                 'forward': make_scalar_source(meta, build_forward_program(meta)),

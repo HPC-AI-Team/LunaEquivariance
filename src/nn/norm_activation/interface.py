@@ -46,8 +46,8 @@ def register_ops(metadata, index_bits, dtype):
             return x.new_empty((*x.shape[:-1], metadata["out_dim"])), None if bias is None else bias.new_empty(bias.shape)
 
         def norm_activation_backward_fake_outputs(order, inputs, needs, lower_seeds=None, grad_mode=False):
-            from .kernels.graph import build_program
-            from .kernels.utils import INPUT_ROLES, BIAS_OUTPUTS, output_width
+            from .kernels.graph import build_program, INPUT_ROLES, BIAS_OUTPUTS
+            from .kernels.utils import output_width
 
             x = inputs[0]
             available = tuple(role for role, value in zip(INPUT_ROLES[order], inputs) if value is not None)

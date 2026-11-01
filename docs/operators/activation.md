@@ -67,6 +67,15 @@ Softplus supports `beta` and `threshold`; GELU supports `approximate="none"` or
 `"tanh"`. Set these on `torch.nn.Softplus` / `torch.nn.GELU`, or through `functools.partial`, for
 example `partial(torch.nn.functional.softplus, beta=2.0, threshold=10.0)`.
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: 128 scalar channels per atom; varying batch size
+- Activation: normalized SiLU
+
+![Activation FP32 throughput and peak memory](../assets/performance/activation.png)
+
 ## Limitations
 
 - GPU acceleration requires compute capability 8.0 or later.

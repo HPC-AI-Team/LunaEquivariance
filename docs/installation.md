@@ -14,7 +14,7 @@ pip install LunaEquivariance
 | PyTorch | 2.8 or later, below 3.0 |
 | GPU | NVIDIA GPU with compute capability 8.0 or later |
 | CUDA toolchain | Linux, a CUDA toolkit with `nvcc`, and a compatible C++ compiler |
-| Package dependencies | NumPy, Ninja and e3nn 0.6.x |
+| Package dependencies | NumPy, Ninja and e3nn >=0.5.2,<0.7 |
 | CUTLASS headers | Version 3.8.0 included with the package |
 
 See [Supported operations](operators.rst) for supported devices and data types.

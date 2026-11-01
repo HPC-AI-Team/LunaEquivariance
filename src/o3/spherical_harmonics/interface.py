@@ -252,7 +252,9 @@ __all__ = ['spherical_harmonics']
 def register_ops(degrees, normalize, normalization, index_bits, dtype):
     """Bind harmonic specialization before tracing tensor operations."""
     with REGISTER_OPERATOR_LOCK:
-        name = sha256(repr((degrees, normalize, normalization, index_bits, dtype)).encode()).hexdigest()[:24]
+        name = sha256(repr((
+            'tensor_backward_v2', degrees, normalize, normalization, index_bits, dtype,
+        )).encode()).hexdigest()[:24]
         if hasattr(torch.ops.lunaeq, f"spherical_harmonics_{name}_forward"):
             return f"spherical_harmonics_{name}_forward"
         op = spherical_harmonics_config(degrees, normalize, normalization, dtype, index_bits)
@@ -265,14 +267,35 @@ def register_ops(degrees, normalize, normalization, index_bits, dtype):
         def spherical_harmonics_forward_fake(x):
             return x.new_empty((*x.shape[:-1], sum(2 * degree + 1 for degree in degrees)))
 
+        has_grad = any(degrees)
+
+        def spherical_harmonics_forward_backward(ctx, g):
+            if g is None or not has_grad:
+                return None
+            (x,) = ctx.saved_tensors
+            return spherical_harmonics_backward(x, g)
+
+        def spherical_harmonics_setup_context(ctx, inputs, output):
+            if has_grad:
+                ctx.save_for_backward(*inputs)
+            ctx.set_materialize_grads(False)
+
+        spherical_harmonics_forward.register_autograd(
+            spherical_harmonics_forward_backward, setup_context=spherical_harmonics_setup_context,
+        )
+        # Handle constant harmonics at the autograd boundary so the registered
+        # backward operator always returns a Tensor, including during AOTI.
+        if not has_grad:
+            return f"spherical_harmonics_{name}_forward"
+
         @torch.library.custom_op(f"lunaeq::spherical_harmonics_{name}_backward", mutates_args=(),
-            schema="(Tensor x, Tensor g) -> Tensor?")
+            schema="(Tensor x, Tensor g) -> Tensor")
         def spherical_harmonics_backward(x, g):
             return run_backward(op, 1, x, g)[0]
 
         @spherical_harmonics_backward.register_fake
         def spherical_harmonics_backward_fake(x, g):
-            return torch.empty_like(x, memory_format=torch.contiguous_format) if any(degrees) else None
+            return torch.empty_like(x, memory_format=torch.contiguous_format)
 
         @torch.library.custom_op(f"lunaeq::spherical_harmonics_{name}_double_backward", mutates_args=(),
             schema="(Tensor x, Tensor g, Tensor rx, bool[] needs) -> (Tensor?, Tensor?)")
@@ -304,21 +327,11 @@ def register_ops(degrees, normalize, normalization, index_bits, dtype):
                          if name in program['active_outputs'] else None
                          for name, value in zip(program['outputs'], (x, g, rx)))
 
-        def spherical_harmonics_forward_backward(ctx, g):
-            if g is None:
-                return None
-            (x,) = ctx.saved_tensors
-            return spherical_harmonics_backward(x, g)
-
         def spherical_harmonics_backward_backward(ctx, rx):
             if rx is None:
                 return None, None
             x, g = ctx.saved_tensors
             return spherical_harmonics_double_backward(x, g, rx, list(ctx.needs_input_grad))
-
-        def spherical_harmonics_setup_context(ctx, inputs, output):
-            ctx.save_for_backward(*inputs)
-            ctx.set_materialize_grads(False)
 
         def spherical_harmonics_double_backward_setup(ctx, inputs, output):
             ctx.save_for_backward(*inputs[:3])
@@ -331,7 +344,6 @@ def register_ops(degrees, normalize, normalization, index_bits, dtype):
             result = spherical_harmonics_triple_backward(x, g, rx, bx, bg, list(ctx.needs_input_grad[:3]))
             return *result, None
 
-        spherical_harmonics_forward.register_autograd(spherical_harmonics_forward_backward, setup_context=spherical_harmonics_setup_context)
         spherical_harmonics_backward.register_autograd(spherical_harmonics_backward_backward, setup_context=spherical_harmonics_setup_context)
         spherical_harmonics_double_backward.register_autograd(spherical_harmonics_double_backward_backward, setup_context=spherical_harmonics_double_backward_setup)
 

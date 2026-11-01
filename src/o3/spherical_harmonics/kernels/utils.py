@@ -1,6 +1,8 @@
 """Shared spherical-harmonic kernel configuration and host binding."""
 
-INPUT_ROLES = ('x', 'grad_out', 'rx', 'bx', 'bg')
+BLOCK_THREADS = 128
+OUTPUT_TILE_COLUMNS = 32
+TRIPLE_BACKWARD_MIN_BLOCKS = 3
 
 BACKWARD_INPUTS = ("x", "grad_out")
 BACKWARD_OUTPUTS = ("dx",)
@@ -14,7 +16,7 @@ HOST_BINDING = r"""pybind11::tuple launch({launch_parameters},int64_t num_items)
     auto options={first}.options();
     {allocations}
     cudaStream_t stream=at::cuda::getCurrentCUDAStream();
-{layout_setup}    if(num_items>0) {kernel}<<<std::min<int64_t>(65535,(num_items+127)/128),128,0,stream>>>({arguments},num_items{layout_argument});
+    {layout_setup}    if(num_items>0) {kernel}<<<std::min<int64_t>(65535,(num_items+{block_last})/{block_threads}),{block_threads},0,stream>>>({arguments},num_items{layout_argument});
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return pybind11::make_tuple({results});
 }}

@@ -84,8 +84,10 @@ See the module parameters above.
 
 ```{py:function} LunaEquivariance.make_graph(src, dst, num_nodes=None)
 
-Build a graph once and reuse it across convolution layers with the same connectivity.
-`TensorProductConv.create_graph(src, dst, num_nodes)` is an equivalent entry point.
+Builds the CSR and traversal tables shared by UUU, UVU and UVW convolutions.
+Create the graph on the convolution's device and reuse it while connectivity is unchanged.
+CUDA inputs use fused construction; CPU inputs use PyTorch.
+`TensorProductConv.create_graph(src, dst, num_nodes=None)` is an equivalent entry point.
 
 :param src: Source-node indices of shape `(num_edges,)` or `(num_edges, 1)`, with dtype `torch.int32` or `torch.int64`.
 :type src: `torch.Tensor`
@@ -258,6 +260,36 @@ node features and scalar contributions for each edge. `l0_feat` has shape
 Columns are ordered by output irrep, then instruction order; paths remain separate.
 For UVU, second-input channels are summed within each path. L0 features follow
 the input edge order.
+
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+UUU and UVW configurations:
+
+- Graph: 2,083 atoms, 85,876 edges
+- Features: 64 channels per degree, `Lmax=2–6`
+
+### UUU performance
+
+- Inputs: 64 channels per degree in both inputs
+- Weights: per-edge
+
+![UUU convolution FP32 throughput and peak memory](../assets/performance/uuu_conv.png)
+
+### UVU performance
+
+- Cases: the ten [paper](https://arxiv.org/abs/2610.18393) benchmarks
+- Baseline: e3nn; speedup and memory reduction
+
+![UVU convolution FP32 speedup and memory reduction](../assets/kernel_bench_result_h100.png)
+
+### UVW performance
+
+- Edge features: one spherical-harmonic channel per degree
+- Weights: shared
+
+![UVW convolution FP32 throughput and peak memory](../assets/performance/uvw_conv.png)
 
 ## Limitations
 

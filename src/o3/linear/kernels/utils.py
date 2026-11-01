@@ -6,10 +6,8 @@ import torch
 from ....utils.extension import get_cuda_arch, combine_cuda_sources, load_cuda_extension
 
 TASK_ALIGNMENT = 32
-MAX_BATCH_RANK = 63
 MAX_WEIGHT_SPLITS = 128
-
-LAYOUT_CACHE_LIMIT = 128
+MAX_WEIGHT_BLOCKS = 4096
 
 ORDER_INPUTS = (
     ('x', 'weight', 'bias'),
@@ -141,9 +139,7 @@ def run_kernel(op, order, *inputs, needs=None, num_items=None, backward_needs=No
 
     values = dict(zip(ORDER_INPUTS[order], inputs))
     if order == 0 and not op.meta["generated_specs"]:
-        # A bias-only graph uses features for shape, without reading or
-        # converting its tensor. Remove that unused native pointer while
-        # retaining the logical batch for allocation and derivatives.
+        # Bias-only execution needs x for its batch size, not its values.
         if num_items is None:
             num_items = values["x"].shape[0]
         values["x"] = values["weight"] = None
@@ -189,7 +185,7 @@ def run_kernel(op, order, *inputs, needs=None, num_items=None, backward_needs=No
     arch = get_cuda_arch(first.device)
     index_bits = 64 if counter_bound > (1 << 31) - 1 else op.index_bits
     use_dx_dw_dg_db = False
-    if order in (2, 3):
+    if order in (2, 3) and op.compute_dtype is torch.float64:
         max_components = op.max_components
         if op.meta["weight_numel"] <= 4096 and len(op.meta["generated_specs"]) <= 32 and max_components <= 17:
             if n <= 64:
@@ -272,108 +268,9 @@ def run_kernel(op, order, *inputs, needs=None, num_items=None, backward_needs=No
         if order == 0 and backward_needs is not None:
             op.kernels[key[:-1] + (None,)] = launch
 
-    arguments = [values[role].contiguous() for role in program["inputs"]]
+    arguments = [
+        values[role] if order == 0 else values[role].contiguous()
+        for role in program["inputs"]
+    ]
     result = launch(*arguments, n)
     return result[0] if order == 0 else result
-
-
-def run_raw_forward(op, plan, *, backward_needs=None):
-    roles = plan["roles"]
-    first = (
-        roles["x"] if op.meta["generated_specs"] or roles["bias"] is None else roles["bias"]
-    )
-    if not plan["n"] or not op.meta["out_dim"]:
-        return torch.empty(
-            (plan["n"], op.meta["out_dim"]), device=first.device, dtype=op.compute_dtype
-        )
-
-    available = tuple(
-        role
-        for role, value in roles.items()
-        if value is not None and (role != "x" or op.meta["generated_specs"])
-    )
-    program = select_program(op, 0, available=available)
-    arch = get_cuda_arch(first.device)
-
-    scaled = []
-    for role in ("x", "weight", "bias"):
-        tensor = roles[role]
-        if tensor is None or not tensor.numel():
-            scaled.append(False)
-            continue
-        expected = tensor.stride()[-1]
-        for size, stride in zip(reversed(tensor.shape), reversed(tensor.stride())):
-            if size != 1 and stride != expected:
-                scaled.append(False)
-                break
-            expected *= size
-        else:
-            scaled.append(True)
-    scaled = tuple(scaled)
-
-    key = (op.compute_dtype, available, arch, plan["index_bits"], plan["descriptor"], scaled, backward_needs)
-    launch = op.raw_layout_kernels.get(key)
-    if launch is None:
-        from .forward import make_forward_source
-        from .backward import make_backward_source
-
-        source = make_forward_source(
-            op.meta, program, arch=arch, f_in=op.f_in, f_out=op.f_out, scaled=scaled, layout=True
-        )
-        if backward_needs is not None:
-            backward_available = tuple(
-                role for role, wanted in (
-                    ("x", backward_needs[1]), ("weight", backward_needs[0]),
-                    ("grad_out", True),
-                ) if wanted
-            )
-            backward_program = select_program(
-                op, 1, available=backward_available, needs=backward_needs
-            )
-            source = combine_cuda_sources({
-                "forward": source,
-                "backward": make_backward_source(op.meta, backward_program, arch=arch),
-            })
-            extension = load_cuda_extension(
-                "linear_forward_backward_raw_views", source,
-                index_bits=plan["index_bits"], arch=arch,
-                use_fast_math=False, minimal_headers=True,
-            )
-
-            # Backward uses contiguous saved operands; its index width depends on
-            # contraction workspaces, independently of the original view strides.
-            bound = max(
-                plan["n"] * op.index_batch_span + op.meta["bias_numel"] + 3 * TASK_ALIGNMENT,
-                op.index_workspace_span,
-            ) + 65535 * 256
-            backward_index_bits = 64 if bound > (1 << 31) - 1 else op.index_bits
-            if backward_index_bits != plan["index_bits"]:
-                backward_extension = load_cuda_extension(
-                    "linear_forward_backward_raw_views", source,
-                    index_bits=backward_index_bits, arch=arch,
-                    use_fast_math=False, minimal_headers=True,
-                )
-            else:
-                backward_extension = extension
-            backward_key = (
-                1, backward_needs, backward_available, arch, backward_index_bits,
-                False, op.compute_dtype,
-            )
-            op.kernels[backward_key] = backward_extension.backward.launch
-            launch = extension.forward.RawLayoutLauncher(plan["descriptor"]).launch
-        else:
-            extension = load_cuda_extension(
-                "linear_forward_raw_views", source,
-                index_bits=plan["index_bits"], arch=arch,
-                use_fast_math=False, minimal_headers=True,
-            )
-            launch = extension.RawLayoutLauncher(plan["descriptor"]).launch
-        op.raw_layout_kernels[key] = launch
-        if backward_needs is not None:
-            op.raw_layout_kernels[key[:-1] + (None,)] = launch
-        while len(op.raw_layout_kernels) > LAYOUT_CACHE_LIMIT:
-            op.raw_layout_kernels.popitem(last=False)
-    else:
-        op.raw_layout_kernels.move_to_end(key)
-
-    return launch(*(roles[role] for role in program["inputs"]), plan["n"])[0]

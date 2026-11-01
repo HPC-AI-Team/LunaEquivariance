@@ -17,13 +17,9 @@ _IRREPS_MISSING = object()
 
 
 @torch.compiler.assume_constant_result
-def register_ops(paths, index_bits, gate_layout=None):
-    """Register a static activation or gate; runtime operators accept tensors and flags."""
-    layout = None if gate_layout is None else {
-        key: gate_layout[key]
-        for key in ("in_dim", "out_dim", "scalar_paths", "gated_paths", "scalar_activation", "has_grad")
-    }
-    suffix = sha256(repr((paths, index_bits, layout)).encode()).hexdigest()[:24]
+def register_ops(paths, index_bits):
+    """Register the static Activation tensor operators."""
+    suffix = sha256(repr((paths, index_bits)).encode()).hexdigest()[:24]
     name = f"activation_{suffix}_forward"
     with REGISTER_OPERATOR_LOCK:
         if hasattr(torch.ops.lunaeq, name):
@@ -32,11 +28,11 @@ def register_ops(paths, index_bits, gate_layout=None):
 
         @torch.library.custom_op(f"lunaeq::activation_{suffix}_forward", mutates_args=())
         def activation_forward_op(x: torch.Tensor) -> torch.Tensor:
-            return forward.activation_forward(x, paths, bits, cache, layout)[0]
+            return forward.activation_forward(x, paths, bits, cache)[0]
 
         @activation_forward_op.register_fake
         def activation_forward_fake(x):
-            width = sum(width for width, _ in paths) if layout is None else layout["out_dim"]
+            width = sum(width for width, _ in paths)
             return x.new_empty((*x.shape[:-1], width))
 
         def activation_backward_fake_outputs(order, inputs, needs=None, grad_mode=False):
@@ -44,9 +40,9 @@ def register_ops(paths, index_bits, gate_layout=None):
             available = tuple(name for name, value in zip(names, inputs) if value is not None)
             x = next(value for value in inputs if value is not None)
             program = get_kernel_config(paths, order, x.dtype, cache, needs=needs, available=available,
-                                        grad_mode=grad_mode, gate_layout=layout)
-            in_dim = sum(width for width, _ in paths) if layout is None else layout["in_dim"]
-            out_dim = in_dim if layout is None else layout["out_dim"]
+                                        grad_mode=grad_mode)
+            in_dim = sum(width for width, _ in paths)
+            out_dim = in_dim
             return tuple(
                 x.new_empty((*x.shape[:-1], out_dim if name in ("sg", "tg") else in_dim))
                 if name in program["active_outputs"] else None
@@ -55,7 +51,7 @@ def register_ops(paths, index_bits, gate_layout=None):
 
         @torch.library.custom_op(f"lunaeq::activation_{suffix}_backward", mutates_args=())
         def activation_backward_op(x: torch.Tensor, g: torch.Tensor, grad_mode: bool) -> torch.Tensor:
-            return backward.activation_backward(x, g, paths, bits, cache, layout, x.dtype, grad_mode=grad_mode)
+            return backward.activation_backward(x, g, paths, bits, cache, x.dtype, grad_mode=grad_mode)
 
         @activation_backward_op.register_fake
         def activation_backward_fake(x, g, grad_mode):
@@ -65,7 +61,7 @@ def register_ops(paths, index_bits, gate_layout=None):
                                  schema="(Tensor x, Tensor g, Tensor rx, bool[] needs) -> (Tensor?, Tensor?)")
         def activation_double_backward_op(x: torch.Tensor, g: torch.Tensor, rx: torch.Tensor,
                                           needs: list[bool]) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-            return double_backward.activation_double_backward(x, g, rx, paths, bits, cache, layout, x.dtype, needs=needs)
+            return double_backward.activation_double_backward(x, g, rx, paths, bits, cache, x.dtype, needs=needs)
 
         @activation_double_backward_op.register_fake
         def activation_double_backward_fake(x, g, rx, needs):
@@ -77,7 +73,7 @@ def register_ops(paths, index_bits, gate_layout=None):
                                           bx: torch.Tensor | None, bg: torch.Tensor | None,
                                           needs: list[bool]) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
             return triple_backward.activation_triple_backward(x, g, rx, bx, bg, paths, bits, cache,
-                                                               layout, x.dtype, needs=needs)
+                                                               x.dtype, needs=needs)
 
         @activation_triple_backward_op.register_fake
         def activation_triple_backward_fake(x, g, rx, bx, bg, needs):
@@ -87,7 +83,7 @@ def register_ops(paths, index_bits, gate_layout=None):
             (x,) = inputs
             ctx.set_materialize_grads(False)
             ctx.save_for_backward(x)
-            program = get_kernel_config(paths, 1, x.dtype, cache, grad_mode=True, gate_layout=layout)
+            program = get_kernel_config(paths, 1, x.dtype, cache, grad_mode=True)
             if not program["active_outputs"]:
                 ctx.mark_non_differentiable(output)
 
@@ -201,23 +197,22 @@ def activation(features, irreps_in=None, acts=None, dim=-1, *, paths=None, kerne
         kernel_cache = OrderedDict()
     if torch.is_inference_mode_enabled():
         with torch.no_grad():
-            result = ActivationFunction.apply(value, paths, 32, kernel_cache, None)
+            result = ActivationFunction.apply(value, paths, 32, kernel_cache)
     else:
-        result = ActivationFunction.apply(value, paths, 32, kernel_cache, None)
+        result = ActivationFunction.apply(value, paths, 32, kernel_cache)
     return result.movedim(-1, dim) if dim != ndim - 1 else result
 
 
 class ActivationFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, features, paths, index_bits, kernel_cache, gate_layout):
+    def forward(ctx, features, paths, index_bits, kernel_cache):
         result, backward_kernel, differentiable, save_input = forward.activation_forward(
-            features, paths, index_bits, kernel_cache, gate_layout
+            features, paths, index_bits, kernel_cache
         )
         if ctx.needs_input_grad[0]:
             ctx.paths = paths
             ctx.index_bits = index_bits
             ctx.kernel_cache = kernel_cache
-            ctx.gate_layout = gate_layout
             ctx.backward_kernel = backward_kernel
             ctx.set_materialize_grads(False)
             ctx.save_for_backward(features if save_input or features.numel() == 0 else None)
@@ -228,41 +223,40 @@ class ActivationFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         if grad_output is None:
-            return None, None, None, None, None
+            return None, None, None, None
 
         (features,) = ctx.saved_tensors
         if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
             grad_input = ActivationBackward.apply(
                 features, grad_output, ctx.paths, ctx.index_bits,
-                ctx.kernel_cache, ctx.gate_layout, grad_output.dtype,
+                ctx.kernel_cache, grad_output.dtype,
             )
         elif ctx.backward_kernel is not None:
             grad_input = ctx.backward_kernel(features, grad_output)
         else:
             grad_input = backward.activation_backward(
                 features, grad_output, ctx.paths, ctx.index_bits,
-                ctx.kernel_cache, ctx.gate_layout, grad_output.dtype,
+                ctx.kernel_cache, grad_output.dtype,
             )
-        return grad_input, None, None, None, None
+        return grad_input, None, None, None
 
 
 class ActivationBackward(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, features, grad_output, paths, index_bits, kernel_cache, gate_layout, dtype):
+    def forward(ctx, features, grad_output, paths, index_bits, kernel_cache, dtype):
         ctx.paths = paths
         ctx.index_bits = index_bits
         ctx.kernel_cache = kernel_cache
-        ctx.gate_layout = gate_layout
         ctx.dtype = dtype
         ctx.set_materialize_grads(False)
 
         result = backward.activation_backward(
-            features, grad_output, paths, index_bits, kernel_cache, gate_layout, dtype, grad_mode=True
+            features, grad_output, paths, index_bits, kernel_cache, dtype, grad_mode=True
         )
 
         config = get_kernel_config(
             paths, 2, dtype, kernel_cache, needs=ctx.needs_input_grad[:2],
-            available=("x", "grad_out", "rx"), gate_layout=gate_layout,
+            available=("x", "grad_out", "rx"),
         )
         ctx.save_for_backward(
             features if features is not None and ("x" in config["inputs"] or features.numel() == 0) else None,
@@ -279,29 +273,28 @@ class ActivationBackward(torch.autograd.Function):
         if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
             gradients = ActivationDoubleBackward.apply(
                 features, grad_output, grad_grad_input, ctx.paths, ctx.index_bits,
-                ctx.kernel_cache, ctx.gate_layout, ctx.dtype, needs,
+                ctx.kernel_cache, ctx.dtype, needs,
             )
         else:
             gradients = double_backward.activation_double_backward(
                 features, grad_output, grad_grad_input, ctx.paths, ctx.index_bits,
-                ctx.kernel_cache, ctx.gate_layout, ctx.dtype, needs=needs,
+                ctx.kernel_cache, ctx.dtype, needs=needs,
             )
-        return *gradients, None, None, None, None, None
+        return *gradients, None, None, None, None
 
 
 class ActivationDoubleBackward(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, features, grad_output, grad_grad_input, paths, index_bits, kernel_cache, gate_layout, dtype, needs):
+    def forward(ctx, features, grad_output, grad_grad_input, paths, index_bits, kernel_cache, dtype, needs):
         ctx.paths = paths
         ctx.index_bits = index_bits
         ctx.kernel_cache = kernel_cache
-        ctx.gate_layout = gate_layout
         ctx.dtype = dtype
         ctx.set_materialize_grads(False)
 
         result = double_backward.activation_double_backward(
             features, grad_output, grad_grad_input, paths, index_bits,
-            kernel_cache, gate_layout, dtype, needs=needs,
+            kernel_cache, dtype, needs=needs,
         )
 
         required = set()
@@ -310,7 +303,7 @@ class ActivationDoubleBackward(torch.autograd.Function):
                 continue
             config = get_kernel_config(
                 paths, 3, dtype, kernel_cache, needs=ctx.needs_input_grad[:3],
-                available=("x", "grad_out", "rx", grad_name), gate_layout=gate_layout,
+                available=("x", "grad_out", "rx", grad_name),
             )
             required.update(config["inputs"])
             if not config["active_outputs"]:
@@ -327,10 +320,10 @@ class ActivationDoubleBackward(torch.autograd.Function):
         features, grad_output, grad_grad_input = ctx.saved_tensors
         gradients = triple_backward.activation_triple_backward(
             features, grad_output, grad_grad_input, grad_input, grad_grad_output,
-            ctx.paths, ctx.index_bits, ctx.kernel_cache, ctx.gate_layout, ctx.dtype,
+            ctx.paths, ctx.index_bits, ctx.kernel_cache, ctx.dtype,
             needs=ctx.needs_input_grad[:3],
         )
-        return *gradients, None, None, None, None, None, None
+        return *gradients, None, None, None, None, None
 
 
 __all__ = ['activation']

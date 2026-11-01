@@ -1,6 +1,8 @@
 """Activation backward CUDA kernel and launch."""
 
-from .utils import make_path_types, make_binding, get_kernel_config, launch_kernel
+from .utils import (
+    BINDING, MODULE_BINDING, make_path_types, make_binding, get_kernel_config, launch_kernel,
+)
 
 
 BACKWARD_MATH = r'''template<ActivationKind Kind, bool Normalize, bool Differentiable>
@@ -72,11 +74,54 @@ void activation_backward_kernel(
 }
 
 template<auto Width, bool Differentiable, bool NeedX, bool NeedGrad, class... Paths>
+__global__ __launch_bounds__(128, 1)
+void activation_backward_vectorized_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_x,
+    int64_t num_items) {
+    const int64_t count = num_items * (Width / 4);
+    for (Index item = Index(blockIdx.x) * 128 + threadIdx.x;
+         item < count; item += Index(gridDim.x) * 128) {
+        const Index column = (item * 4) % Width;
+        float4 values = make_float4(0, 0, 0, 0);
+        float4 gradients = make_float4(0, 0, 0, 0);
+        if constexpr (NeedX) values = reinterpret_cast<const float4*>(x)[item];
+        if constexpr (NeedGrad) gradients = reinterpret_cast<const float4*>(grad_out)[item];
+        float4 result;
+        ((column < Paths::end
+            ? (result = make_float4(
+                   activation_backward_value<Paths::kind, Paths::normalize, Differentiable>(
+                       values.x, gradients.x, Paths::parameters()),
+                   activation_backward_value<Paths::kind, Paths::normalize, Differentiable>(
+                       values.y, gradients.y, Paths::parameters()),
+                   activation_backward_value<Paths::kind, Paths::normalize, Differentiable>(
+                       values.z, gradients.z, Paths::parameters()),
+                   activation_backward_value<Paths::kind, Paths::normalize, Differentiable>(
+                       values.w, gradients.w, Paths::parameters())), true)
+            : false) || ...);
+        reinterpret_cast<float4*>(grad_x)[item] = result;
+    }
+}
+
+template<auto Width, bool Differentiable, bool NeedX, bool NeedGrad, class... Paths>
 void run_activation_backward(
     const Element* x, const Element* grad_out, Element* grad_x,
     int64_t num_items, cudaStream_t stream) {
     if (num_items == 0) return;
     const int64_t count = num_items * Width;
+    if constexpr (std::is_same_v<Element, float> && Width % 4 == 0 &&
+                  ((Paths::end % 4 == 0) && ...)) {
+        if (count >= VectorMinElements &&
+            (!NeedX || reinterpret_cast<uintptr_t>(x) % 16 == 0) &&
+            (!NeedGrad || reinterpret_cast<uintptr_t>(grad_out) % 16 == 0)) {
+            const int64_t vector_count = num_items * (Width / 4);
+            const unsigned blocks = std::min<int64_t>(65535, (vector_count + 127) / 128);
+            activation_backward_vectorized_kernel<Width, Differentiable, NeedX, NeedGrad, Paths...><<<blocks, 128, 0, stream>>>(
+                x, grad_out, grad_x, num_items);
+            return;
+        }
+    }
     const unsigned blocks = std::min<int64_t>(65535, (count + 127) / 128);
     activation_backward_kernel<Width, Differentiable, NeedX, NeedGrad, Paths...><<<blocks, 128, 0, stream>>>(
         x, grad_out, grad_x, num_items);
@@ -140,51 +185,6 @@ BACKWARD_CALL = r'''
 '''
 
 
-BINDING = r'''using Element={scalar};{layout_declarations}
-{declarations}
-{kernel_body}
-{result_type} launch({tensor_parameters},int64_t num_items) {{
-    c10::cuda::CUDAGuard guard({first}.device());
-    auto options={first}.options();
-    {allocations}
-    cudaStream_t stream=at::cuda::getCurrentCUDAStream();{layout_host}
-    {launch}
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {result_return};
-}}
-'''
-
-
-MODULE_BINDING = r'''PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("launch",&launch);}
-'''
-
-
-TENSOR_BINDING = r'''
-torch::Tensor launch_tensor({args}) {{
-    c10::cuda::CUDAGuard guard(x.device());
-    const int64_t num_items=x.numel()/{width};
-    constexpr int64_t padding=65535*128;
-    TORCH_CHECK(num_items<=(std::numeric_limits<int64_t>::max()-padding)/{max_width},"Pointwise task offsets exceed int64");
-{checks}
-{call}
-    auto result={result_value};
-    std::vector<int64_t> shape(x.sizes().begin(),x.sizes().end());
-    shape.back()={result_width};
-    // The fresh output owns its storage. Remove the host reshape's view
-    // metadata before Python autograd attaches the custom backward.
-    return result.reshape(shape).detach();
-}}
-'''
-
-
-TENSOR_MODULE_BINDING = r'''    m.def("launch_backward",&backward_impl::launch_tensor);
-    m.def("launch_backward_tuple", [](torch::Tensor x, torch::Tensor grad_out, int64_t num_items) {
-        return pybind11::make_tuple(backward_impl::contiguous::launch(x, grad_out, num_items));
-    });
-}
-'''
-
-
 def required_inputs(paths):
     """Identity reads only grad_out; nonlinear activations also read x."""
     if not paths:
@@ -219,10 +219,10 @@ def make_source(activation_paths, in_dim, config, *, tensor_only=False, fragment
     )
 
 
-def activation_backward(features, grad_output, paths, index_bits, kernel_cache, gate_layout, dtype, *, grad_mode=False):
+def activation_backward(features, grad_output, paths, index_bits, kernel_cache, dtype, *, grad_mode=False):
     inputs = features, grad_output
     available = tuple(name for name, value in zip(("x", "grad_out"), inputs) if value is not None)
     config = get_kernel_config(
-        paths, 1, dtype, kernel_cache, available=available, grad_mode=grad_mode, gate_layout=gate_layout
+        paths, 1, dtype, kernel_cache, available=available, grad_mode=grad_mode
     )
-    return launch_kernel(inputs, config, paths, index_bits, kernel_cache, make_source, gate_layout)[0]
+    return launch_kernel(inputs, config, paths, index_bits, kernel_cache, make_source)[0]

@@ -1,6 +1,10 @@
-"""FP32 differential arithmetic and stride-aware views shared by fused kernels."""
+"""Shared tensor views, directional arithmetic, and CUTLASS GEMM source."""
+
 import torch
+
 from ....utils.extension import get_cuda_arch, load_cuda_extension
+from ...varlen_attention.kernels.utils import GEMM_SOURCE, dtype_defines
+
 
 CUDA_SOURCE = r"""
 
@@ -12,34 +16,30 @@ CUDA_SOURCE = r"""
 #include <optional>
 #include <vector>
 
-#if defined(LOWP_BF16)
-#include <cassert>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <mma.h>
-#endif
 
 // Value, two directional derivatives, and their mixed derivative.
 // Compile-time width removes unused arithmetic from lower derivative orders.
 template <int N> struct Differential {
     float x[N];
-    __device__ Differential(float value = 0.f) {
+    __device__ __forceinline__ Differential(float value = 0.f) {
         x[0] = value;
         for (int i = 1; i < N; ++i)
             x[i] = 0.f;
     }
 };
-template <int N> __device__ Differential<N> operator+(Differential<N> a, Differential<N> b) {
+template <int N> __device__ __forceinline__ Differential<N> operator+(Differential<N> a, Differential<N> b) {
     for (int i = 0; i < N; ++i)
         a.x[i] += b.x[i];
     return a;
 }
-template <int N> __device__ Differential<N> operator-(Differential<N> a, Differential<N> b) {
+template <int N> __device__ __forceinline__ Differential<N> operator-(Differential<N> a, Differential<N> b) {
     for (int i = 0; i < N; ++i)
         a.x[i] -= b.x[i];
     return a;
 }
-template <int N> __device__ Differential<N> operator*(Differential<N> a, Differential<N> b) {
+template <int N> __device__ __forceinline__ Differential<N> operator*(Differential<N> a, Differential<N> b) {
     Differential<N> c(a.x[0] * b.x[0]);
     if constexpr (N >= 2)
         c.x[1] = fmaf(a.x[1], b.x[0], a.x[0] * b.x[1]);
@@ -49,7 +49,7 @@ template <int N> __device__ Differential<N> operator*(Differential<N> a, Differe
     }
     return c;
 }
-template <int N> __device__ Differential<N> reciprocal(Differential<N> a) {
+template <int N> __device__ __forceinline__ Differential<N> reciprocal(Differential<N> a) {
     float inv = 1.f / a.x[0];
     Differential<N> b(inv);
     if constexpr (N >= 2)
@@ -60,8 +60,8 @@ template <int N> __device__ Differential<N> reciprocal(Differential<N> a) {
     }
     return b;
 }
-template <int N> __device__ Differential<N> exponential(Differential<N> a) {
-    float e = expf(a.x[0]);
+template <int N> __device__ __forceinline__ Differential<N> exponential(Differential<N> a) {
+    float e = __expf(a.x[0]);
     Differential<N> b(e);
     if constexpr (N >= 2)
         b.x[1] = e * a.x[1];
@@ -71,7 +71,7 @@ template <int N> __device__ Differential<N> exponential(Differential<N> a) {
     }
     return b;
 }
-template <int N> __device__ Differential<N> warp_sum(Differential<N> a) {
+template <int N> __device__ __forceinline__ Differential<N> warp_sum(Differential<N> a) {
     for (int offset = 16; offset; offset /= 2)
         for (int c = 0; c < N; ++c)
             a.x[c] += __shfl_xor_sync(0xffffffff, a.x[c], offset);
@@ -85,48 +85,22 @@ struct View {
 #else
     float *data = nullptr;
 #endif
-    __device__ float* fp32_data() const {
-#if defined(LOWP_BF16)
-        assert(dtype == 0);
-        return static_cast<float*>(data);
-#else
-        return data;
-#endif
-    }
-    int64_t stride[4] = {}, size[4] = {};
-    __device__ int64_t index(int64_t i, int64_t j = 0, int64_t k = 0, int64_t l = 0) const {
+    int64_t stride[4] = {};
+    __device__ __forceinline__ int64_t index(int64_t i, int64_t j = 0, int64_t k = 0, int64_t l = 0) const {
         return i * stride[0] + j * stride[1] + k * stride[2] + l * stride[3];
     }
-    __device__ float load(int64_t offset) const {
+    __device__ __forceinline__ float load(int64_t offset, int slot) const {
 #if defined(LOWP_BF16)
-        if (dtype == 0) return static_cast<const float *>(data)[offset];
-        if (dtype == 1) return __half2float(static_cast<const __half *>(data)[offset]);
+        constexpr uint64_t types=INPUT_DTYPES;
+        int type=(types>>(2*slot))&3u;
+        if (type == 0) return static_cast<const float *>(data)[offset];
+        if (type == 1) return __half2float(static_cast<const __half *>(data)[offset]);
         return __bfloat162float(static_cast<const __nv_bfloat16 *>(data)[offset]);
 #else
         return data[offset];
 #endif
     }
-    // Four adjacent storage values, with one aligned global load.
-    __device__ float4 load4(int64_t offset) const {
-#if defined(LOWP_BF16)
-        if(dtype != 0) {
-            uint2 bits=*reinterpret_cast<const uint2*>(static_cast<const char*>(data)+offset*2);
-            float2 a,b;
-            if(dtype == 1) {
-                a=__half22float2(*reinterpret_cast<const __half2*>(&bits.x));
-                b=__half22float2(*reinterpret_cast<const __half2*>(&bits.y));
-            } else {
-                a=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bits.x));
-                b=__bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bits.y));
-            }
-            return {a.x,a.y,b.x,b.y};
-        }
-        return *reinterpret_cast<const float4*>(static_cast<const float*>(data)+offset);
-#else
-        return *reinterpret_cast<const float4*>(data+offset);
-#endif
-    }
-    __device__ void store(int64_t offset, float v) const {
+    __device__ __forceinline__ void store(int64_t offset, float v) const {
 #if defined(LOWP_BF16)
         if (dtype == 0) static_cast<float *>(data)[offset] = v;
         else if (dtype == 1) static_cast<__half *>(data)[offset] = __float2half_rn(v);
@@ -135,28 +109,14 @@ struct View {
         data[offset] = v;
 #endif
     }
-    __device__ void accumulate(int64_t offset, float v) const {
-#if defined(LOWP_BF16)
-        assert(dtype == 0);
-        static_cast<float *>(data)[offset] += v;
-#else
-        data[offset] += v;
-#endif
+    // Gradient storage is allocated once in FP32 for every input dtype.
+    __device__ __forceinline__ void accumulate(int64_t offset, float v) const {
+        static_cast<float*>(data)[offset] += v;
     }
-    __device__ void atomic_add(int64_t offset, float v) const {
-#if defined(LOWP_BF16)
-        assert(dtype == 0);
-        atomicAdd(static_cast<float *>(data) + offset, v);
-#else
-        atomicAdd(data + offset, v);
-#endif
+    __device__ __forceinline__ void atomic_add(int64_t offset, float v) const {
+        atomicAdd(static_cast<float*>(data) + offset, v);
     }
-    __device__ float get(int64_t i, int64_t j = 0, int64_t k = 0, int64_t l = 0) const {
-        return data ? load(index(i, j, k, l)) : 0.f;
-    }
-    __device__ void add(float v, int64_t i, int64_t j = 0, int64_t k = 0, int64_t l = 0) const {
-        if (data) accumulate(index(i, j, k, l), v);
-    }
+
 };
 View view(std::optional<at::Tensor> const &t) {
     View v;
@@ -169,7 +129,6 @@ View view(std::optional<at::Tensor> const &t) {
 #endif
         for (int i = 0; i < t->dim(); ++i) {
             v.stride[i] = t->stride(i);
-            v.size[i] = t->size(i);
         }
     }
     return v;
@@ -180,7 +139,7 @@ struct Params {
     bool csr64;
     int64_t csr_stride;
     float scale;
-    __device__ int64_t offset(int64_t a) const {
+    __device__ __forceinline__ int64_t offset(int64_t a) const {
         return csr64 ? static_cast<int64_t const *>(csr)[a * csr_stride]
                      : static_cast<int const *>(csr)[a * csr_stride];
     }
@@ -198,93 +157,220 @@ Params params(std::vector<std::optional<at::Tensor>> const &in,
     p.scale = scale;
     return p;
 }
-template <int N>
-__device__ Differential<N> input(Params const &p, int slot, int64_t i, int64_t j = 0, int64_t k = 0,
-                                 int64_t l = 0) {
-    Differential<N> v(p.in[slot].get(i, j, k, l));
-    if constexpr (N >= 2)
-        v.x[1] = p.in[7 + slot].get(i, j, k, l);
-    if constexpr (N == 4)
-        v.x[2] = p.in[12 + slot].get(i, j, k, l);
-    return v;
-}
-template <int N>
-__device__ Differential<N> upstream(Params const &p, int slot, int64_t i, int h, int c) {
-    Differential<N> v(p.in[slot].get(i, h, c));
-    if constexpr (N == 4)
-        v.x[2] = p.in[slot + 12].get(i, h, c);
-    return v;
-}
-template <int N>
-__device__ Differential<N> score(Params const &p, int64_t atom, int64_t begin, int64_t q, int64_t k,
-                                 int h) {
-    Differential<N> a;
-    for (int c = 0; c < DIM; ++c)
-        a = a + input<N>(p, 0, q, h, c) * input<N>(p, 1, k, h, c);
-    a = a * Differential<N>(p.scale);
-    if constexpr (BIAS_KIND == 1)
-        a = a + input<N>(p, 3, k, h);
-    if constexpr (BIAS_KIND == 2)
-        a = a + input<N>(p, 3, atom, h, q - begin, k - begin);
-    return a;
-}
-// Every CTA owns one complete atom, including its heads. Thus envelope gradients
-// and all node/key reductions need neither atomics nor global scratch storage.
-__device__ void clear_outputs(Params const &p, int slots, int64_t atom, int64_t begin,
-                              int64_t end) {
-    for (int slot = 0; slot < slots; ++slot) {
-        View v = p.out[slot];
-        if (!v.data)
-            continue;
-        int field = slot >= 7 ? slot - 7 : slot;
-        if (field == 5) {
-            for (int h = 0; h < HEADS; ++h)
-                for (int c = threadIdx.x; c < VALUE_DIM; c += 32)
-                    v.store(v.index(atom, h, c), 0.f);
-        } else if (field == 3 && BIAS_KIND == 2) {
-            int64_t count = v.size[2] * v.size[3];
-            for (int h = 0; h < HEADS; ++h)
-                for (int64_t i = threadIdx.x; i < count; i += 32)
-                    v.store(v.index(atom, h, i / v.size[3], i % v.size[3]), 0.f);
-        } else if (field == 4) {
-            for (int64_t i = begin + threadIdx.x; i < end; i += 32)
-                v.store(v.index(i), 0.f);
-        } else {
-            int width = field < 2 ? DIM : (field == 3 ? 1 : VALUE_DIM);
-            for (int64_t i = begin + threadIdx.x; i < end; i += 32)
-                for (int h = 0; h < HEADS; ++h)
-                    for (int c = 0; c < width; ++c)
-                        v.store(v.index(i, h, c), 0.f);
-        }
+// Compile-time presence removes missing bias, envelope and gradient seeds.
+// Packed tensors use the known feature width; arbitrary strides use View.
+__device__ __forceinline__ int64_t input_offset(Params const& p,int actual,int slot,
+    int64_t i,int64_t j,int64_t k,int64_t l=0) {
+    if(CONTIGUOUS&(1u<<actual)) {
+        if(slot==0 || slot==1) return (i*HEADS+j)*DIM+k;
+        if(slot==2 || slot==5 || slot==6) return (i*HEADS+j)*VALUE_DIM+k;
+        if(slot==4) return i;
     }
-    __syncwarp();
+    return p.in[actual].index(i,j,k,l);
+}
+template <int N>
+__device__ __forceinline__ Differential<N> input(Params const& p,int slot,int64_t i,int64_t j=0,
+    int64_t k=0,int64_t l=0) {
+    Differential<N> value;
+    if(PRESENT&(1u<<slot)) value.x[0]=p.in[slot].load(input_offset(p,slot,slot,i,j,k,l),slot);
+    if constexpr(N>=2)
+        if(PRESENT&(1u<<(7+slot))) value.x[1]=p.in[7+slot].load(input_offset(p,7+slot,slot,i,j,k,l),7+slot);
+    if constexpr(N==4)
+        if(PRESENT&(1u<<(12+slot))) value.x[2]=p.in[12+slot].load(input_offset(p,12+slot,slot,i,j,k,l),12+slot);
+    return value;
+}
+template <int N>
+__device__ __forceinline__ Differential<N> upstream(Params const& p,int slot,int64_t i,int h,int c) {
+    Differential<N> value;
+    if(PRESENT&(1u<<slot)) value.x[0]=p.in[slot].load(input_offset(p,slot,slot,i,h,c),slot);
+    if constexpr(N==4)
+        if(PRESENT&(1u<<(12+slot))) value.x[2]=p.in[12+slot].load(input_offset(p,12+slot,slot,i,h,c),12+slot);
+    return value;
+}
+
+"""
+
+
+GEMM_DIFFERENTIAL_SOURCE = r"""
+#if LOW_PRECISION
+// CUTLASS still requires iterator interfaces when operands are already staged.
+struct ConvReadyOperand {
+    using Fragment=cutlass::Array<GemmElement,1>;
+    __device__ __forceinline__ ConvReadyOperand() {}
+    template<typename Ref> __device__ __forceinline__ ConvReadyOperand(Ref const&,int) {}
+    __device__ __forceinline__ void clear_mask(bool) {}
+    __device__ __forceinline__ ConvReadyOperand& operator++() {return *this;}
+    __device__ __forceinline__ void load(Fragment& fragment) const {fragment.clear();}
+    __device__ __forceinline__ void store(Fragment const&) const {}
+};
+
+// Raw Q/K/V tiles retain their storage type until the TensorOp mainloop.
+// Coefficients and all higher-order products keep their FP32 arithmetic.
+template<int Slot,bool Transpose>
+struct ConvGemmFeature {
+    Params const& p;
+    int64_t begin,end;
+    int head,channel=0;
+    static constexpr int Width=Slot==2 ? VALUE_DIM:DIM;
+    static constexpr int InputType=(INPUT_DTYPES>>(2*Slot))&3u;
+
+    __device__ __forceinline__ GemmElement operator()(int row,int column) const {
+        int64_t edge=begin+(Transpose ? column:row);
+        int c=channel+(Transpose ? row:column);
+        if(edge>=end || c>=Width) return GemmElement(0.f);
+        int64_t offset=input_offset(p,Slot,Slot,edge,head,c);
+        if constexpr(InputType==0) return GemmElement(static_cast<float const*>(p.in[Slot].data)[offset]);
+        else return static_cast<GemmElement const*>(p.in[Slot].data)[offset];
+    }
+
+    template<bool First,typename Fragment>
+    __device__ __forceinline__ void load8(Fragment& fragment,int index,int row,int column) const {
+        if constexpr(First==Transpose && InputType!=0 && (CONTIGUOUS&(1u<<Slot))) {
+            int64_t edge=begin+(Transpose ? column:row);
+            int c=channel+(Transpose ? row:column);
+            auto pointer=static_cast<GemmElement const*>(p.in[Slot].data)+input_offset(p,Slot,Slot,edge,head,c);
+            if(edge<end && c+7<Width && (reinterpret_cast<uintptr_t>(pointer)&15u)==0) {
+                uint4 packed=*reinterpret_cast<uint4 const*>(pointer);
+                auto values=reinterpret_cast<GemmElement const*>(&packed);
+                #pragma unroll
+                for(int i=0;i<8;++i) fragment[index+i]=values[i];
+                return;
+            }
+        }
+        #pragma unroll
+        for(int i=0;i<8;++i)
+            fragment[index+i]=operator()(row+(First ? i:0),column+(First ? 0:i));
+    }
+};
+#endif
+
+// Concatenate product-rule terms along K. Each requested derivative
+// component is one complete CUTLASS GEMM, with one accumulator epilogue.
+// Selected components occupy consecutive output tiles.
+template<int N, bool LeftMixed=true, bool RightMixed=true,
+    unsigned Components=(1u<<N)-1, int Columns, bool RowMajorB, typename Left, typename Right>
+__device__ __forceinline__ void differential_gemm(AttentionGemmTile<Columns,RowMajorB>& shared, float (*output)[32*Columns],
+    int reduction, Left left, Right right) {
+    if constexpr(Components&1u)
+        attention_gemm(shared,output[0],reduction,
+            [&](int row,int k) {return left(row,k).x[0];},
+            [&](int k,int column) {return right(k,column).x[0];});
+    if constexpr(N>=2 && (Components&2u))
+        attention_gemm(shared,output[int(bool(Components&1u))],2*reduction,
+            [&](int row,int k) {return k<reduction ? left(row,k).x[1]:left(row,k-reduction).x[0];},
+            [&](int k,int column) {return k<reduction ? right(k,column).x[0]:right(k-reduction,column).x[1];});
+    if constexpr(N==4 && (Components&4u))
+        attention_gemm(shared,output[int(bool(Components&1u))+int(bool(Components&2u))],2*reduction,
+            [&](int row,int k) {return k<reduction ? left(row,k).x[2]:left(row,k-reduction).x[0];},
+            [&](int k,int column) {return k<reduction ? right(k,column).x[0]:right(k-reduction,column).x[2];});
+    if constexpr(N==4 && (Components&8u)) {
+        constexpr int terms=2+int(LeftMixed)+int(RightMixed);
+        attention_gemm(shared,output[int(bool(Components&1u))+int(bool(Components&2u))+int(bool(Components&4u))],terms*reduction,
+            [&](int row,int k) {
+                if(k<reduction) return left(row,k).x[1];
+                if(k<2*reduction) return left(row,k-reduction).x[2];
+                if constexpr(LeftMixed) {
+                    if(k<3*reduction) return left(row,k-2*reduction).x[3];
+                    if constexpr(RightMixed) return left(row,k-3*reduction).x[0];
+                } else if constexpr(RightMixed) return left(row,k-2*reduction).x[0];
+                return 0.f;
+            },
+            [&](int k,int column) {
+                if(k<reduction) return right(k,column).x[2];
+                if(k<2*reduction) return right(k-reduction,column).x[1];
+                if constexpr(LeftMixed) {
+                    if(k<3*reduction) return right(k-2*reduction,column).x[0];
+                    if constexpr(RightMixed) return right(k-3*reduction,column).x[3];
+                } else if constexpr(RightMixed) return right(k-2*reduction,column).x[3];
+                return 0.f;
+            });
+    }
+}
+
+template<int N, unsigned Components=(1u<<N)-1, int Elements>
+__device__ __forceinline__ Differential<N> matrix_value(float const (*matrix)[Elements],int index) {
+    Differential<N> value;
+    int selected=0;
+    #pragma unroll
+    for(int component=0;component<N;++component)
+        if(Components&(1u<<component)) value.x[component]=matrix[selected++][index];
+    return value;
+}
+
+template<int N>
+__device__ __forceinline__ void matrix_store(float (*matrix)[1024],int index,Differential<N> value) {
+    #pragma unroll
+    for(int component=0;component<N;++component) matrix[component][index]=value.x[component];
+}
+
+template<int N>
+__device__ __forceinline__ Differential<N> output_gradient(Params const& p,int64_t atom,int64_t row,int head,int c) {
+    auto envelope=(PRESENT&16u) ? input<N>(p,4,row):Differential<N>(1.f);
+    return envelope*upstream<N>(p,5,atom,head,c)+upstream<N>(p,6,row,head,c);
+}
+
+template<int N,typename Shared>
+__device__ __forceinline__ void attention_scores(Params const& p,Shared& shared,float (*scores)[1024],
+    int64_t atom,int64_t begin,int64_t end,int64_t qb,int64_t kb,int head) {
+#if LOW_PRECISION
+    if constexpr(N==1)
+        attention_gemm(shared,scores[0],DIM,
+            ConvGemmFeature<0,false>{p,qb,end,head},ConvGemmFeature<1,true>{p,kb,end,head});
+    else
+#endif
+    differential_gemm<N,false,false>(shared,scores,DIM,
+        [&](int row,int c) {return qb+row<end ? input<N>(p,0,qb+row,head,c):Differential<N>();},
+        [&](int c,int column) {return kb+column<end ? input<N>(p,1,kb+column,head,c):Differential<N>();});
+    for(int i=threadIdx.x;i<1024;i+=128) {
+        int64_t q=qb+i/32,k=kb+i%32;
+        Differential<N> score(-INFINITY);
+        if(q<end && k<end && (!CAUSAL || k<=q)) {
+            score=matrix_value<N>(scores,i)*Differential<N>(p.scale);
+            if constexpr(BIAS_KIND==1) score=score+input<N>(p,3,k,head);
+            if constexpr(BIAS_KIND==2) score=score+input<N>(p,3,atom,head,q-begin,k-begin);
+        }
+        matrix_store<N>(scores,i,score);
+    }
+    __syncthreads();
 }
 """
 
 
-def load_kernel(name, source, config, device_index, dtype=torch.float32):
-    dim, value_dim, heads, scale, causal, bias_kind = config
-    defines = f"#define DIM {dim}\n#define VALUE_DIM {value_dim}\n#define HEADS {heads}\n#define CAUSAL {int(causal)}\n#define BIAS_KIND {bias_kind}\n"
+def load_kernel(name, source, config, device_index, dtype, layout):
+    dim, value_dim, heads, _, causal, bias_kind = config
+    present, contiguous, input_types = layout
+    defines = (
+        f"#define DIM {dim}\n#define VALUE_DIM {value_dim}\n#define HEADS {heads}\n"
+        f"#define CAUSAL {int(causal)}\n#define BIAS_KIND {bias_kind}\n"
+    )
+    defines += f"#define PRESENT {present}u\n#define CONTIGUOUS {contiguous}u\n"
     if dtype != torch.float32:
         defines += f"#define LOWP_BF16 {int(dtype == torch.bfloat16)}\n"
+        defines += f"#define INPUT_DTYPES {input_types}ull\n"
     return load_cuda_extension(
         name,
-        defines + CUDA_SOURCE + source,
+        dtype_defines(dtype) + defines + CUDA_SOURCE + GEMM_SOURCE + GEMM_DIFFERENTIAL_SOURCE + source,
         arch=get_cuda_arch(torch.device("cuda", device_index)),
         use_fast_math=False,
         minimal_headers=True,
     )
 
 
-def allocate(inputs, needs, accumulate=False):
-    return tuple(
-        torch.empty(x.shape, device=x.device, dtype=torch.float32 if accumulate else x.dtype)
-        if x is not None and need
-        else None
-        for x, need in zip(inputs, needs)
-    )
+def input_layout(inputs):
+    present = contiguous = input_types = 0
+    for i, value in enumerate(inputs):
+        if value is not None:
+            bit = 1 << i
+            present |= bit
+            if value.is_contiguous():
+                contiguous |= bit
+            dtype = value.dtype
+            input_types |= (0 if dtype == torch.float32 else 1 if dtype == torch.float16 else 2) << (2 * i)
+    return present, contiguous, input_types
 
 
 def finish_gradients(outputs, inputs):
-    return tuple(y.to(x.dtype) if y is not None and y.dtype != x.dtype else y
-                 for y, x in zip(outputs, inputs))
+    return tuple(
+        y.to(x.dtype) if y is not None and y.dtype != x.dtype else y
+        for y, x in zip(outputs, inputs)
+    )

@@ -72,6 +72,16 @@ functional = o3.spherical_harmonics([0, 1, 2, 3], x, True, "component")  # (num_
 torch.testing.assert_close(functional, y)
 ```
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Graph: 2,083 atoms, 85,876 edges
+- Degrees: `0–Lmax`, with `Lmax=2–6`
+- Normalization: `normalize=True`, `normalization="component"`
+
+![Spherical harmonics FP32 throughput and peak memory](../assets/performance/spherical_harmonics.png)
+
 ## Limitations
 
 - GPU acceleration requires compute capability 8.0 or later.

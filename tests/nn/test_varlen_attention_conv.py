@@ -40,11 +40,12 @@ def reference(q, k, v, bias, env, lengths, causal, return_out):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("envelope,return_out,bias_kind,causal,strided,flatten", [
-    (True, True, 1, False, False, False),
-    (True, False, 0, False, True, False),
-    (False, True, 0, False, False, True),
-    (True, True, 2, True, True, False),
+@pytest.mark.parametrize("envelope,return_out,bias_kind,causal,strided,flatten,edge_only", [
+    (True, True, 1, False, False, False, False),
+    (True, True, 1, False, False, False, True),
+    (True, False, 0, False, True, False, False),
+    (False, True, 0, False, False, True, False),
+    (True, True, 2, True, True, False, False),
 ])
 def test_attention_conv(
     bias_kind,
@@ -53,6 +54,7 @@ def test_attention_conv(
     return_out,
     strided,
     flatten,
+    edge_only,
     lengths=(0, 1, 3, 33),
     h=2,
     d=7,
@@ -114,6 +116,8 @@ def test_attention_conv(
                 torch.testing.assert_close(a.double(), b, atol=3e-4, rtol=3e-4)
         if order == 3:
             break
+        if order == 0 and edge_only:
+            actual, expected = actual[1:], expected[1:]
         pairs = [
             (a, b)
             for a, b in zip(actual, expected)
@@ -137,3 +141,13 @@ def test_attention_conv(
         )
         targets = (*targets, *seeds)
         reference_targets = (*reference_targets, *ref_seeds)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("d,v", [(7, 5), (32, 32), (33, 17)])
+def test_attention_conv_tile_boundaries(d, v):
+    test_attention_conv(
+        bias_kind=1, causal=False, envelope=True, return_out=True,
+        strided=False, flatten=False, edge_only=False,
+        lengths=(0, 1, 31, 32, 33, 64, 65), d=d, v=v,
+    )

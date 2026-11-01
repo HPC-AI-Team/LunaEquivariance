@@ -1,8 +1,10 @@
 """UVU double-backward CUDA templates."""
 
 from collections.abc import Mapping
+from textwrap import indent
 import torch
 from ...utils.cg import weight_channel_offset
+from ...utils.layout import build_signed_ij_classes
 from ....utils.precision import cuda_source_for_dtype, float_literal
 from ...utils.runtime import DERIVATIVE_STREAM_SOURCE
 from .utils import make_grid_source, get_uvu_launch_config
@@ -13,7 +15,39 @@ from .backward import (
 )
 
 
-# Instruction math and traversals used by the kernels above.
+def make_uvu_double_terms(spec, *, need_weight, gy=True, gg=True, weight="gw"):
+    """Reuse a complete signed CG projection within one weight path."""
+    lines = []
+    for cls in build_signed_ij_classes(spec["terms"], spec_y_offset=0, y_name_base=0):
+        entries = cls.members[0].terms
+        _, _, k, coefficient = entries[0]
+        lines += ["    {", f"        float projected = {float_literal(coefficient)} * gov{k};"]
+        for _, _, k, coefficient in entries[1:]:
+            lines.append(f"        projected = fmaf({float_literal(coefficient)}, gov{k}, projected);")
+        lines.append("        float q1 = 0.0f;")
+        if gg:
+            lines.append("        float q0 = 0.0f;")
+        for member in cls.members:
+            i, j = member.i_idx, member.j_name
+            sign = "" if member.relative_sign == 1 else "-"
+            lines += [
+                f"        q1 = fmaf({sign}yv{j}, rxv{i}, q1);",
+                f"        q1 = fmaf({sign}xv{i}, ryv{j}, q1);",
+            ]
+            if gg:
+                lines.append(f"        q0 = fmaf({sign}xv{i}, yv{j}, q0);")
+            if gy:
+                lines.append(f"        gy{j} = fmaf({sign}projected, ww * rxv{i} + xv{i} * rwv, gy{j});")
+        if need_weight:
+            lines.append(f"    {weight} = fmaf(projected, q1, {weight});")
+        if gg:
+            lines.append("        const float weighted = ww * q1 + rwv * q0;")
+            for _, _, k, coefficient in entries:
+                lines.append(f"        gg{k} = fmaf({float_literal(coefficient)}, weighted, gg{k});")
+        lines.append("    }")
+    return lines
+
+
 def make_uvu_double_backward_source(
     meta: Mapping[str, object], *, need_grad_weight: bool = True, needs=None
 ) -> str:
@@ -61,8 +95,7 @@ def make_uvu_double_backward_source(
         spec_channel_tile, spec_threads, spec_min_blocks = get_uvu_launch_config(
             max_channels
         )
-    # A grouped edge reduction cannot use more than 1024 threads. Wide
-    # irreps reuse the normal channel tile and accumulate tile contributions.
+    # A grouped edge reduction cannot use more than 1024 threads.
     wide_channels = max_channels > 1024
     group_threads = spec_threads if wide_channels else (max_channels + 31) // 32 * 32
     group_u = (
@@ -129,14 +162,33 @@ def make_uvu_double_backward_source(
                 lines.append(
                     f"    const float go_s{spec_idx}_{k} = __ldg(grad_out + item_go + {out_offset} + u * {d3} + {k});"
                 )
-            for i_idx, j_idx, k_idx, coeff in terms:
-                i = i_idx
-                j = j_idx
-                k = k_idx
-                c = float_literal(coeff)
-                lines.append(
-                    f"    acc{i} = fmaf({c} * go_s{spec_idx}_{k}, ww_s{spec_idx} * ry_s{spec_idx}_{j} + y_s{spec_idx}_{j} * rw_s{spec_idx}, acc{i});"
-                )
+            if meta.get("dtype") is torch.float64:
+                for i, j, k, coefficient in terms:
+                    c = float_literal(coefficient)
+                    lines.append(
+                        f"    acc{i} = fmaf({c} * go_s{spec_idx}_{k}, ww_s{spec_idx} * ry_s{spec_idx}_{j} + y_s{spec_idx}_{j} * rw_s{spec_idx}, acc{i});"
+                    )
+            else:
+                for cls in build_signed_ij_classes(
+                    terms, spec_y_offset=0, y_name_base=0
+                ):
+                    entries = cls.members[0].terms
+                    _, _, k, coefficient = entries[0]
+                    lines.append("    {")
+                    lines.append(
+                        f"    float projected = {float_literal(coefficient)} * go_s{spec_idx}_{k};"
+                    )
+                    for _, _, k, coefficient in entries[1:]:
+                        lines.append(
+                            f"    projected = fmaf({float_literal(coefficient)}, go_s{spec_idx}_{k}, projected);"
+                        )
+                    for member in cls.members:
+                        i, j = member.i_idx, member.j_name
+                        sign = "" if member.relative_sign == 1 else "-"
+                        lines.append(
+                            f"    acc{i} = fmaf({sign}projected, ww_s{spec_idx} * ry_s{spec_idx}_{j} + y_s{spec_idx}_{j} * rw_s{spec_idx}, acc{i});"
+                        )
+                    lines.append("    }")
         for i in range(d1):
             lines.append(f"    gx_out[item_gx + {x_offset} + u * {d1} + {i}] = acc{i};")
         lines.append("    break;")
@@ -199,23 +251,26 @@ def make_uvu_double_backward_source(
             )
             if need_grad_weight:
                 lines.append("    float gw = 0.0f;")
-            for i_idx, j_idx, k_idx, coeff in terms:
-                i = i_idx
-                j = j_idx
-                k = k_idx
-                c = float_literal(coeff)
-                lines.extend(
-                    f"    const float cgo_{i}_{j}_{k} = {c} * gov{k};\n    gy{j} = fmaf(cgo_{i}_{j}_{k}, ww * rxv{i} + xv{i} * rwv, gy{j});".split(
-                        "\n"
+            if meta.get("dtype") is torch.float64:
+                for i_idx, j_idx, k_idx, coeff in terms:
+                    i = i_idx
+                    j = j_idx
+                    k = k_idx
+                    c = float_literal(coeff)
+                    lines.extend(
+                        f"    const float cgo_{i}_{j}_{k} = {c} * gov{k};\n    gy{j} = fmaf(cgo_{i}_{j}_{k}, ww * rxv{i} + xv{i} * rwv, gy{j});".split(
+                            "\n"
+                        )
                     )
-                )
-                if need_grad_weight:
+                    if need_grad_weight:
+                        lines.append(
+                            f"    gw = fmaf(cgo_{i}_{j}_{k}, yv{j} * rxv{i} + xv{i} * ryv{j}, gw);"
+                        )
                     lines.append(
-                        f"    gw = fmaf(cgo_{i}_{j}_{k}, yv{j} * rxv{i} + xv{i} * ryv{j}, gw);"
+                        f"    gg{k} = fmaf({c}, ww * (yv{j} * rxv{i} + xv{i} * ryv{j}) + xv{i} * yv{j} * rwv, gg{k});"
                     )
-                lines.append(
-                    f"    gg{k} = fmaf({c}, ww * (yv{j} * rxv{i} + xv{i} * ryv{j}) + xv{i} * yv{j} * rwv, gg{k});"
-                )
+            else:
+                lines.extend(make_uvu_double_terms(spec, need_weight=need_grad_weight))
             for j in unique_j:
                 if use_y_warp_partial:
                     lines.extend(
@@ -322,23 +377,26 @@ def make_uvu_double_backward_source(
             )
             if need_grad_weight and weight_mode != "shared":
                 lines.append("        float gw = 0.0f;")
-            for i_idx, j_idx, k_idx, coeff in terms:
-                i = i_idx
-                j = j_idx
-                k = k_idx
-                c = float_literal(coeff)
-                lines.extend(
-                    r"""        const float cgo_{i}_{j}_{k} = {c} * gov{k};
+            if meta.get("dtype") is torch.float64:
+                for i_idx, j_idx, k_idx, coeff in terms:
+                    i = i_idx
+                    j = j_idx
+                    k = k_idx
+                    c = float_literal(coeff)
+                    lines.extend(
+                        r"""        const float cgo_{i}_{j}_{k} = {c} * gov{k};
         gy{j} = fmaf(cgo_{i}_{j}_{k}, ww * rxv{i} + xv{i} * rwv, gy{j});
         const float xry_{i}_{j}_{k} = yv{j} * rxv{i} + xv{i} * ryv{j};""".format(i=i, j=j, k=k, c=c).split("\n")
-                )
-                if need_grad_weight and weight_mode != "shared":
-                    lines.append(
-                        f"        gw = fmaf(cgo_{i}_{j}_{k}, xry_{i}_{j}_{k}, gw);"
                     )
-                lines.append(
-                    f"        gg{k} = fmaf({c}, ww * xry_{i}_{j}_{k} + xv{i} * yv{j} * rwv, gg{k});"
-                )
+                    if need_grad_weight and weight_mode != "shared":
+                        lines.append(
+                            f"        gw = fmaf(cgo_{i}_{j}_{k}, xry_{i}_{j}_{k}, gw);"
+                        )
+                    lines.append(
+                        f"        gg{k} = fmaf({c}, ww * xry_{i}_{j}_{k} + xv{i} * yv{j} * rwv, gg{k});"
+                    )
+            else:
+                lines.extend(make_uvu_double_terms(spec, need_weight=need_grad_weight and weight_mode != "shared"))
             lines.append("        if (active) {")
             if need_grad_weight and weight_mode != "shared":
                 lines.append(
@@ -369,33 +427,33 @@ def make_uvu_double_backward_source(
         y_group_cases.append("\n".join(lines))
     grouped_y_kernel = (
         r"""
-__global__ __launch_bounds__({group_threads})
-void lunatp_uvu_double_bwd_grouped_y_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    float* __restrict__ gy_out,
-    float* __restrict__ gw_out,
-    float* __restrict__ gg_out,
+__global__ __launch_bounds__({group_threads}) void lunatp_uvu_double_bwd_grouped_y_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    float *__restrict__ gy_out,
+    float *__restrict__ gw_out,
+    float *__restrict__ gg_out,
     int64_t num_items) {{
     const Index n = blockIdx.x;
     const int group = blockIdx.y;
     const int u = {group_u};
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (group) {{
 {y_group_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 """.format(
             group_threads=group_threads,
             group_u=group_u,
-            y_group_cases=chr(10).join(y_group_cases),
+            y_group_cases=indent("\n".join(y_group_cases), "        "),
         )
         if use_grouped_y
         else ""
@@ -429,7 +487,7 @@ void lunatp_uvu_double_bwd_grouped_y_fp32(
             {gw_work_pointer},
             gg.data_ptr<float>(),
             x.size(0));
-{group_weight_reduction}""".format(
+        {group_weight_reduction}""".format(
             gw_work_allocation=gw_work_allocation,
             group_threads=group_threads,
             y_group_items_count=len(y_group_items),
@@ -489,14 +547,17 @@ void lunatp_uvu_double_bwd_grouped_y_fp32(
                 "\n"
             )
         )
-        for i_idx, j_idx, k_idx, coeff in terms:
-            i = i_idx
-            j = j_idx
-            k = k_idx
-            c = float_literal(coeff)
-            lines.extend(r"""    const float cgo_{i}_{j}_{k} = {c} * gov{k};
+        if meta.get("dtype") is torch.float64:
+            for i_idx, j_idx, k_idx, coeff in terms:
+                i = i_idx
+                j = j_idx
+                k = k_idx
+                c = float_literal(coeff)
+                lines.extend(r"""    const float cgo_{i}_{j}_{k} = {c} * gov{k};
     gy{j} = fmaf(cgo_{i}_{j}_{k}, ww * rxv{i} + xv{i} * rwv, gy{j});
     gg{k} = fmaf({c}, ww * (yv{j} * rxv{i} + xv{i} * ryv{j}) + xv{i} * yv{j} * rwv, gg{k});""".format(i=i, j=j, k=k, c=c).split("\n"))
+        else:
+            lines.extend(make_uvu_double_terms(spec, need_weight=False))
         for j in unique_j:
             if use_y_block_reduce:
                 lines.extend(
@@ -559,14 +620,17 @@ void lunatp_uvu_double_bwd_grouped_y_fp32(
             lines.append(
                 f"        const float gov{k} = __ldg(grad_out + item_go + {out_offset} + u * {d3} + {k});"
             )
-        for i_idx, j_idx, k_idx, coeff in terms:
-            i = i_idx
-            j = j_idx
-            k = k_idx
-            c = float_literal(coeff)
-            lines.append(
-                f"        acc = fmaf({c} * gov{k}, yv{j} * rxv{i} + xv{i} * ryv{j}, acc);"
-            )
+        if meta.get("dtype") is torch.float64:
+            for i_idx, j_idx, k_idx, coeff in terms:
+                i = i_idx
+                j = j_idx
+                k = k_idx
+                c = float_literal(coeff)
+                lines.append(
+                    f"        acc = fmaf({c} * gov{k}, yv{j} * rxv{i} + xv{i} * ryv{j}, acc);"
+                )
+        else:
+            lines.extend(make_uvu_double_terms(spec, need_weight=True, gy=False, gg=False, weight="acc"))
         lines.append("    }")
         lines.append(
             f"    partials[int64_t(blockIdx.z) * GEN_WEIGHT_NUMEL + {weight_offset} + {weight_u}] = acc;"
@@ -637,97 +701,95 @@ constexpr bool GEN_SHARED_WEIGHT_REDUCE = {shared_weight_reduction};
 constexpr bool GEN_UNIFORM_CHANNELS = {uniform_channels};
 constexpr bool GEN_GROUPED_Y = {grouped_edges};
 
-{make_reduction_source}__global__ __launch_bounds__(GEN_X_THREADS, GEN_X_MIN_BLOCKS)
-void lunatp_uvu_double_bwd_gx_fp32(
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    float* __restrict__ gx_out,
+{make_reduction_source}__global__ __launch_bounds__(GEN_X_THREADS, GEN_X_MIN_BLOCKS) void lunatp_uvu_double_bwd_gx_fp32(
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    float *__restrict__ gx_out,
     int64_t num_items,
     bool shared_weight) {{
     const Index n = blockIdx.x;
     const int group = blockIdx.y;
     const int u = blockIdx.z * GEN_X_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (group) {{
 {gx_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_double_bwd_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    float* __restrict__ gx_out,
-    float* __restrict__ gy_out,
-    float* __restrict__ gw_out,
-    float* __restrict__ gg_out,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_double_bwd_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    float *__restrict__ gx_out,
+    float *__restrict__ gy_out,
+    float *__restrict__ gw_out,
+    float *__restrict__ gg_out,
     int64_t num_items,
     bool shared_weight) {{
     const Index n = blockIdx.x;
     const int spec = blockIdx.y;
     const int u = blockIdx.z * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (spec) {{
 {cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
 {grouped_y_kernel}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_double_bwd_shared_ygg_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    float* __restrict__ gy_out,
-    float* __restrict__ gg_out,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_double_bwd_shared_ygg_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    float *__restrict__ gy_out,
+    float *__restrict__ gg_out,
     int64_t num_items) {{
     const Index n = blockIdx.x;
     const int spec = blockIdx.y;
     const int u = blockIdx.z * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (spec) {{
 {shared_ygg_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_double_bwd_shared_w_partial_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    float* __restrict__ partials,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_double_bwd_shared_w_partial_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    float *__restrict__ partials,
     int64_t num_items,
     int items_per_tile) {{
     const int spec = blockIdx.x;
     const int u = blockIdx.y * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
     switch (spec) {{
 {shared_w_partial_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
-
 
 std::vector<torch::Tensor> run_second(
     torch::Tensor x,
@@ -759,7 +821,7 @@ std::vector<torch::Tensor> run_second(
         GEN_NUM_SPECS,
         static_cast<unsigned int>((GEN_MAX_CHANNELS + GEN_SPEC_CHANNEL_TILE - 1) / GEN_SPEC_CHANNEL_TILE));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
-    auto& lane = derivative_stream(x.get_device(), stream);
+    auto &lane = derivative_stream(x.get_device(), stream);
     DerivativeFork fork(lane, stream);
     lunatp_uvu_double_bwd_gx_fp32<<<gx_grid, x_block, 0, lane.stream>>>(
         y.data_ptr<float>(),
@@ -771,7 +833,7 @@ std::vector<torch::Tensor> run_second(
         x.size(0),
         shared_weight);
     if constexpr (GEN_GROUPED_Y) {{
-{group_launch}
+        {group_launch}
     }} else if (use_shared_weight_reduce) {{
         lunatp_uvu_double_bwd_shared_ygg_fp32<<<grid, spec_block, 0, stream>>>(
             x.data_ptr<float>(),
@@ -784,7 +846,8 @@ std::vector<torch::Tensor> run_second(
             gy.data_ptr<float>(),
             gg.data_ptr<float>(),
             x.size(0));
-{shared_weight_launch}    }} else {{
+        {shared_weight_launch}
+    }} else {{
         lunatp_uvu_double_bwd_fp32<<<grid, spec_block, 0, stream>>>(
             x.data_ptr<float>(),
             y.data_ptr<float>(),
@@ -805,7 +868,7 @@ std::vector<torch::Tensor> run_second(
     return {{{outputs}}};
 }}
 
-}}  // namespace
+}} // namespace
 
 std::vector<torch::Tensor> lunatp_uvu_double_bwd_external_fp32(
     torch::Tensor x,
@@ -856,11 +919,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
         uniform_channels="true" if len(channel_set) == 1 else "false",
         grouped_edges="true" if use_grouped_y else "false",
         make_reduction_source=make_reduction_source(meta),
-        gx_cases=chr(10).join(gx_cases),
-        cases=chr(10).join(cases),
+        gx_cases=indent("\n".join(gx_cases), "        "),
+        cases=indent("\n".join(cases), "        "),
         grouped_y_kernel=grouped_y_kernel,
-        shared_ygg_cases=chr(10).join(shared_ygg_cases),
-        shared_w_partial_cases=chr(10).join(shared_w_partial_cases),
+        shared_ygg_cases=indent("\n".join(shared_ygg_cases), "        "),
+        shared_w_partial_cases=indent("\n".join(shared_w_partial_cases), "        "),
         input_allocator="zeros_like"
         if (
             sum(

@@ -1,8 +1,4 @@
-"""Registered per-irrep expressions and their scalar graph lowering.
-
-Tracing happens only for a new dtype and requested derivative signature. The
-original Torch operations preserve e3nn's rounding and threshold behavior.
-"""
+"""Trace per-irrep Torch expressions into scalar CUDA programs."""
 
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -13,13 +9,130 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from ...activation.kernels.utils import apply_activation_spec
-from .utils import Graph, ROLES, OUTPUTS, INPUT_ROLES
 from ....utils.torch_scalar import gradient, ScalarValue, Scalarizer
 from ....o3.norm.kernels.utils import norm_product
 
 
 TRACE_LOCK = Lock()
 TRACE_EXECUTOR = None
+
+
+ROLES = ("x", "bias", "grad_out", "rx", "rb", "bx", "bb", "bg")
+OUTPUTS = (
+    ("out",),
+    ("dx", "db"),
+    ("sx", "sb", "sg"),
+    ("tx", "tb", "tg", "trx", "trb"),
+)
+INPUT_ROLES = (ROLES[:2], ROLES[:3], ROLES[:5], ROLES)
+
+VECTOR_INPUTS = frozenset(("x", "rx", "bx"))
+VECTOR_OUTPUTS = frozenset(("dx", "sx", "tx", "trx"))
+BIAS_OUTPUTS = frozenset(("db", "sb", "tb", "trb"))
+
+
+class ScalarNode:
+    __slots__ = ("index", "op", "args", "value")
+
+    def __init__(self, index, op, args, value):
+        self.index, self.op, self.args, self.value = index, op, args, value
+
+
+class Graph:
+    def __init__(self):
+        self.nodes, self.cache = [], {}
+        self.zero, self.one = self.constant(0.0), self.constant(1.0)
+
+    def node(self, op, *args, value=None):
+        key = op, tuple(arg.index for arg in args), value
+        if key not in self.cache:
+            node = ScalarNode(len(self.nodes), op, args, value)
+            self.nodes.append(node)
+            self.cache[key] = node
+        return self.cache[key]
+
+    def constant(self, value):
+        return self.node("constant", value=float(value).hex())
+
+    def input(self, role, column):
+        return self.node("input", value=(role, column))
+
+    @staticmethod
+    def ancestors(outputs):
+        visited = set()
+        pending = list(outputs)
+        while pending:
+            node = pending.pop()
+            if node.index not in visited:
+                visited.add(node.index)
+                pending.extend(node.args)
+        return visited
+
+
+def copy_field(node, clone, memo, maps):
+    if node.index not in memo:
+        value = node.value
+        if node.op == "input":
+            role, column = value
+            if column not in maps[role]:
+                raise ValueError(f"Cross-task scalar dependency: {role}/{column}")
+            value = role, maps[role][column]
+        memo[node.index] = clone.node(node.op, *(copy_field(arg, clone, memo, maps) for arg in node.args), value=value)
+    return memo[node.index]
+
+
+def field_signature(node, signatures):
+    if node.index not in signatures:
+        signatures[node.index] = node.op, node.value, tuple(field_signature(arg, signatures) for arg in node.args)
+    return signatures[node.index]
+
+
+def clone_fields(roots, columns):
+    clone, memo = Graph(), {}
+    maps = {
+        role: {column: i for i, column in enumerate(values)} for role, values in columns.items()
+    }
+
+    fields = {name: tuple(copy_field(root, clone, memo, maps) for root in values) for name, values in roots.items()}
+    return clone, fields
+
+
+def build_irrep_program(meta, program, path, *, check_copies=False):
+    """Clone one irrep copy and optionally check its repeated copies."""
+    components = path["components"]
+    graph = fields = signature = None
+    for copy in range(path["copies"] if check_copies else 1):
+        columns = {}
+        for role in program["inputs"]:
+            vector = role in VECTOR_INPUTS or (
+                role in ("grad_out", "bg") and meta["kind"] == "norm_activation"
+            )
+            start = path["input_offset"] + copy * components if vector else path["scalar_offset"] + copy
+            columns[role] = tuple(range(start, start + (components if vector else 1)))
+        roots = {}
+        for name in program["active_outputs"]:
+            vector = name in VECTOR_OUTPUTS or (
+                name in ("out", "sg", "tg") and meta["kind"] == "norm_activation"
+            )
+            start = path["input_offset"] + copy * components if vector else path["scalar_offset"] + copy
+            roots[name] = tuple(
+                program["fields"][name][column]
+                for column in range(start, start + (components if vector else 1))
+            )
+        copy_graph, copy_fields = clone_fields(roots, columns)
+        if check_copies:
+            signatures = {}
+            copy_signature = tuple(
+                (name, tuple(field_signature(root, signatures) for root in values))
+                for name, values in copy_fields.items()
+            )
+            if copy == 0:
+                signature = copy_signature
+            elif copy_signature != signature:
+                raise ValueError("Norm copy program structure differs within an irrep group")
+        if copy == 0:
+            graph, fields = copy_graph, copy_fields
+    return {**program, "graph": graph, "fields": fields}
 
 
 class RegisteredScalarizer(Scalarizer):
@@ -279,7 +392,6 @@ def trace_scalar_product(components, scalings, features):
 
 
 def trace_program(*values, copy_meta, order, names, available, grad_mode):
-    # This is the one boundary between the native role ABI and the formulas.
     (
         x, bias, grad_output, input_direction, bias_direction,
         input_gradient, bias_gradient, output_gradient,
@@ -346,22 +458,6 @@ def trace_program(*values, copy_meta, order, names, available, grad_mode):
     return gradient(
         second, tuple(targets[name] for name in names), gradients, create_graph=False
     )
-
-
-def build_registered_graph(meta, order, names, available, *, grad_mode=False, lower_seeds=None):
-    global TRACE_EXECUTOR
-    with TRACE_LOCK:
-        if TRACE_EXECUTOR is None:
-            TRACE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="norm-metadata")
-        meta = {
-            **meta,
-            "lower_seeds": (
-                (True, bool(meta["bias"])) if lower_seeds is None else tuple(lower_seeds)
-            ),
-        }
-        return TRACE_EXECUTOR.submit(
-            assemble_registered_graph, meta, order, names, available, grad_mode
-        ).result()
 
 
 def assemble_registered_graph(meta, order, names, available, grad_mode):
@@ -463,9 +559,19 @@ def build_program(meta, order, *, needs=None, available=None, grad_mode=False, l
     if not selected or not meta["paths"]:
         return program
 
-    graph, fields = build_registered_graph(
-        meta, order, selected, available, grad_mode=grad_mode, lower_seeds=lower_seeds
-    )
+    global TRACE_EXECUTOR
+    with TRACE_LOCK:
+        if TRACE_EXECUTOR is None:
+            TRACE_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="norm-metadata")
+        trace_meta = {
+            **meta,
+            "lower_seeds": (
+                (True, bool(meta["bias"])) if lower_seeds is None else tuple(lower_seeds)
+            ),
+        }
+        graph, fields = TRACE_EXECUTOR.submit(
+            assemble_registered_graph, trace_meta, order, selected, available, grad_mode
+        ).result()
     active = []
     zero = []
     dependencies = set()

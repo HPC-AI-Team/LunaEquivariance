@@ -1,9 +1,11 @@
-"""NormActivation radius/scaling and forward CUDA copy kernel binding."""
+"""NormActivation forward CUDA kernel and binding."""
 
 from functools import partial
+from math import gcd
+from textwrap import indent
 
 import torch
-from .utils import CUDA_HEADERS, emit_copy_program
+from .utils import CUDA_HEADERS, FORWARD_BLOCK_SIZE, FORWARD_MIN_BLOCKS, MAX_SHARED_BYTES, emit_copy_program
 from ....utils.indexing import LAYOUT_HOST, LAYOUT_SOURCE
 from ...activation.kernels.scalar import activation_cuda_prelude
 
@@ -39,9 +41,19 @@ def forward_expression_source(node, args, dtype, *, eps_squared):
 
 
 def make_forward_source(meta, program, *, strided=False, generic=False, save_bias=False):
-    lines, atoms, count, _ = emit_copy_program(
+    block_size = FORWARD_BLOCK_SIZE
+    warps = block_size // 32
+    max_components = max((path["components"] for path in meta["paths"]), default=1)
+    copy_tile = gcd(32, *(path["copies"] for path in meta["paths"]))
+    rows_per_warp = 32 // copy_tile
+    shared_outputs = (
+        meta["dtype"] == torch.float32 and copy_tile >= 8 and not (generic or strided)
+        and max_components * block_size * 4 <= MAX_SHARED_BYTES
+    )
+    lines, atoms, count, paths = emit_copy_program(
         meta, program, strided=strided, generic=generic, save_bias=save_bias,
         expression_source=partial(forward_expression_source, eps_squared=meta["eps_squared"]),
+        shared_outputs=shared_outputs,
     )
     fields, names = (program["fields"], program["active_outputs"])
     scalar = "double" if meta["dtype"] == torch.float64 else "float"
@@ -81,18 +93,66 @@ def make_forward_source(meta, program, *, strided=False, generic=False, save_bia
 
     first = program["inputs"][0]
     kernel = "norm_activation_forward"
-    geometry = f"<<<std::min<int64_t>(65535,(num_items*{count}+127)/128),128,0,stream>>>"
+    if shared_outputs:
+        tiles = sum((path["copies"] + copy_tile - 1) // copy_tile for path in meta["paths"])
+        paths_source = []
+        offset = 0
+        for path, statements in paths:
+            copies, components = path["copies"], path["components"]
+            if not copies:
+                continue
+            width = copies // copy_tile
+            saved = ""
+            if save_bias:
+                saved = f"if(row==0) saved_state[{path['scalar_offset']}+copy]=bias[{path['scalar_offset']}+copy];"
+            stores = ""
+            if components * (8 if meta["dtype"] == torch.float64 else 4) > 16:
+                stores = f"""__syncwarp();
+if(row<num_items) {{
+    #pragma unroll
+    for(int c=0;c<{components};++c) {{
+        const Index column=Index(c)*{copy_tile}+lane;
+        out_out[row*{meta['in_dim']}+{path['input_offset']}+copy_base*{components}+column]=values[column];
+    }}
+}}
+__syncwarp();"""
+            paths_source.append(f"""if(tile>={offset} && tile<{offset + width}) {{
+    const Index copy_base=(tile-{offset})*{copy_tile};
+    const Index copy=copy_base+lane;
+    Element* values=shared+group*{copy_tile}*{max_components};
+    {saved}
+    if(row<num_items) {{
+{indent(chr(10).join(statements), "        ")}
+    }}
+{indent(stores, "    ")}
+}}""")
+            offset += width
+        device_kernel = f"""__global__ __launch_bounds__({block_size},{FORWARD_MIN_BLOCKS}) void {kernel}({','.join(parameters)},int64_t num_items) {{
+    __shared__ __align__(16) Element shared[{block_size}*{max_components}];
+    const int lane=threadIdx.x%{copy_tile},warp=threadIdx.x>>5;
+    const int group=threadIdx.x/{copy_tile};
+    for(Index task=Index(blockIdx.x)*{warps}+warp;task<((num_items+{rows_per_warp-1})/{rows_per_warp})*{tiles};task+=Index(gridDim.x)*{warps}) {{
+        const Index row=(task/{tiles})*{rows_per_warp}+(threadIdx.x&31)/{copy_tile};
+        const Index tile=task%{tiles};
+{indent(chr(10).join(paths_source), "        ")}
+    }}
+}}"""
+        geometry = f"<<<std::min<int64_t>(65535,(((num_items+{rows_per_warp-1})/{rows_per_warp})*{tiles}+{warps-1})/{warps}),{block_size},0,stream>>>"
+    else:
+        device_kernel = None
+        geometry = f"<<<std::min<int64_t>(65535,(num_items*{count}+{block_size-1})/{block_size}),{block_size},0,stream>>>"
     launch = f"if(num_items>0) {kernel}{geometry}({','.join(arguments)},num_items);"
     prelude = activation_cuda_prelude(meta["dtype"], atoms)
-    device_kernel = r"""__global__ __launch_bounds__(128,1) void {kernel}({parameters},int64_t num_items) {{
-    for(Index item=Index(blockIdx.x)*128+threadIdx.x;item<num_items*{count};item+=Index(gridDim.x)*128) {{
-        {statements}
+    device_kernel = device_kernel or r"""__global__ __launch_bounds__({block_size},1) void {kernel}({parameters},int64_t num_items) {{
+    for(Index item=Index(blockIdx.x)*{block_size}+threadIdx.x;item<num_items*{count};item+=Index(gridDim.x)*{block_size}) {{
+{statements}
     }}
 }}""".format(
         kernel=kernel,
+        block_size=block_size,
         parameters=','.join(parameters),
         count=count,
-        statements=chr(10).join(lines),
+        statements=indent(chr(10).join(lines), "        "),
     )
     body = r"""using Element={scalar};{layout_declarations}
 {prelude}
@@ -100,7 +160,7 @@ def make_forward_source(meta, program, *, strided=False, generic=False, save_bia
 pybind11::tuple launch({tensor_parameters},int64_t num_items) {{
     c10::cuda::CUDAGuard guard({first}.device());
     auto options={first}.options();
-    {allocations}
+{allocations}
 {layout_host}    cudaStream_t stream=at::cuda::getCurrentCUDAStream();
     {launch}
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -113,10 +173,10 @@ pybind11::tuple launch({tensor_parameters},int64_t num_items) {{
         device_kernel=device_kernel,
         tensor_parameters=','.join((f'torch::Tensor {role}' for role in program['inputs'])),
         first=first,
-        allocations=chr(10).join(allocations),
+        allocations=indent(chr(10).join(allocations), "    "),
         layout_host=layout_host,
         launch=launch,
         returns=','.join(returns),
     )
-    binding = 'PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("launch",&launch);}\n'
+    binding = 'PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {\n    m.def("launch",&launch);\n}\n'
     return "\n" + "\n".join(CUDA_HEADERS) + "\n" + body + binding

@@ -1,6 +1,7 @@
 """UVU convolution forward CUDA and native launch."""
 
 from __future__ import annotations
+import textwrap
 import torch
 from ...utils.cg import weight_channel_offset
 from .utils import (
@@ -46,7 +47,7 @@ def emit_simple_terms(
         )
         accumulator = f"{accumulator_prefix}_{int(k_idx)}"
         dst_lines.append(
-            f"        {accumulator} += {c_lit} * {x_operand} * {y_operand};"
+            f"{accumulator} += {c_lit} * {x_operand} * {y_operand};"
         )
 
 
@@ -79,11 +80,11 @@ def emit_ij_terms(
             )
             accumulator = f"{accumulator_prefix}_{k_idx}"
             dst_lines.append(
-                f"        {accumulator} += {float_literal(coeff)} * {x_operand} * {y_operand};"
+                f"{accumulator} += {float_literal(coeff)} * {x_operand} * {y_operand};"
             )
         else:
             dst_lines.append(
-                f"        const float xy_p{path_idx}_{i_idx}_{j_name} = {x_operand} * {y_operand};"
+                f"const float xy_p{path_idx}_{i_idx}_{j_name} = {x_operand} * {y_operand};"
             )
             for k_idx, coeff in ij_terms:
                 accumulator_prefix = (
@@ -91,17 +92,17 @@ def emit_ij_terms(
                 )
                 accumulator = f"{accumulator_prefix}_{k_idx}"
                 dst_lines.append(
-                    f"        {accumulator} += {float_literal(coeff)} * xy_p{path_idx}_{i_idx}_{j_name};"
+                    f"{accumulator} += {float_literal(coeff)} * xy_p{path_idx}_{i_idx}_{j_name};"
                 )
 
 
 def mode_switch(selector, plain_body, envelope_body, *, with_env, return_l0):
     if with_env or return_l0:
         body = envelope_body if with_env else plain_body
-        return f"        switch ({selector}) {{\n{body}\n        default:\n            break;\n        }}"
-    plain_switch = f"        switch ({selector}) {{\n{plain_body}\n        default:\n            break;\n        }}"
-    envelope_switch = f"        switch ({selector}) {{\n{envelope_body}\n        default:\n            break;\n        }}"
-    return f"    if (env == nullptr) {{\n{plain_switch}\n    }} else {{\n{envelope_switch}\n    }}"
+        return f"        switch ({selector}) {{\n{body}\ndefault:\n    break;\n        }}"
+    plain_switch = f"            switch ({selector}) {{\n    {plain_body}\ndefault:\n    break;\n        }}"
+    envelope_switch = f"                switch ({selector}) {{\n        {envelope_body}\ndefault:\n    break;\n        }}"
+    return f"    if (env == nullptr) {{\n    {plain_switch}\n    }} else {{\n        {envelope_switch}\n    }}"
 
 
 def make_uvu_conv_fwd_source(
@@ -203,53 +204,53 @@ def make_uvu_conv_fwd_source(
             and not degree_tiers
             and all(tiles == (task_warps or warps) for tiles in group_tiles)
         ):
-            ordered_task_prologue = r"""    const int warp_id = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const Index group_task = blockIdx.x;
-    const Index node_count = num_nodes;
-    const int group = group_task / node_count;
-    const Index node_rank = group_task - Index(group) * node_count;
-    const int t = node_order[node_rank];
-    const int channel_base = warp_id * GEN_CHANNEL_CHUNK;
+            ordered_task_prologue = r"""const int warp_id = threadIdx.x >> 5;
+const int lane = threadIdx.x & 31;
+const Index group_task = blockIdx.x;
+const Index node_count = num_nodes;
+const int group = group_task / node_count;
+const Index node_rank = group_task - Index(group) * node_count;
+const int t = node_order[node_rank];
+const int channel_base = warp_id * GEN_CHANNEL_CHUNK;
 """
         else:
             if use_tile_table:
                 decode = [
-                    "        const Index node_rank = task_id / GEN_NUM_FORWARD_EXECS;",
-                    "        const int tile = task_id % GEN_NUM_FORWARD_EXECS;",
-                    "        t = node_order[node_rank];",
-                    "        const int2 tile_info = FORWARD_TILE_INFO[tile];",
-                    "        group = tile_info.x;",
-                    "        channel_base = tile_info.y;",
+                    "const Index node_rank = task_id / GEN_NUM_FORWARD_EXECS;",
+                    "const int tile = task_id % GEN_NUM_FORWARD_EXECS;",
+                    "t = node_order[node_rank];",
+                    "const int2 tile_info = FORWARD_TILE_INFO[tile];",
+                    "group = tile_info.x;",
+                    "channel_base = tile_info.y;",
                 ]
             else:
                 decode = []
                 if node_major:
                     decode.extend([
-                        "        const Index node_rank = task_id / GEN_NUM_FORWARD_EXECS;",
-                        "        const int tile = task_id % GEN_NUM_FORWARD_EXECS;",
-                        "        t = node_order[node_rank];",
+                        "const Index node_rank = task_id / GEN_NUM_FORWARD_EXECS;",
+                        "const int tile = task_id % GEN_NUM_FORWARD_EXECS;",
+                        "t = node_order[node_rank];",
                     ])
                 else:
                     decode.extend([
-                        "        Index node_begin = 0;",
-                        "        Index node_end = num_nodes;",
+                        "Index node_begin = 0;",
+                        "Index node_end = num_nodes;",
                     ])
                     if degree_tiers:
                         decode.extend([
-                            "        #pragma unroll",
-                            "        for (int tier = 0; node_tiers && tier < 3; ++tier) {",
-                            "            const Index end = node_tiers[tier];",
-                            "            if (task_id < end * GEN_NUM_FORWARD_EXECS) {",
-                            "                node_end = end;",
-                            "                break;",
-                            "            }",
-                            "            node_begin = end;",
-                            "        }",
+                            "#pragma unroll",
+                            "for (int tier = 0; node_tiers && tier < 3; ++tier) {",
+                            "    const Index end = node_tiers[tier];",
+                            "    if (task_id < end * GEN_NUM_FORWARD_EXECS) {",
+                            "        node_end = end;",
+                            "        break;",
+                            "    }",
+                            "    node_begin = end;",
+                            "}",
                         ])
                     decode.extend([
-                        "        const Index tier_nodes = node_end - node_begin;",
-                        "        const Index local_task = task_id - node_begin * GEN_NUM_FORWARD_EXECS;",
+                        "const Index tier_nodes = node_end - node_begin;",
+                        "const Index local_task = task_id - node_begin * GEN_NUM_FORWARD_EXECS;",
                     ])
                 tile_begin = 0
                 for group, tiles in enumerate(group_tiles):
@@ -261,24 +262,25 @@ def make_uvu_conv_fwd_source(
                         if not node_major:
                             bound += " * tier_nodes"
                         condition = ("if" if group == 0 else "else if") + f" ({selector} < {bound})"
-                    decode.append(f"        {condition} {{")
-                    decode.append(f"            group = {group};")
+                    decode.append(f"{condition} {{")
+                    decode.append(f"    group = {group};")
                     if node_major:
-                        decode.append(f"            channel_base = (tile - {tile_begin}) * GEN_CHANNEL_CHUNK;")
+                        decode.append(f"    channel_base = (tile - {tile_begin}) * GEN_CHANNEL_CHUNK;")
                     else:
                         decode.extend([
-                            f"            const Index group_task = local_task - {tile_begin} * tier_nodes;",
-                            f"            t = node_order[node_begin + group_task / {tiles}];",
-                            f"            channel_base = (group_task % {tiles}) * GEN_CHANNEL_CHUNK;",
+                            f"    const Index group_task = local_task - {tile_begin} * tier_nodes;",
+                            f"    t = node_order[node_begin + group_task / {tiles}];",
+                            f"    channel_base = (group_task % {tiles}) * GEN_CHANNEL_CHUNK;",
                         ])
-                    decode.append("        }")
+                    decode.append("}")
                     tile_begin += tiles
-            ordered_task_prologue = r"""    const int warp_id = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const Index task_id = Index(blockIdx.x) * GEN_FORWARD_TASK_TEAMS + warp_id;
-    if (task_id >= num_tasks) return;
-    int group, t, channel_base;
-    {
+            ordered_task_prologue = r"""const int warp_id = threadIdx.x >> 5;
+const int lane = threadIdx.x & 31;
+const Index task_id = Index(blockIdx.x) * GEN_FORWARD_TASK_TEAMS + warp_id;
+if (task_id >= num_tasks)
+    return;
+int group, t, channel_base;
+{
 """ + "\n".join(decode) + "\n    }"
     for group_idx, (
         (x_offset, y_offset, d1, channels),
@@ -560,7 +562,7 @@ def make_uvu_conv_fwd_source(
                                     else f"wy_p{path_idx}_{representative.j_name}"
                                 )
                                 lines.extend(
-                                    f"        {{\n            float {product_name} = {representative_x} * {representative_y};".split(
+                                    f"    {{\n        float {product_name} = {representative_x} * {representative_y};".split(
                                         "\n"
                                     )
                                 )
@@ -577,7 +579,7 @@ def make_uvu_conv_fwd_source(
                                         else f"wy_p{path_idx}_{member.j_name}"
                                     )
                                     lines.append(
-                                        f"            {product_name} {op} {member_x} * {member_y};"
+                                        f"        {product_name} {op} {member_x} * {member_y};"
                                     )
                                 for _, _, k_idx, coeff in representative.terms:
                                     accumulator_prefix = (
@@ -587,9 +589,9 @@ def make_uvu_conv_fwd_source(
                                     )
                                     accumulator = f"{accumulator_prefix}_{k_idx}"
                                     lines.append(
-                                        f"            {accumulator} += {float_literal(coeff)} * {product_name};"
+                                        f"        {accumulator} += {float_literal(coeff)} * {product_name};"
                                     )
-                                lines.append("        }")
+                                lines.append("    }")
                                 duplicate_idx += 1
                     elif term_grouping == "jk":
                         reuse_duplicate_jk_exprs = reuse_duplicate_exprs
@@ -885,7 +887,7 @@ def make_uvu_conv_fwd_source(
                             lines.append(f"        *({l0_ptr}) = {l0_value};")
                 lines.append("    }")
                 if masked_channels:
-                    lines.append("    }")
+                    lines.append("}")
                 if collaborative:
                     slot = 0
                     for path_idx, spec in group_specs:
@@ -917,15 +919,15 @@ def make_uvu_conv_fwd_source(
                         for k in range(d3):
                             if store_mode == "assign":
                                 lines.append(
-                                    f"{indent}out[Index(t) * {out_dim} + {out_offset} + u * {d3} + {k}] = acc_p{path_idx}_{k};"
+                                    f"    {indent}out[Index(t) * {out_dim} + {out_offset} + u * {d3} + {k}] = acc_p{path_idx}_{k};"
                                 )
                             elif store_mode == "stream":
                                 lines.append(
-                                    f"{indent}store_global_cs_f32(out + Index(t) * {out_dim} + {out_offset} + u * {d3} + {k}, acc_p{path_idx}_{k});"
+                                    f"    {indent}store_global_cs_f32(out + Index(t) * {out_dim} + {out_offset} + u * {d3} + {k}, acc_p{path_idx}_{k});"
                                 )
                             elif store_mode == "atomic":
                                 lines.append(
-                                    f"{indent}atomicAdd(out + Index(t) * {out_dim} + {out_offset} + u * {d3} + {k}, acc_p{path_idx}_{k});"
+                                    f"    {indent}atomicAdd(out + Index(t) * {out_dim} + {out_offset} + u * {d3} + {k}, acc_p{path_idx}_{k});"
                                 )
                             else:
                                 raise ValueError(
@@ -963,11 +965,11 @@ def make_uvu_conv_fwd_source(
     collaborative_store_metadata = (
         "__device__ __constant__ int GEN_FORWARD_STORE_COUNTS[] = {"
         + ", ".join(map(str, collaborative_store_counts))
-        + "};\n__device__ __constant__ int GEN_FORWARD_STORE_OFFSETS[] = {"
+        + "                                                                                              };\n__device__ __constant__ int GEN_FORWARD_STORE_OFFSETS[] = {"
         + ", ".join(map(str, collaborative_store_offsets))
-        + "};\n__device__ __constant__ int GEN_FORWARD_STORE_STRIDES[] = {"
+        + "    };\n__device__ __constant__ int GEN_FORWARD_STORE_STRIDES[] = {"
         + ", ".join(map(str, collaborative_store_strides))
-        + "};"
+        + "    };"
         if use_collaborative_order
         else ""
     )
@@ -1009,25 +1011,16 @@ def make_uvu_conv_fwd_source(
     store_body = (
         "*ptr = value;"
         if max_channels >= 320 and in2_dim >= 36
-        else f'asm volatile("st.global.cs.f32 [%0], %1;" :: "l"(ptr), "f"(value) : "memory");'
+        else f'    asm volatile("st.global.cs.f32 [%0], %1;" :: "l"(ptr), "f"(value) : "memory");'
     )
     forward_task_min_blocks = min_blocks
     if use_collaborative_order:
         ordered_kernel_source = r"""
 {task_launch_bounds}__global__ void lunatp_uvuconv_fwd_ordered_kernel_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ env,
-{l0_kernel_parameter}    const int32_t* __restrict__ src,
-    const EdgeIndex* __restrict__ rowptr,
-    const int32_t* __restrict__ node_order,
-    float* __restrict__ out,
-    int64_t num_tasks,
-    int64_t num_nodes) {{
-    __shared__ float partials[
-        GEN_FORWARD_MAX_LIVE_OUTPUTS * GEN_FORWARD_EDGE_WARPS
-        * GEN_CHANNEL_CHUNK];
+        const float *__restrict__ x, const float *__restrict__ y, const float *__restrict__ weight,
+        const float *__restrict__ env, {l0_kernel_parameter} const int32_t *__restrict__ src, const EdgeIndex *__restrict__ rowptr,
+        const int32_t *__restrict__ node_order, float *__restrict__ out, int64_t num_tasks, int64_t num_nodes) {{
+    __shared__ float partials[GEN_FORWARD_MAX_LIVE_OUTPUTS * GEN_FORWARD_EDGE_WARPS * GEN_CHANNEL_CHUNK];
     const int warp_id = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int edge_warp = warp_id;
@@ -1039,30 +1032,28 @@ def make_uvu_conv_fwd_source(
     if (edge_warp == 0{collaborative_tail_guard}) {{
         const int metadata_base = exec * GEN_FORWARD_MAX_LIVE_OUTPUTS;
         const int store_count = GEN_FORWARD_STORE_COUNTS[exec];
-        #pragma unroll
+#pragma unroll
         for (int slot = 0; slot < GEN_FORWARD_MAX_LIVE_OUTPUTS; ++slot) {{
-            if (slot >= store_count) break;
-            const int partial_base =
-                (slot * GEN_FORWARD_EDGE_WARPS) * GEN_CHANNEL_CHUNK + lane;
-            const float value = partials[partial_base]
-                + partials[partial_base + GEN_CHANNEL_CHUNK];
-            {collaborative_store}(
-                out + Index(t) * {out_dim} + GEN_FORWARD_STORE_OFFSETS[metadata_base + slot]
-                + lane * GEN_FORWARD_STORE_STRIDES[metadata_base + slot],
-                value);
+            if (slot >= store_count)
+                break;
+            const int partial_base = (slot * GEN_FORWARD_EDGE_WARPS) * GEN_CHANNEL_CHUNK + lane;
+            const float value = partials[partial_base] + partials[partial_base + GEN_CHANNEL_CHUNK];
+            {collaborative_store}(out + Index(t) * {out_dim} + GEN_FORWARD_STORE_OFFSETS[metadata_base + slot] +
+                                            lane * GEN_FORWARD_STORE_STRIDES[metadata_base + slot],
+                                        value);
         }}
     }}
 }}
 """.format(
             task_launch_bounds=task_launch_bounds,
             l0_kernel_parameter=l0_kernel_parameter,
-            forward_cases=mode_switch(
+            forward_cases=textwrap.indent(mode_switch(
                 "exec",
                 collaborative_switch_body,
                 env_collaborative_switch_body,
                 with_env=with_env,
                 return_l0=return_l0,
-            ),
+            ), '    '),
             collaborative_tail_guard=collaborative_tail_guard,
             collaborative_store=collaborative_store,
             out_dim=out_dim,
@@ -1070,17 +1061,10 @@ def make_uvu_conv_fwd_source(
     else:
         ordered_kernel_source = r"""
 {task_launch_bounds}__global__ void lunatp_uvuconv_fwd_ordered_kernel_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ env,
-{l0_kernel_parameter}    const int32_t* __restrict__ src,
-    const EdgeIndex* __restrict__ rowptr,
-    const int32_t* __restrict__ node_order,
-    const int32_t* __restrict__ node_tiers,
-    float* __restrict__ out,
-    int64_t num_tasks,
-    int64_t num_nodes) {{
+    const float *__restrict__ x, const float *__restrict__ y, const float *__restrict__ weight,
+    const float *__restrict__ env, {l0_kernel_parameter} const int32_t *__restrict__ src, const EdgeIndex *__restrict__ rowptr,
+    const int32_t *__restrict__ node_order, const int32_t *__restrict__ node_tiers, float *__restrict__ out,
+    int64_t num_tasks, int64_t num_nodes) {{
 {ordered_task_prologue}
 
 {forward_cases}
@@ -1088,14 +1072,14 @@ def make_uvu_conv_fwd_source(
 """.format(
             task_launch_bounds=task_launch_bounds,
             l0_kernel_parameter=l0_kernel_parameter,
-            ordered_task_prologue=ordered_task_prologue,
-            forward_cases=mode_switch(
+            ordered_task_prologue=textwrap.indent(ordered_task_prologue, '    '),
+            forward_cases=textwrap.indent(mode_switch(
                 "group",
                 ordered_switch_body,
                 env_ordered_switch_body,
                 with_env=with_env,
                 return_l0=return_l0,
-            ),
+            ), '    '),
         )
     if use_direct_tasks and use_tile_table:
         entries = ", ".join(
@@ -1118,10 +1102,10 @@ def make_uvu_conv_fwd_source(
     split_cache_config = ""
     split_host_source = ""
     split_binding = ""
-    ordered_launch = r"""    lunatp_uvuconv_fwd_ordered_kernel_fp32<<<grid, block, 0, stream>>>(
-        x.data_ptr<float>(), y.data_ptr<float>(), weight.data_ptr<float>(), env_ptr,
-{l0_launch_argument}        src.data_ptr<int32_t>(), rowptr.data_ptr<EdgeIndex>(), node_order.data_ptr<int32_t>(),
-{tier_argument}        out.data_ptr<float>(), num_tasks, num_nodes);"""
+    ordered_launch = r"""lunatp_uvuconv_fwd_ordered_kernel_fp32<<<grid, block, 0, stream>>>(
+    x.data_ptr<float>(), y.data_ptr<float>(), weight.data_ptr<float>(), env_ptr, {l0_launch_argument} src.data_ptr<int32_t>(),
+    rowptr.data_ptr<EdgeIndex>(), node_order.data_ptr<int32_t>(), {tier_argument} out.data_ptr<float>(), num_tasks,
+    num_nodes);"""
     ordered_launch = ordered_launch.format(
         l0_launch_argument=l0_launch_argument,
         tier_argument=(
@@ -1130,32 +1114,24 @@ def make_uvu_conv_fwd_source(
         ),
     )
     ordered_cache_config = f"        cudaFuncSetCacheConfig(lunatp_uvuconv_fwd_ordered_kernel_fp32, {cache_preference});\n"
-    ordered_host_source = r"""void run_uvu_conv_fwd_ordered(
-    torch::Tensor x,
-    torch::Tensor y,
-    torch::Tensor weight,
-    std::optional<torch::Tensor> env,
-    std::optional<torch::Tensor> l0_feat,
-    torch::Tensor src,
-    torch::Tensor rowptr,
-    torch::Tensor node_order,
-    std::optional<torch::Tensor> node_tiers,
-    torch::Tensor out,
+    ordered_host_source = r"""void run_uvu_conv_fwd_ordered(torch::Tensor x, torch::Tensor y, torch::Tensor weight, std::optional<torch::Tensor> env,
+    std::optional<torch::Tensor> l0_feat, torch::Tensor src, torch::Tensor rowptr,
+    torch::Tensor node_order, std::optional<torch::Tensor> node_tiers, torch::Tensor out,
     int64_t num_nodes) {{
-    const float* env_ptr = env && env->numel() ? env->data_ptr<float>() : nullptr;
+    const float *env_ptr = env && env->numel() ? env->data_ptr<float>() : nullptr;
     const int64_t num_tasks = num_nodes * GEN_NUM_FORWARD_EXECS;
     const dim3 block(GEN_FORWARD_TASK_WARPS * GEN_CHANNEL_CHUNK);
-    {ordered_grid}
+{ordered_grid}
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-{l0_clear}    configure_kernel_cache();
+    {l0_clear} configure_kernel_cache();
 {ordered_launch}
 }}
 """.format(
-        ordered_grid=ordered_grid,
+        ordered_grid=textwrap.indent(ordered_grid, '    '),
         l0_clear=l0_clear,
-        ordered_launch=ordered_launch,
+        ordered_launch=textwrap.indent(ordered_launch, '    '),
     )
-    ordered_binding = '    m.def("run_uvu_conv_fwd_ordered", &run_uvu_conv_fwd_ordered, "LunaTP var CSR CGTP ordered forward (CUDA)");\n'
+    ordered_binding = '        m.def("run_uvu_conv_fwd_ordered", &run_uvu_conv_fwd_ordered, "LunaTP var CSR CGTP ordered forward (CUDA)");\n'
     return r"""
 #include <torch/extension.h>
 #include <optional>
@@ -1177,7 +1153,7 @@ constexpr int GEN_SPLIT_EDGE_CHUNK = {split_edge_chunk};
 {collaborative_store_metadata}
 
 __device__ __forceinline__ void store_global_cs_f32(float* ptr, float value) {{
-    {store_body}
+{store_body}
 }}
 
 __global__ void lunatp_uvuconv_fwd_kernel_fp32(
@@ -1185,7 +1161,7 @@ __global__ void lunatp_uvuconv_fwd_kernel_fp32(
     const float* __restrict__ y,
     const float* __restrict__ weight,
     const float* __restrict__ env,
-{l0_kernel_parameter}    const int32_t* __restrict__ src,
+    {l0_kernel_parameter}    const int32_t* __restrict__ src,
     const EdgeIndex* __restrict__ rowptr,
     const int32_t* __restrict__ node_order,
     float* __restrict__ out,
@@ -1206,7 +1182,7 @@ inline void configure_kernel_cache() {{
     static bool configured = false;
     if (!configured) {{
         cudaFuncSetCacheConfig(lunatp_uvuconv_fwd_kernel_fp32, {cache_preference});
-{ordered_cache_config}{split_cache_config}        configured = true;
+        {ordered_cache_config}{split_cache_config}        configured = true;
     }}
 }}
 
@@ -1227,10 +1203,10 @@ void run_uvu_conv_fwd(
     const dim3 block(GEN_CHANNEL_CHUNK);
     const dim3 grid(static_cast<unsigned int>(num_nodes), GEN_NUM_FORWARD_EXECS);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-{l0_clear}    configure_kernel_cache();
+    {l0_clear}    configure_kernel_cache();
     lunatp_uvuconv_fwd_kernel_fp32<<<grid, block, 0, stream>>>(
         x.data_ptr<float>(), y.data_ptr<float>(), weight.data_ptr<float>(), env_ptr,
-{l0_launch_argument}        src.data_ptr<int32_t>(), rowptr.data_ptr<EdgeIndex>(), node_order.data_ptr<int32_t>(),
+        {l0_launch_argument}        src.data_ptr<int32_t>(), rowptr.data_ptr<EdgeIndex>(), node_order.data_ptr<int32_t>(),
         out.data_ptr<float>(), num_nodes);
 }}
 
@@ -1239,7 +1215,7 @@ void run_uvu_conv_fwd(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("run_uvu_conv_fwd", &run_uvu_conv_fwd, "LunaTP var CSR CGTP forward (CUDA)");
-{ordered_binding}{split_binding}}}
+    {ordered_binding}{split_binding}}}
 """.format(
         exec_idx=exec_idx,
         UVU_CONV_CHANNEL_CHUNK=UVU_CONV_CHANNEL_CHUNK,
@@ -1251,11 +1227,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
         forward_task_min_blocks=forward_task_min_blocks,
         split_edge_chunk=split_edge_chunk,
         collaborative_store_metadata=collaborative_store_metadata,
-        store_body=store_body,
+        store_body=textwrap.indent(store_body, '    '),
         l0_kernel_parameter=l0_kernel_parameter,
-        forward_cases=mode_switch(
+        forward_cases=textwrap.indent(mode_switch(
             "exec", switch_body, env_switch_body, with_env=with_env, return_l0=return_l0
-        ),
+        ), '    '),
         ordered_kernel_source=ordered_kernel_source,
         split_kernel_source=split_kernel_source,
         cache_preference=cache_preference,

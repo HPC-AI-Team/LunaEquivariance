@@ -11,6 +11,7 @@ from ...utils.contractions import PROGRAMS
 UUU_THREADS = 128
 # Estimate cached scalars and accumulators, leaving room for address registers.
 UUU_FUSED_REGISTER_BUDGET = 112
+UUU_BACKWARD_REGISTER_BUDGET = 160
 # Traverse large generated bodies in groups to improve instruction-cache reuse.
 UUU_GROUP_MAJOR_SOURCE_BYTES = 512 * 1024
 
@@ -99,7 +100,7 @@ def contraction_dependencies(order, outputs):
         roles.update(role for pair in cg[q] for role in pair)
     for name in z_names:
         roles.update(role for pair in z[name] for role in pair)
-    return cg, z, q_names, z_names, roles
+    return cg, z, expressions, q_names, z_names, roles
 
 
 def find_root(parent, index):
@@ -109,8 +110,31 @@ def find_root(parent, index):
     return index
 
 
-def prepare_fused_group(order, dtype, paths, names):
-    _, _, q_names, z_names, roles = contraction_dependencies(order, names)
+def connected_path_groups(specs):
+    """Collect paths sharing input or output slices, preserving path order."""
+    parent = list(range(len(specs)))
+    owners = {}
+    for index, spec in enumerate(specs):
+        for layout, offset, width in (
+            ("x", spec["x_offset"], spec["d1"]),
+            ("y", spec["y_offset"], spec["d2"]),
+            ("output", spec["out_offset"], spec["d3"]),
+        ):
+            key = (layout, offset, width, spec["channels"])
+            if key in owners:
+                parent[find_root(parent, index)] = find_root(parent, owners[key])
+            else:
+                owners[key] = index
+    groups = {}
+    for index, spec in enumerate(specs):
+        groups.setdefault(find_root(parent, index), []).append(spec)
+    return groups.values()
+
+
+def prepare_fused_group(
+    order, dtype, paths, names, *, register_budget=UUU_FUSED_REGISTER_BUDGET
+):
+    _, _, _, q_names, z_names, roles = contraction_dependencies(order, names)
     output_slices = {
         name: sorted({output_slice(spec, name) for spec in paths})
         for name in names
@@ -135,7 +159,7 @@ def prepare_fused_group(order, dtype, paths, names):
     registers = len(cached_values) + accumulators + local_state
     if dtype is torch.float64:
         registers *= 2
-    if registers > UUU_FUSED_REGISTER_BUDGET:
+    if registers > register_budget:
         return None
     return {
         "layout": "fused",
@@ -144,6 +168,7 @@ def prepare_fused_group(order, dtype, paths, names):
         "specs": paths,
         "output_slices": output_slices,
         "cached_values": cached_values,
+        "registers": registers,
     }
 
 
@@ -169,9 +194,7 @@ def make_channel_schedule(groups, cases):
     const int group = blockIdx.y;""".format(channels=count)
         grid = f"const dim3 grid(static_cast<unsigned int>(\n        (int64_t(num_items) * {count} + GEN_THREADS - 1) / GEN_THREADS), {len(groups)});"
         if len(groups) > 1 and not group_major:
-            # Nearby blocks process different roles of the same item/channel
-            # tile. Reused x/y/gradient rows remain resident in L2 instead of
-            # traversing the entire batch once for each destination group.
+            # Interleave groups within each item/channel tile to reuse input rows.
             index = r"""const int group = Index(blockIdx.x) % {groups};
     const Index item_channel = (Index(blockIdx.x) / {groups}) * GEN_THREADS + threadIdx.x;
     const Index n = item_channel / {channels};
@@ -227,7 +250,6 @@ def make_channel_schedule(groups, cases):
 def build_uuu_metadata(
     official_tp: TensorProductConfig, dtype: torch.dtype = torch.float32
 ) -> UuuMetadata:
-
     internal = bool(official_tp.internal_weights)
     shared = bool(official_tp.shared_weights)
     if internal and not shared:

@@ -65,6 +65,16 @@ y = gate(x)  # (num_atoms, gate.irreps_out.dim)
 y.square().mean().backward()
 ```
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: 2,083 atoms, `Lmax=2–6`
+- Features: 64 scalar channels, 64 gated channels per non-scalar degree, and matching gates
+- Activations: SiLU for scalars, sigmoid for gates
+
+![Gate FP32 throughput and peak memory](../assets/performance/gate.png)
+
 ## Limitations
 
 - GPU acceleration requires compute capability 8.0 or later.

@@ -1,5 +1,7 @@
 """CSR self-attention followed by envelope-weighted sum, through third derivatives."""
+
 import torch
+
 from ...utils import is_compiling
 from .kernels import forward, backward, double_backward, triple_backward
 
@@ -20,7 +22,7 @@ def varlen_attention_conv(
     num_heads=1,
     bias=None,
     softmax_scale=None,
-    causal=False
+    causal=False,
 ):
     """Return CSR sums of attention outputs, optionally also unweighted edge outputs.
 
@@ -87,7 +89,10 @@ def varlen_attention_conv(
         raise ValueError("q/k/v must use float32, float16 or bfloat16")
     if k.dtype != q.dtype or v.dtype != q.dtype:
         raise ValueError("q/k/v must have the same dtype")
-    if any(t is not None and t.dtype not in (q.dtype, torch.float32) for t in (bias, envelope)):
+    if any(
+        t is not None and t.dtype not in (q.dtype, torch.float32)
+        for t in (bias, envelope)
+    ):
         raise ValueError("bias and envelope must use the q/k/v dtype or float32")
     scale = q.shape[2] ** -0.5 if softmax_scale is None else float(softmax_scale)
     if is_compiling():
@@ -109,13 +114,21 @@ class AttentionConvForward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, config, csr, return_attn_out, *inputs):
         ctx.config = config
+        output, edge_output = forward.attention_conv_forward(
+            inputs, csr, config, return_attn_out
+        )
         ctx.save_for_backward(*inputs, csr)
         ctx.set_materialize_grads(False)
-        return forward.attention_conv_forward(inputs, csr, config, return_attn_out)
+        return output, edge_output
 
     @staticmethod
     def backward(ctx, node_grad, edge_grad):
         *inputs, csr = ctx.saved_tensors
+        if not torch.is_grad_enabled():
+            result = backward.attention_conv_backward(
+                (*inputs, node_grad, edge_grad), csr, ctx.config, ctx.needs_input_grad[3:]
+            )
+            return (None, None, None, *result)
         result = AttentionConvBackward.apply(
             ctx.config, csr, ctx.needs_input_grad[3:], *inputs, node_grad, edge_grad
         )
@@ -136,7 +149,7 @@ class AttentionConvBackward(torch.autograd.Function):
         result = AttentionConvDoubleBackward.apply(
             ctx.config, csr, ctx.needs_input_grad[3:], *inputs, *directions
         )
-        return (None, None, None, *result)
+        return (None,) * 3 + result
 
 
 class AttentionConvDoubleBackward(torch.autograd.Function):
@@ -161,8 +174,13 @@ class AttentionConvDoubleBackward(torch.autograd.Function):
 # Use individual tensor arguments: autograd dispatch can miss
 # requires_grad in a list containing None.
 @torch.library.custom_op(
-    "lunaeq::attention_conv_forward", mutates_args=(),
-    schema="(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, Tensor csr, float scale, bool causal, int bias_kind, bool return_attn_out) -> (Tensor, Tensor?)",
+    "lunaeq::attention_conv_forward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, "
+        "Tensor csr, float scale, bool causal, int bias_kind, bool return_attn_out) "
+        "-> (Tensor, Tensor?)"
+    ),
 )
 def attention_conv_forward(
     q, k, v, bias, envelope,
@@ -186,8 +204,14 @@ def forward_fake(
 
 
 @torch.library.custom_op(
-    "lunaeq::attention_conv_backward", mutates_args=(),
-    schema="(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, Tensor? node_grad, Tensor? edge_grad, Tensor csr, float scale, bool causal, int bias_kind, bool[] needs) -> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)",
+    "lunaeq::attention_conv_backward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, "
+        "Tensor? node_grad, Tensor? edge_grad, Tensor csr, float scale, "
+        "bool causal, int bias_kind, bool[] needs) "
+        "-> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
+    ),
 )
 def attention_conv_backward(
     q, k, v, bias, envelope, node_grad, edge_grad,
@@ -211,8 +235,15 @@ def backward_fake(
 
 
 @torch.library.custom_op(
-    "lunaeq::attention_conv_double_backward", mutates_args=(),
-    schema="(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, Tensor? node_grad, Tensor? edge_grad, Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, Tensor? re, Tensor csr, float scale, bool causal, int bias_kind, bool[] needs) -> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)",
+    "lunaeq::attention_conv_double_backward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, "
+        "Tensor? node_grad, Tensor? edge_grad, "
+        "Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, Tensor? re, "
+        "Tensor csr, float scale, bool causal, int bias_kind, bool[] needs) "
+        "-> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
+    ),
 )
 def attention_conv_double_backward(
     q, k, v, bias, envelope, node_grad, edge_grad, rq, rk, rv, rb, re,
@@ -236,14 +267,27 @@ def double_backward_fake(
 
 
 @torch.library.custom_op(
-    "lunaeq::attention_conv_triple_backward", mutates_args=(),
-    schema="(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, Tensor? node_grad, Tensor? edge_grad, Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, Tensor? re, Tensor? sq, Tensor? sk, Tensor? sv, Tensor? sb, Tensor? se, Tensor? sg, Tensor? so, Tensor csr, float scale, bool causal, int bias_kind, bool[] needs) -> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)",
+    "lunaeq::attention_conv_triple_backward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor? envelope, "
+        "Tensor? node_grad, Tensor? edge_grad, "
+        "Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, Tensor? re, "
+        "Tensor? sq, Tensor? sk, Tensor? sv, Tensor? sb, Tensor? se, Tensor? sg, Tensor? so, "
+        "Tensor csr, float scale, bool causal, int bias_kind, bool[] needs) "
+        "-> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, "
+        "Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
+    ),
 )
 def attention_conv_triple_backward(
-    q, k, v, bias, envelope, node_grad, edge_grad, rq, rk, rv, rb, re, sq, sk, sv, sb, se, sg, so,
+    q, k, v, bias, envelope, node_grad, edge_grad,
+    rq, rk, rv, rb, re, sq, sk, sv, sb, se, sg, so,
     csr, scale, causal, bias_kind, needs,
 ):
-    inputs = (q, k, v, bias, envelope, node_grad, edge_grad, rq, rk, rv, rb, re, sq, sk, sv, sb, se, sg, so)
+    inputs = (
+        q, k, v, bias, envelope, node_grad, edge_grad,
+        rq, rk, rv, rb, re, sq, sk, sv, sb, se, sg, so,
+    )
     return triple_backward.attention_conv_triple_backward(
         inputs, csr, configuration(inputs, scale, causal, bias_kind), needs
     )
@@ -251,12 +295,15 @@ def attention_conv_triple_backward(
 
 @attention_conv_triple_backward.register_fake
 def triple_backward_fake(
-    q, k, v, bias, envelope, node_grad, edge_grad, rq, rk, rv, rb, re, sq, sk, sv, sb, se, sg, so,
+    q, k, v, bias, envelope, node_grad, edge_grad,
+    rq, rk, rv, rb, re, sq, sk, sv, sb, se, sg, so,
     csr, scale, causal, bias_kind, needs,
 ):
     return tuple(
         x.new_empty(x.shape) if x is not None and need else None
-        for x, need in zip((q, k, v, bias, envelope, node_grad, edge_grad, rq, rk, rv, rb, re), needs)
+        for x, need in zip(
+            (q, k, v, bias, envelope, node_grad, edge_grad, rq, rk, rv, rb, re), needs
+        )
     )
 
 

@@ -21,7 +21,11 @@ from .uvu_conv.kernels.utils import build_uvu_conv_metadata, configure_uvu_conv
 from .uvw.interface import lunatp_uvw_func, register_ops as register_uvw_ops
 from .uvw.kernels.utils import build_uvw_metadata
 from .uvw_conv.interface import lunatp_uvw_conv_func, register_ops as register_uvw_conv_ops
-from .uvw_conv.kernels.utils import reset_launch_caches
+from .uvw_conv.kernels.utils import (
+    FORWARD_SPLIT_CHANNELS, BACKWARD_NEIGHBOR_SPLITS,
+    NODE_NEIGHBOR_SPLITS, reset_launch_caches, get_uvw_conv_backward_grid_tasks,
+    get_uvw_conv_tr_grid_tasks,
+)
 
 
 class LunaTPUUU:
@@ -144,6 +148,28 @@ class LunaTPUVWConv:
         self.meta = build_uvw_metadata(official_tp, self.compute_dtype)
         self.weight_mode = self.meta["weight_mode"]
         configure_indexing(self, self.meta, "uvw_conv", index_bits)
+        if self.weight_mode != "shared":
+            # Node partitions can exhaust the launch grid before feature offsets.
+            specs = self.meta["generated_specs"]
+            tile_n = 32
+            groups = {}
+            for spec in specs:
+                key = (spec["out_offset"], spec["out_channels"], spec["d3"])
+                groups[key] = max(groups.get(key, 0), spec["path_channels"])
+            forward_tasks = NODE_NEIGHBOR_SPLITS * sum(
+                ((channels + tile_n - 1) // tile_n)
+                * ((paths + FORWARD_SPLIT_CHANNELS - 1) // FORWARD_SPLIT_CHANNELS)
+                for (_, channels, _), paths in groups.items()
+            )
+            node_tasks = max(forward_tasks, get_uvw_conv_backward_grid_tasks(self.meta), 1)
+            edge_tasks = get_uvw_conv_tr_grid_tasks(self.meta)
+            self.index_edge_limit = min(self.index_edge_limit, ((1 << 31) - 1) // edge_tasks)
+            self.index_node_limit = min(self.index_node_limit, ((1 << 31) - 1) // node_tasks)
+            self.wide_node_limit = min(self.wide_node_limit, ((1 << 63) - 1024) // node_tasks)
+            self.wide_edge_limit = min(
+                self.wide_edge_limit,
+                ((1 << 63) - 1024) // max(edge_tasks, NODE_NEIGHBOR_SPLITS, BACKWARD_NEIGHBOR_SPLITS),
+            )
         reset_launch_caches(self)
 
 

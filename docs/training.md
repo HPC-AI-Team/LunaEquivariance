@@ -129,3 +129,42 @@ optimizer.step()
 The compiled step returns gradients directly; the optimizer applies them without
 another `backward()` call. This example captures the graph topology and model
 buffers; retrace when these or input shapes change.
+
+## NequIP AOTInductor
+
+[`examples/nequip_aoti.py`](../examples/nequip_aoti.py) shows export and loading
+with NequIP 0.19. It replaces e3nn Linear, SphericalHarmonics, Gate and unfused
+TensorProduct modules while keeping NequIP's graph aggregation. NequIP remains
+an optional dependency. Use a uniform FP32 or FP64 CUDA model.
+
+From a repository checkout, pass an existing NequIP model and a representative
+CUDA data dictionary, including neighbor lists:
+
+```python
+from examples.nequip_aoti import replace_e3nn_modules, export_model
+
+replace_e3nn_modules(model)
+model.eval().requires_grad_(False)
+export_model(model, data, "model.nequip.pt2")
+```
+
+Load in a new process with the example's helper:
+
+```python
+from examples.nequip_aoti import load_calculator
+
+calculator = load_calculator(
+    "model.nequip.pt2", device="cuda",
+    chemical_species_to_atom_type_map=True,
+    neighborlist_backend="matscipy",
+)
+atoms.calc = calculator
+energy = atoms.get_potential_energy()
+```
+
+The helper restores each static operator configuration saved inside the `.pt2`
+archive before calling NequIP's loader. Importing `LunaEquivariance` alone does
+not register model-specific operator layouts. `load_model` provides the same
+registration step for NequIP's dictionary-based inference interface. No eager
+model or warmup forward is needed during loading. Export supports dynamic atom
+and edge counts of at least two, for a single periodic structure per call.

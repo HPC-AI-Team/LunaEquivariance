@@ -1,451 +1,360 @@
-"""Third reverse derivatives including both output adjoints and envelope mixtures."""
+"""Mixed backward directions through all inputs and both output adjoints."""
+
 from functools import lru_cache
+
 import torch
-from ....utils.extension import get_device_properties
-from .double_backward import DERIVATIVE_SOURCE, LOWP_SOURCE
-from .utils import allocate, load_kernel
-from .backward import TILED_SOURCE
+
+from .backward import BACKWARD_SOURCE
+from .utils import finish_gradients, input_layout, load_kernel
+
 
 GRADIENT_SOURCE = r"""
-
-
-// x: D_s D_r[J(x)^T g], including the incoming upstream direction s_g.
-// r: D_s[J(x)^T g]. g: D_s D_r F(x), for both node and raw edge outputs.
-template <int Order, int N>
-__device__ void gradient(Params const &p, int slot, Differential<N> value, int64_t i, int64_t j = 0,
-                         int64_t k = 0, int64_t l = 0) {
-    if (p.out[slot].data)
-        p.out[slot].atomic_add(p.out[slot].index(i, j, k, l), value.x[3]);
-    if (p.out[7 + slot].data)
-        p.out[7 + slot].atomic_add(p.out[7 + slot].index(i, j, k, l), value.x[2]);
+#define PACKED_GRADIENTS (!EDGE_GRAD)
+constexpr unsigned GradientComponents=12u;
+// dS_rs includes all four product-rule terms. CUTLASS then contracts
+// dQ_rs = dS_rs K + dS_r K_s + dS_s K_r (and the transposed dK terms).
+// G_rs also includes envelope_r * node_grad_s in the value-gradient path.
+template<int N>
+__device__ __forceinline__ Differential<N> softmax_gradient(Differential<N> probability,Differential<N> dot,Differential<N> mean) {
+    Differential<N> value;
+    float centered[4];
+    #pragma unroll
+    for(int i=0;i<4;++i) centered[i]=dot.x[i]-mean.x[i];
+    value.x[0]=probability.x[0]*centered[0];
+    value.x[1]=fmaf(probability.x[1],centered[0],probability.x[0]*centered[1]);
+    value.x[2]=fmaf(probability.x[2],centered[0],probability.x[0]*centered[2]);
+    value.x[3]=fmaf(probability.x[3],centered[0],fmaf(probability.x[1],centered[2],
+                    fmaf(probability.x[2],centered[1],probability.x[0]*centered[3])));
+    return value;
 }
-template <int Order, int N>
-__device__ __forceinline__ void gradient_unique(Params const &p, int slot, Differential<N> value, int64_t i,
-                                int64_t j = 0, int64_t k = 0, int64_t l = 0) {
-    if (NEEDS & (1u << (0 + slot))) {
-        auto offset = (slot < 2 ? (i * HEADS + j) * DIM + k : slot == 2 ? (i * HEADS + j) * VALUE_DIM + k : slot == 4 ? i : BIAS_KIND == 1 ? i * HEADS + j : p.out[0 + slot].index(i, j, k, l));
-        if (slot == 4)
-            p.out[0 + slot].accumulate(offset, value.x[3]);
-        else
-            p.out[0 + slot].store(offset, value.x[3]);
+// Mixed components include the third primal derivative and the incoming
+// node/edge-adjoint direction. The second component differentiates the first
+// incoming direction. Both original output adjoints receive mixed outputs.
+template<int N>
+__device__ __forceinline__ void gradient(Params const& p,int slot,Differential<N> value,
+    int64_t i,int64_t j=0,int64_t k=0,int64_t l=0) {
+    if(NEEDS&(1u<<slot)) {
+        if(slot==4 || (QUERY_WORKERS>1 && (slot==1 || slot==2 || (slot==3 && BIAS_KIND==1)))) p.out[slot].atomic_add(p.out[slot].index(i,j,k,l),value.x[3]);
+        else p.out[slot].accumulate(p.out[slot].index(i,j,k,l),value.x[3]);
     }
-    if (NEEDS & (1u << (7 + slot))) {
-        auto offset = (slot < 2 ? (i * HEADS + j) * DIM + k : slot == 2 ? (i * HEADS + j) * VALUE_DIM + k : slot == 4 ? i : BIAS_KIND == 1 ? i * HEADS + j : p.out[7 + slot].index(i, j, k, l));
-        if (slot == 4)
-            p.out[7 + slot].accumulate(offset, value.x[2]);
-        else
-            p.out[7 + slot].store(offset, value.x[2]);
+    if(NEEDS&(1u<<(7+slot))) {
+        if(slot==4 || (QUERY_WORKERS>1 && (slot==1 || slot==2 || (slot==3 && BIAS_KIND==1)))) p.out[7+slot].atomic_add(p.out[7+slot].index(i,j,k,l),value.x[2]);
+        else p.out[7+slot].accumulate(p.out[7+slot].index(i,j,k,l),value.x[2]);
+    }
+}
+template<int N>
+__device__ __forceinline__ void upstream_gradient(Params const& p,int slot,Differential<N> value,int64_t i,int h,int c) {
+    if(NEEDS&(1u<<slot)) {
+        if(QUERY_WORKERS>1 && slot==5) p.out[slot].atomic_add(p.out[slot].index(i,h,c),value.x[3]);
+        else p.out[slot].accumulate(p.out[slot].index(i,h,c),value.x[3]);
     }
 }
 """
 
-NODE_TRIPLE_SOURCE = r"""
-#ifdef LOWP_BF16
-using NodeTripleTile = typename std::conditional<LOWP_BF16,__nv_bfloat16,__half>::type;
-constexpr int NODE_TRIPLE_WIDTH = ((DIM>VALUE_DIM ? DIM:VALUE_DIM)+15)/16*16;
-constexpr int NODE_TRIPLE_PITCH = NODE_TRIPLE_WIDTH+8;
-constexpr int NODE_TRIPLE_PLANE = 32*NODE_TRIPLE_PITCH;
-constexpr int NODE_TRIPLE_BYTES = 6*NODE_TRIPLE_PLANE*sizeof(NodeTripleTile)+(8192+256)*sizeof(float);
-constexpr bool NODE_TRIPLE_ENABLED = (DIM>32 || VALUE_DIM>32) && DIM<=128 && VALUE_DIM<=128 && !(PRESENT&64) && !(PRESENT&(1u<<18)) && !(NEEDS&64);
-__device__ __forceinline__ NodeTripleTile node_triple_cast(float x) {
-#if LOWP_BF16
-    return __float2bfloat16_rn(x);
-#else
-    return __float2half_rn(x);
-#endif
-}
 
-__device__ __forceinline__ float node_triple_float(NodeTripleTile x) {
-#if LOWP_BF16
-    return __bfloat162float(x);
-#else
-    return __half2float(x);
-#endif
-}
+PACKED_SOURCE = r"""
+#if PACKED_GRADIENTS
+#include <cutlass/gemm/threadblock/default_mma_core_simt.h>
+#include <cutlass/gemm/threadblock/mma_pipelined.h>
+#include <cutlass/gemm/warp/mma_simt_tile_iterator.h>
 
-template<int Input,int Field,int Slot>
-__device__ void node_triple_load(Params const& p,NodeTripleTile* features,int64_t begin,int n,int head) {
-    constexpr int channels=Field<2 ? DIM:VALUE_DIM;
-    auto const& source=p.in[Input];
-    if constexpr((PRESENT&(1u<<Input)) && channels%8==0) {
-        if(source.stride[2]==1 && source.stride[0]%8==0 && source.stride[1]%8==0 && (reinterpret_cast<uintptr_t>(source.data)&15)==0) {
-            for(int t=threadIdx.x*8;t<NODE_TRIPLE_PLANE;t+=128*8) {
-                int row=t/NODE_TRIPLE_PITCH,c=t%NODE_TRIPLE_PITCH;
-                uint4 value={0,0,0,0};
-                if(row<n && c<channels) value=*reinterpret_cast<uint4 const*>(reinterpret_cast<NodeTripleTile const*>(source.data)+(begin+row)*source.stride[0]+head*source.stride[1]+c);
-                *reinterpret_cast<uint4*>(features+Slot*NODE_TRIPLE_PLANE+t)=value;
-            }
-            return;
-        }
-    }
-    for(int t=threadIdx.x;t<NODE_TRIPLE_PLANE;t+=128) {
-        int row=t/NODE_TRIPLE_PITCH,c=t%NODE_TRIPLE_PITCH;
-        NodeTripleTile value=node_triple_cast(0.f);
-        if constexpr(PRESENT&(1u<<Input)) if(row<n && c<channels)
-            value=reinterpret_cast<NodeTripleTile const*>(source.data)[input_offset(p,Input,Field,begin+row,head,c)];
-        features[Slot*NODE_TRIPLE_PLANE+t]=value;
-    }
-}
+namespace packed_pair {
 
-template<int Left,int Right,int Left1=-1,int Right1=-1>
-__device__ void node_triple_score(NodeTripleTile const* features,float* output) {
-    using namespace nvcuda;
-    int warp=threadIdx.x/32,q=warp/2*16,k=warp%2*16;
-    wmma::fragment<wmma::accumulator,16,16,16,float> d;
-    wmma::fill_fragment(d,0.f);
-    for(int c=0;c<DIM;c+=16) {
-        wmma::fragment<wmma::matrix_a,16,16,16,NodeTripleTile,wmma::row_major> a;
-        wmma::fragment<wmma::matrix_b,16,16,16,NodeTripleTile,wmma::col_major> b;
-        wmma::load_matrix_sync(a,features+Left*NODE_TRIPLE_PLANE+q*NODE_TRIPLE_PITCH+c,NODE_TRIPLE_PITCH);
-        wmma::load_matrix_sync(b,features+Right*NODE_TRIPLE_PLANE+k*NODE_TRIPLE_PITCH+c,NODE_TRIPLE_PITCH);
-        wmma::mma_sync(d,a,b,d);
-        if constexpr(Left1>=0) {
-            wmma::load_matrix_sync(a,features+Left1*NODE_TRIPLE_PLANE+q*NODE_TRIPLE_PITCH+c,NODE_TRIPLE_PITCH);
-            wmma::load_matrix_sync(b,features+Right1*NODE_TRIPLE_PLANE+k*NODE_TRIPLE_PITCH+c,NODE_TRIPLE_PITCH);
-            wmma::mma_sync(d,a,b,d);
-        }
-    }
-    wmma::store_matrix_sync(output+q*32+k,d,32,wmma::mem_row_major);
-}
+template<typename A,typename B,typename C,bool RowMajorB=false>
+struct Traits {
+    using Shape=cutlass::gemm::GemmShape<32,32,8>;
+    using Core=cutlass::gemm::threadblock::DefaultMmaCore<
+        Shape,cutlass::gemm::GemmShape<16,16,8>,cutlass::gemm::GemmShape<1,1,1>,
+        A,cutlass::layout::RowMajor,B,
+        typename std::conditional<RowMajorB,cutlass::layout::RowMajor,cutlass::layout::ColumnMajor>::type,
+        C,cutlass::layout::RowMajor,cutlass::arch::OpClassSimt,2,cutlass::arch::OpMultiplyAdd>;
+    using Base=cutlass::gemm::threadblock::MmaBase<Shape,typename Core::MmaPolicy,2>;
+    using Operator=typename Core::MmaPolicy::Operator;
+};
 
-template<int Target,int C0,int F0,int C1,int F1,int C2=-1,int F2=-1,bool Transpose=false>
-__device__ void node_triple_output(Params const& p,NodeTripleTile const* features,NodeTripleTile const* coefficients,float* temporary,
-                                 int64_t begin,int n,int head) {
-    if constexpr(NEEDS&(1u<<Target)) {
-        using namespace nvcuda;
-        constexpr int padded=(DIM+15)/16*16;
-        constexpr int tiles=2*(padded/16);
-        using Layout=typename std::conditional<Transpose,wmma::col_major,wmma::row_major>::type;
-        for(int tile=threadIdx.x/32;tile<tiles;tile+=4) {
-            int q=tile/(padded/16)*16,c=tile%(padded/16)*16;
-            wmma::fragment<wmma::accumulator,16,16,16,float> d;
-            wmma::fill_fragment(d,0.f);
+template<typename A,typename B,typename C,bool RowMajorB=false>
+struct alignas(16) GemmStorage {
+    typename Traits<A,B,C,RowMajorB>::Base::SharedStorage operands;
+};
+
+template<typename ThreadMap,typename Producer,typename Element_,bool Left,bool RowMajorB>
+struct ProducerIterator {
+    using Element=Element_;
+    using Fragment=cutlass::Array<Element,ThreadMap::Iterations::kCount*ThreadMap::kElementsPerAccess>;
+    Producer producer;
+    cutlass::PitchLinearCoord origin;
+    int base=0,reduction;
+    bool enabled=true;
+
+    __device__ __forceinline__ ProducerIterator(Producer producer_,int reduction_)
+        :producer(producer_),origin(ThreadMap::initial_offset(threadIdx.x)),reduction(reduction_) {}
+    __device__ __forceinline__ void clear_mask(bool clear) {enabled=enabled && !clear;}
+    __device__ __forceinline__ ProducerIterator& operator++() {base+=8;return *this;}
+    __device__ __forceinline__ void load(Fragment& fragment) const {
+        #pragma unroll
+        for(int s=0;s<ThreadMap::Iterations::kStrided;++s)
             #pragma unroll
-            for(int key=0;key<32;key+=16) {
-                wmma::fragment<wmma::matrix_a,16,16,16,NodeTripleTile,Layout> a;
-                wmma::fragment<wmma::matrix_b,16,16,16,NodeTripleTile,wmma::row_major> b;
-                int offset=Transpose ? key*40+q:q*40+key;
-                wmma::load_matrix_sync(a,coefficients+C0*1280+offset,40);
-                wmma::load_matrix_sync(b,features+F0*NODE_TRIPLE_PLANE+key*NODE_TRIPLE_PITCH+c,NODE_TRIPLE_PITCH);
-                wmma::mma_sync(d,a,b,d);
-                wmma::load_matrix_sync(a,coefficients+C1*1280+offset,40);
-                wmma::load_matrix_sync(b,features+F1*NODE_TRIPLE_PLANE+key*NODE_TRIPLE_PITCH+c,NODE_TRIPLE_PITCH);
-                wmma::mma_sync(d,a,b,d);
-                if constexpr(C2>=0) {
-                    wmma::load_matrix_sync(a,coefficients+C2*1280+offset,40);
-                    wmma::load_matrix_sync(b,features+F2*NODE_TRIPLE_PLANE+key*NODE_TRIPLE_PITCH+c,NODE_TRIPLE_PITCH);
-                    wmma::mma_sync(d,a,b,d);
+            for(int c=0;c<ThreadMap::Iterations::kContiguous;++c)
+                #pragma unroll
+                for(int e=0;e<ThreadMap::kElementsPerAccess;++e) {
+                    int contiguous=origin.contiguous()+c*ThreadMap::Delta::kContiguous+e;
+                    int strided=origin.strided()+s*ThreadMap::Delta::kStrided;
+                    int k=base+((Left || !RowMajorB) ? contiguous:strided);
+                    int outer=(Left || !RowMajorB) ? strided:contiguous;
+                    int index=(s*ThreadMap::Iterations::kContiguous+c)*ThreadMap::kElementsPerAccess+e;
+                    Element value;
+                    if(enabled && k<reduction) {
+                        if constexpr(Left) value=producer(outer,k);
+                        else value=producer(k,outer);
+                    }
+                    fragment[index]=value;
                 }
-            }
-            wmma::store_matrix_sync(temporary+q*padded+c,d,padded,wmma::mem_row_major);
-        }
-        __syncthreads();
-        for(int t=threadIdx.x;t<n*DIM;t+=128) {
-            int row=t/DIM,c=t%DIM;
-            p.out[Target].store((int64_t(begin+row)*HEADS+head)*DIM+c,temporary[row*padded+c]*p.scale);
-        }
-        __syncthreads();
     }
+};
+
+template<typename IteratorC, typename Fragment, typename Project>
+__device__ __forceinline__ void store_plane(Fragment const& accumulator, float* output, Project project) {
+    using FloatIterator = cutlass::gemm::warp::MmaSimtTileIterator<
+        typename IteratorC::Shape, cutlass::gemm::Operand::kC, float,
+        cutlass::layout::RowMajor, typename IteratorC::Policy>;
+    static_assert(IteratorC::Shape::kRow == 16 && IteratorC::Shape::kColumn == 16);
+    static_assert(FloatIterator::Fragment::kElements == Fragment::kElements);
+    typename FloatIterator::Fragment field;
+    #pragma unroll
+    for (int i = 0; i < Fragment::kElements; ++i)
+        field[i] = project(accumulator[i]);
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    FloatIterator iterator(
+        {output + (warp % 2) * 16 * 32 + (warp / 2) * 16, cutlass::layout::RowMajor(32)}, lane);
+    iterator.store(field);
 }
 
-// Each CTA owns the atom across all heads. Envelope sums stay FP32 until
-// both requested envelope derivatives are stored once after the final head.
-__device__ void node_triple_derivative(Params const& p,int64_t atom,int64_t begin,int n) {
-    using F=Differential<4>;
-    extern __shared__ float storage[];
-    auto* features=reinterpret_cast<NodeTripleTile*>(storage);
-    float* work=reinterpret_cast<float*>(features+6*NODE_TRIPLE_PLANE);
-    F* full_dot=reinterpret_cast<F*>(work+8192);
-    F* alpha=full_dot+32;
-    int lane=threadIdx.x%32,row=threadIdx.x/32;
-    float envelope_third[8]={},envelope_direction[8]={};
-    for(int h=0;h<HEADS;++h) {
-        node_triple_load<0,0,0>(p,features,begin,n,h);
-        node_triple_load<1,1,1>(p,features,begin,n,h);
-        node_triple_load<7,0,2>(p,features,begin,n,h);
-        node_triple_load<8,1,3>(p,features,begin,n,h);
-        node_triple_load<12,0,4>(p,features,begin,n,h);
-        node_triple_load<13,1,5>(p,features,begin,n,h);
-        __syncthreads();
-        node_triple_score<0,1>(features,work);
-        node_triple_score<2,1,0,3>(features,work+1024);
-        node_triple_score<4,1,0,5>(features,work+2048);
-        node_triple_score<2,5,4,3>(features,work+3072);
-        __syncthreads();
-        node_triple_load<2,2,0>(p,features,begin,n,h);
-        node_triple_load<9,2,1>(p,features,begin,n,h);
-        node_triple_load<14,2,2>(p,features,begin,n,h);
-        __syncthreads();
-        for(int key=row;key<n;key+=4) {
-            F dot;
-            for(int c=lane;c<VALUE_DIM;c+=32) {
-                F value;
-                value.x[0]=node_triple_float(features[key*NODE_TRIPLE_PITCH+c]);
-                value.x[1]=node_triple_float(features[NODE_TRIPLE_PLANE+key*NODE_TRIPLE_PITCH+c]);
-                value.x[2]=node_triple_float(features[2*NODE_TRIPLE_PLANE+key*NODE_TRIPLE_PITCH+c]);
-                dot=jet_fma<false,false>(dot,value,static_upstream<4>(p,5,atom,h,c));
-            }
-            dot=warp_sum(dot);
-            if(lane==0) full_dot[key]=dot;
-        }
-        __syncthreads();
-        #pragma unroll
-        for(int r=0;r<8;++r) {
-            int q=row+r*4,pos=q*32+lane;
-            F score(-INFINITY),prob;
-            if(q<n && lane<n && (!CAUSAL || lane<=q)) {
-                #pragma unroll
-                for(int component=0;component<4;++component) score.x[component]=work[component*1024+pos]*p.scale;
-                if constexpr(BIAS_KIND==1) score=score+static_input<4>(p,3,begin+lane,h);
-                if constexpr(BIAS_KIND==2) score=score+static_input<4>(p,3,atom,h,q,lane);
-            }
-            float maximum=score.x[0];
-            #pragma unroll
-            for(int d=16;d;d/=2) maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,d));
-            F weight=isfinite(maximum) && isfinite(score.x[0]) ? exponential(score-F(maximum)):F();
-            F denominator=warp_sum(weight);
-            if(denominator.x[0]>0.f) prob=weight*reciprocal(denominator);
-            F dot=lane<n ? full_dot[lane]:F();
-            F delta=warp_sum(prob*dot);
-            F env=q<n && (PRESENT&16) ? static_input<4>(p,4,begin+q):F(1.f);
-            F ds=prob*(dot-delta)*env;
-            #pragma unroll
-            for(int component=0;component<4;++component) {
-                work[component*1024+pos]=prob.x[component];
-                work[(component+4)*1024+pos]=ds.x[component];
-            }
-            if(lane==0 && q<n) {
-                envelope_third[r]+=delta.x[3];
-                envelope_direction[r]+=delta.x[2];
-            }
-            if constexpr(BIAS_KIND==2) if(q<n && lane<n) {
-                if constexpr(NEEDS&8) p.out[3].store(p.out[3].index(atom,h,q,lane),ds.x[3]);
-                if constexpr(NEEDS&(1u<<10)) p.out[10].store(p.out[10].index(atom,h,q,lane),ds.x[2]);
-            }
-        }
-        __syncthreads();
-        if(threadIdx.x<n) {
-            F sum;
-            for(int q=0;q<n;++q) {
-                F prob;
-                #pragma unroll
-                for(int component=0;component<4;++component) prob.x[component]=work[component*1024+q*32+threadIdx.x];
-                F env=(PRESENT&16) ? static_input<4>(p,4,begin+q):F(1.f);
-                sum=jet_fma<false,true>(sum,env,prob);
-            }
-            alpha[threadIdx.x]=sum;
-        }
-        if constexpr(BIAS_KIND==1) if(threadIdx.x<n) {
-            float third=0.f,direction=0.f;
-            for(int q=0;q<n;++q) {third+=work[7168+q*32+threadIdx.x];direction+=work[6144+q*32+threadIdx.x];}
-            if constexpr(NEEDS&8) p.out[3].store(p.out[3].index(begin+threadIdx.x,h),third);
-            if constexpr(NEEDS&(1u<<10)) p.out[10].store(p.out[10].index(begin+threadIdx.x,h),direction);
-        }
-        __syncthreads();
-        for(int t=threadIdx.x;t<n*VALUE_DIM;t+=128) {
-            int key=t/VALUE_DIM,c=t%VALUE_DIM;
-            F g=static_upstream<4>(p,5,atom,h,c),a=alpha[key];
-            float third=fmaf(a.x[3],g.x[0],a.x[1]*g.x[2]);
-            float direction=fmaf(a.x[2],g.x[0],a.x[0]*g.x[2]);
-            if constexpr(NEEDS&4) p.out[2].store((int64_t(begin+key)*HEADS+h)*VALUE_DIM+c,third);
-            if constexpr(NEEDS&(1u<<9)) p.out[9].store((int64_t(begin+key)*HEADS+h)*VALUE_DIM+c,direction);
-        }
-        if constexpr(NEEDS&32) for(int c=threadIdx.x;c<VALUE_DIM;c+=128) {
-            float sum=0.f;
-            for(int key=0;key<n;++key) {
-                F a=alpha[key];
-                sum=fmaf(a.x[3],node_triple_float(features[key*NODE_TRIPLE_PITCH+c]),sum);
-                sum=fmaf(a.x[1],node_triple_float(features[2*NODE_TRIPLE_PLANE+key*NODE_TRIPLE_PITCH+c]),sum);
-                sum=fmaf(a.x[2],node_triple_float(features[NODE_TRIPLE_PLANE+key*NODE_TRIPLE_PITCH+c]),sum);
-            }
-            p.out[5].store(p.out[5].index(atom,h,c),sum);
-        }
-        __syncthreads();
-        auto* coefficients=reinterpret_cast<NodeTripleTile*>(work);
-        for(int t=threadIdx.x;t<4*1280;t+=128) {
-            int plane=t/1280,row=t%1280/40,col=t%40;
-            coefficients[t]=node_triple_cast(col<32 ? work[4096+plane*1024+row*32+col]:0.f);
-        }
-        node_triple_load<0,0,0>(p,features,begin,n,h);
-        node_triple_load<1,1,1>(p,features,begin,n,h);
-        node_triple_load<7,0,2>(p,features,begin,n,h);
-        node_triple_load<8,1,3>(p,features,begin,n,h);
-        node_triple_load<12,0,4>(p,features,begin,n,h);
-        node_triple_load<13,1,5>(p,features,begin,n,h);
-        __syncthreads();
-        float* temporary=work+4096;
-        node_triple_output<0,3,1,1,5,2,3>(p,features,coefficients,temporary,begin,n,h);
-        node_triple_output<7,2,1,0,5>(p,features,coefficients,temporary,begin,n,h);
-        node_triple_output<1,3,0,1,4,2,2,true>(p,features,coefficients,temporary,begin,n,h);
-        node_triple_output<8,2,0,0,4,-1,-1,true>(p,features,coefficients,temporary,begin,n,h);
-    }
-    if(lane==0) {
-        #pragma unroll
-        for(int r=0;r<8;++r) if(row+r*4<n) {
-            if constexpr(NEEDS&16) p.out[4].store(begin+row+r*4,envelope_third[r]);
-            if constexpr(NEEDS&(1u<<11)) p.out[11].store(begin+row+r*4,envelope_direction[r]);
-        }
-    }
+
+// The library owns every operand load and all K-loop and warp-MMA iterations.
+template<typename A,typename B,typename C,bool RowMajorB,typename Left,typename Right>
+__device__ __forceinline__ void multiply(GemmStorage<A,B,C,RowMajorB>& shared,
+    typename Traits<A,B,C,RowMajorB>::Operator::FragmentC& accumulator,
+    int reduction,Left left,Right right) {
+    using T=Traits<A,B,C,RowMajorB>;
+    using Core=typename T::Core;
+    using IteratorA=ProducerIterator<typename Core::IteratorThreadMapA,Left,A,true,RowMajorB>;
+    using IteratorB=ProducerIterator<typename Core::IteratorThreadMapB,Right,B,false,RowMajorB>;
+    using ThreadblockMma=cutlass::gemm::threadblock::MmaPipelined<
+        typename T::Shape,IteratorA,typename Core::SmemIteratorA,IteratorB,typename Core::SmemIteratorB,
+        C,cutlass::layout::RowMajor,typename Core::MmaPolicy>;
+    accumulator.clear();
+    ThreadblockMma mma(shared.operands,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+    mma((reduction+7)/8,accumulator,IteratorA(left,reduction),IteratorB(right,reduction),accumulator);
 }
-__global__ __launch_bounds__(128,2)
-void small_triple_kernel(const __grid_constant__ Params p,
-    const __grid_constant__ Params native_p,
-    const __grid_constant__ Params final_p,float* envelope) {
-    int64_t atom=blockIdx.x,begin=p.offset(atom),end=p.offset(atom+1);
-    if(end-begin<=32) {
-        clear_optional_outputs<3>(native_p,atom,begin,end);
-        node_triple_derivative(native_p,atom,begin,int(end-begin));
-        __syncthreads();
-        finish_higher_rows<3>(p,final_p,atom,false);
-    } else small_higher_long<3>(p,final_p,atom,begin,end,envelope);
+
+// Planes may overwrite operands after the complete mainloop has returned.
+template<typename A,typename B,typename C,bool RowMajorB,typename Left,typename Right>
+__device__ __forceinline__ void gemm_planes(GemmStorage<A,B,C,RowMajorB>& shared,
+    float* value,float* first,float* second,float* mixed,int reduction,Left left,Right right) {
+    using Operator=typename Traits<A,B,C,RowMajorB>::Operator;
+    typename Operator::FragmentC accumulator;
+    multiply(shared,accumulator,reduction,left,right);
+    __syncthreads();
+    using IteratorC=typename Operator::IteratorC;
+    if(value) store_plane<IteratorC>(accumulator,value,[](C const& x) {return x.value;});
+    if(first) store_plane<IteratorC>(accumulator,first,[](C const& x) {return x.first;});
+    if(second) store_plane<IteratorC>(accumulator,second,[](C const& x) {return x.second;});
+    if(mixed) store_plane<IteratorC>(accumulator,mixed,[](C const& x) {return x.mixed;});
+    __syncthreads();
+}
+
+struct alignas(16) FeatureElement {
+    float value, first, second, padding0;
+
+    __host__ __device__ __forceinline__ FeatureElement(float value_ = 0.f)
+        : value(value_), first(0.f), second(0.f), padding0(0.f) {}
+    __host__ __device__ __forceinline__ FeatureElement(float value_, float first_, float second_)
+        : value(value_), first(first_), second(second_), padding0(0.f) {}
+};
+
+struct alignas(16) PairElement {
+    float value, first, second, mixed;
+
+    __host__ __device__ __forceinline__ PairElement(float value_ = 0.f)
+        : value(value_), first(0.f), second(0.f), mixed(0.f) {}
+    __host__ __device__ __forceinline__ PairElement(FeatureElement const& feature)
+        : value(feature.value), first(feature.first), second(feature.second), mixed(0.f) {}
+};
+
+// ADL supplies only the scalar multiply-add used by CUTLASS's generic Mma.
+struct Product {
+    PairElement left, right;
+
+    __host__ __device__ __forceinline__ PairElement operator+(PairElement const& accumulator) const {
+        PairElement result;
+        result.value = fmaf(left.value, right.value, accumulator.value);
+        result.first = fmaf(left.first, right.value, fmaf(left.value, right.first, accumulator.first));
+        result.second = fmaf(left.second, right.value, fmaf(left.value, right.second, accumulator.second));
+        result.mixed = fmaf(left.first, right.second, fmaf(left.second, right.first, accumulator.mixed));
+        return result;
+    }
+};
+
+__host__ __device__ __forceinline__ Product operator*(PairElement const& left, PairElement const& right) {
+    return {left, right};
+}
+
+static_assert(sizeof(FeatureElement) == 16 && sizeof(PairElement) == 16);
+static_assert(alignof(FeatureElement) == 16 && alignof(PairElement) == 16);
+
+// The accumulator only retains the two terminal gradient components. The
+// other fields carry operands through CUTLASS's generic multiply_add casts.
+struct alignas(16) Terminal4 {
+    float value,first,second,mixed;
+    __host__ __device__ __forceinline__ Terminal4(float scalar=0.f)
+        :value(scalar),first(0.f),second(0.f),mixed(0.f) {}
+    __host__ __device__ __forceinline__ Terminal4(FeatureElement const& feature)
+        :value(feature.value),first(feature.first),second(feature.second),mixed(0.f) {}
+    __host__ __device__ __forceinline__ Terminal4(PairElement const& pair)
+        :value(pair.value),first(pair.first),second(pair.second),mixed(pair.mixed) {}
+};
+
+struct TerminalProduct {
+    Terminal4 left,right;
+    __host__ __device__ __forceinline__ Terminal4 operator+(Terminal4 const& accumulator) const {
+        Terminal4 result;
+        result.second=fmaf(left.second,right.value,
+                          fmaf(left.value,right.second,accumulator.second));
+        result.mixed=fmaf(left.mixed,right.value,
+                         fmaf(left.first,right.second,
+                              fmaf(left.second,right.first,accumulator.mixed)));
+        return result;
+    }
+};
+
+__host__ __device__ __forceinline__ TerminalProduct operator*(Terminal4 left,Terminal4 right) {
+    return {left,right};
+}
+
+} // namespace packed_pair
+
+using PackedScoreStorage=packed_pair::GemmStorage<packed_pair::FeatureElement,
+    packed_pair::FeatureElement,packed_pair::PairElement>;
+using PackedOutputStorage=packed_pair::GemmStorage<packed_pair::PairElement,
+    packed_pair::FeatureElement,packed_pair::Terminal4,true>;
+
+
+namespace packed_pair {
+template<int N,bool LeftMixed=true,bool RightMixed=true,unsigned Components=(1u<<N)-1,
+    typename Left,typename Right>
+__device__ __forceinline__ void differential_gemm(PackedScoreStorage& shared,float (*output)[1024],
+    int reduction,Left left,Right right) {
+    static_assert(N==4 && !LeftMixed && !RightMixed && Components==15u);
+    packed_pair::gemm_planes(shared,output[0],output[1],output[2],output[3],reduction,
+        [&](int row,int k) {
+            auto x=left(row,k);
+            return packed_pair::FeatureElement(x.x[0],x.x[1],x.x[2]);
+        },
+        [&](int k,int column) {
+            auto x=right(k,column);
+            return packed_pair::FeatureElement(x.x[0],x.x[1],x.x[2]);
+        });
+}
+
+template<int N,bool LeftMixed=true,bool RightMixed=true,unsigned Components=(1u<<N)-1,
+    typename Left,typename Right>
+__device__ __forceinline__ void differential_gemm(PackedOutputStorage& shared,float (*output)[1024],
+    int reduction,Left left,Right right) {
+    static_assert(N==4 && LeftMixed && !RightMixed && Components==12u);
+    packed_pair::gemm_planes(shared,nullptr,nullptr,output[0],output[1],reduction,
+        [&](int row,int k) {
+            auto x=left(row,k);
+            packed_pair::PairElement result;
+            result.value=x.x[0];
+            result.first=x.x[1];
+            result.second=x.x[2];
+            result.mixed=x.x[3];
+            return result;
+        },
+        [&](int k,int column) {
+            auto x=right(k,column);
+            return packed_pair::FeatureElement(x.x[0],x.x[1],x.x[2]);
+        });
+}
+
+
 }
 
 #endif
-
 """
+
 
 SOURCE = r"""
-
-
-// The mixed component of the analytic gradient gives the primal third
-// derivative plus the second-output-adjoint term. Its second direction gives
-// the gradient of the first incoming direction; the output mixed component
-// gives the gradient of the original node/edge adjoints.
-void run(std::vector<std::optional<at::Tensor>> inputs, at::Tensor csr,
-         std::vector<std::optional<at::Tensor>> outputs,
-         std::vector<std::optional<at::Tensor>> final_outputs, double scale) {
+void run(std::vector<std::optional<at::Tensor>> inputs,at::Tensor csr,
+         std::vector<std::optional<at::Tensor>> outputs,double scale
+#if defined(CONV_NATIVE_HIGHER_SUMMARY)
+         ,at::Tensor summary
+#endif
+         ) {
     c10::cuda::CUDAGuard guard(inputs[0]->device());
-    if (csr.numel() > 1) {
-        constexpr int extent = DIM > VALUE_DIM ? DIM : VALUE_DIM;
-        constexpr int width = extent < 32 ? extent : 32;
-        constexpr int feature_size = 3 * 32 * (width + 1) * 3;
-        constexpr int pv_size = 2 * 4 * 1024 + 32 * (width + 1) * 3;
-        constexpr int qk_size = 4 * 1024 + 2 * 32 * (width + 1) * 3;
-        constexpr int base_arena = feature_size > pv_size ? (feature_size > qk_size ? feature_size : qk_size) : (pv_size > qk_size ? pv_size : qk_size);
-#ifdef LOWP_BF16
-    constexpr int arena = base_arena > feature_size + 1024 ? base_arena : feature_size + 1024;
-#else
-    constexpr int arena = base_arena;
-#endif
-
-        #ifdef LOWP_BF16
-        constexpr int dynamic_bytes = (arena+4*64)*sizeof(float);
-#else
-        constexpr int short_bytes = (arena+4*64)*sizeof(float);
-        constexpr int dynamic_bytes = short_bytes;
-#endif
+    if(csr.numel()>1) {
+        constexpr int bytes=sizeof(BackwardStorage<4>);
         static thread_local int configured_device=-1;
-        static thread_local int multiprocessors=0;
         int device=inputs[0]->get_device();
         if(configured_device!=device) {
-            if constexpr(dynamic_bytes>0)
-                C10_CUDA_CHECK(cudaFuncSetAttribute(derivative_kernel<3>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,dynamic_bytes));
-            C10_CUDA_CHECK(cudaFuncSetAttribute(long_rows_kernel<3,512,2>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,TiledBackwardLayout<3>::SharedBytes));
-            C10_CUDA_CHECK(cudaFuncSetAttribute(long_rows_kernel<3,512,2,false>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,TiledBackwardLayout<3>::SharedBytes));
-            if constexpr(TiledBackwardLayout<3>::NodeOnly) {
-                C10_CUDA_CHECK(cudaFuncSetAttribute(node_higher_cached_kernel<3,64>,cudaFuncAttributeMaxDynamicSharedMemorySize,NodeHigherLayout<3,64>::Bytes));
-                C10_CUDA_CHECK(cudaFuncSetAttribute(node_higher_cached_kernel<3,64>,cudaFuncAttributePreferredSharedMemoryCarveout,100));
-                C10_CUDA_CHECK(cudaFuncSetAttribute(node_higher_cached_kernel<3,48>,cudaFuncAttributeMaxDynamicSharedMemorySize,NodeHigherLayout<3,48>::Bytes));
-                C10_CUDA_CHECK(cudaFuncSetAttribute(node_higher_cached_kernel<3,48>,cudaFuncAttributePreferredSharedMemoryCarveout,100));
-            }
-#ifdef LOWP_BF16
-            if constexpr(NODE_TRIPLE_ENABLED) {
-                constexpr int small_bytes=NODE_TRIPLE_BYTES>TiledBackwardLayout<3>::SharedBytes?
-                    NODE_TRIPLE_BYTES:TiledBackwardLayout<3>::SharedBytes;
-                C10_CUDA_CHECK(cudaFuncSetAttribute(small_triple_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,small_bytes));
-                C10_CUDA_CHECK(cudaFuncSetAttribute(small_triple_kernel,cudaFuncAttributePreferredSharedMemoryCarveout,100));
-            }
-#endif
-            multiprocessors=at::cuda::getDeviceProperties(device)->multiProcessorCount;
+            C10_CUDA_CHECK(cudaFuncSetAttribute(backward_kernel<4>,cudaFuncAttributeMaxDynamicSharedMemorySize,bytes));
             configured_device=device;
         }
-        Params p=params(inputs,outputs,csr,scale);
-        Params final_p=params(inputs,final_outputs,csr,scale);
-        Params native_p=p;
-#ifdef LOWP_BF16
-        for(int slot=0;slot<12;++slot)
-            if((slot>=7?slot-7:slot)<3)native_p.out[slot]=final_p.out[slot];
+#if defined(CONV_NATIVE_HIGHER_SUMMARY)
+        auto p=params(inputs,outputs,csr,scale);
+        auto projected=view(summary);
+        node_projection_kernel<4><<<dim3(csr.numel()-1,HEADS),128,0,at::cuda::getCurrentCUDAStream()>>>(p,projected);
+        backward_kernel<4><<<dim3(csr.numel()-1,HEADS,QUERY_WORKERS),128,bytes,at::cuda::getCurrentCUDAStream()>>>(p,projected);
+        if constexpr(NEEDS&548u)
+            node_value_kernel<4><<<dim3(csr.numel()-1,HEADS),128,0,at::cuda::getCurrentCUDAStream()>>>(p,projected);
+#else
+        backward_kernel<4><<<dim3(csr.numel()-1,HEADS,QUERY_WORKERS),128,bytes,at::cuda::getCurrentCUDAStream()>>>(params(inputs,outputs,csr,scale));
 #endif
-        float* envelope=nullptr;
-        int query_workers=1;
-        bool resident=false;
-        auto workspace=tiled_envelope_workspace<3>(*inputs[0]);
-        if(workspace.defined()) envelope=workspace.data_ptr<float>();
-        query_workers=tiled_query_workers<3>(inputs[0]->get_device(),csr.numel()-1);
-        // Amortize two resident launches only when average degree exceeds a streaming tile.
-        if constexpr(TiledBackwardLayout<3>::NodeOnly)
-            resident=inputs[0]->size(0)>32*(csr.numel()-1);
-        if(resident) query_workers=4;
-#ifdef LOWP_BF16
-        if constexpr(NODE_TRIPLE_ENABLED) {
-            if(!resident && (csr.numel()-1)*HEADS<=2*multiprocessors) {
-                constexpr int small_bytes=NODE_TRIPLE_BYTES>TiledBackwardLayout<3>::SharedBytes?
-                    NODE_TRIPLE_BYTES:TiledBackwardLayout<3>::SharedBytes;
-                small_triple_kernel<<<csr.numel()-1,128,small_bytes,at::cuda::getCurrentCUDAStream()>>>(p,native_p,final_p,envelope);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
-                return;
-            }
-        }
-#endif
-
-
-        derivative_kernel<3><<<csr.numel()-1,512,dynamic_bytes,at::cuda::getCurrentCUDAStream()>>>(p,native_p,query_workers,resident);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
-        if(resident) {
-        long_rows_kernel<3,512,2><<<dim3(csr.numel()-1,HEADS,query_workers),512,
-            TiledBackwardLayout<3>::SharedBytes,at::cuda::getCurrentCUDAStream()>>>(p,envelope);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        } else {
-        long_rows_kernel<3,512,2,false><<<dim3(csr.numel()-1,HEADS,query_workers),512,
-            TiledBackwardLayout<3>::SharedBytes,at::cuda::getCurrentCUDAStream()>>>(p,envelope);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-        if constexpr(TiledBackwardLayout<3>::NodeOnly) if(resident) {
-            node_higher_cached_kernel<3,64><<<dim3(csr.numel()-1,HEADS),(NodeHigherLayout<3,64>::Threads),(NodeHigherLayout<3,64>::Bytes),at::cuda::getCurrentCUDAStream()>>>(native_p,envelope);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-            node_higher_cached_kernel<3,48><<<dim3(csr.numel()-1,HEADS),(NodeHigherLayout<3,48>::Threads),(NodeHigherLayout<3,48>::Bytes),at::cuda::getCurrentCUDAStream()>>>(native_p,envelope);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-        if(envelope) {
-            tiled_envelope_reduce<3><<<csr.numel()-1,128,0,at::cuda::getCurrentCUDAStream()>>>(p,envelope);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
-        }
-#ifdef LOWP_BF16
-        finish_higher<3><<<csr.numel()-1,256,0,at::cuda::getCurrentCUDAStream()>>>(p,final_p,resident);
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-#endif
     }
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run", &run);
-}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) { m.def("run",&run); }
 """
 
 
 @lru_cache(maxsize=128)
-def get_triple_backward_kernel(config, device, dtype, present, contiguous, needed):
-    defines = f"#define PRESENT {present}u\n#define NEEDS {needed}u\n#define CONTIGUOUS {contiguous}u\n"
-    native_score = 0
-    if dtype in (torch.float16, torch.bfloat16):
-        pitch = (config[0] + 15) // 16 * 16 + 8
-        required = 4 * max(3 * 64 * pitch, 4 * 64 * 72 // 2 + 4 * (64 * 64 + 4 * 64))
-        native_score = int(required <= get_device_properties(device).shared_memory_per_block_optin)
-    defines += f"#define HIGHER_NATIVE_SCORE {native_score}\n"
-    return load_kernel(
-        "attention_conv_triple_backward", defines + LOWP_SOURCE + GRADIENT_SOURCE + TILED_SOURCE + DERIVATIVE_SOURCE + NODE_TRIPLE_SOURCE + SOURCE,
-        config, device.index, dtype,
-    ).run
+def get_triple_backward_kernel(config, device, dtype, needed, edge_grad, layout, query_workers):
+    defines = (
+        f"#define QUERY_WORKERS {query_workers}\n"
+        f"#define NEEDS {needed}u\n"
+        f"#define EDGE_GRAD {int(edge_grad)}\n"
+    )
+    if dtype == torch.float32 and not edge_grad:
+        defines += "#define CONV_NATIVE_HIGHER_SUMMARY 1\n"
+    source = (
+        defines
+        + GRADIENT_SOURCE
+        + PACKED_SOURCE
+        + BACKWARD_SOURCE
+        + SOURCE
+    )
+    return load_kernel("attention_conv_triple_backward", source, config, device.index, dtype, layout).run
 
 
 def attention_conv_triple_backward(inputs, csr, config, needs):
-    present = sum(1 << i for i, value in enumerate(inputs) if value is not None)
-    contiguous = sum(1 << i for i, value in enumerate(inputs) if value is not None and value.is_contiguous())
-    needed = sum(1 << i for i, need in enumerate(needs) if need and inputs[i] is not None)
-    outputs = allocate(inputs[:12], needs, accumulate=True)
-    final_outputs = allocate(inputs[:12], needs) if inputs[0].dtype in (torch.float16, torch.bfloat16) else outputs
-    kernel = get_triple_backward_kernel(config, inputs[0].device, inputs[0].dtype, present, contiguous, needed)
-    kernel(inputs, csr, outputs, final_outputs, config[3])
-    return final_outputs
+    native_node = inputs[0].dtype == torch.float32 and inputs[6] is None
+    outputs = tuple(
+        (torch.empty if native_node and i in (2, 5, 9) else torch.zeros)(
+            x.shape, device=x.device, dtype=torch.float32
+        ) if x is not None and need else None
+        for i, (x, need) in enumerate(zip(inputs[:12], needs))
+    )
+    needed = sum(1 << i for i, output in enumerate(outputs) if output is not None)
+    query_workers = 4 if inputs[0].shape[0] > 32 * (csr.numel() - 1) else 1
+    kernel = get_triple_backward_kernel(
+        config, inputs[0].device, inputs[0].dtype, needed,
+        inputs[6] is not None, input_layout(inputs), query_workers,
+    )
+    if native_node:
+        summary = torch.empty(
+            (*inputs[0].shape[:2], 8), device=inputs[0].device, dtype=torch.float32
+        )
+        kernel(inputs, csr, outputs, config[3], summary)
+    else:
+        kernel(inputs, csr, outputs, config[3])
+    return finish_gradients(outputs, inputs)

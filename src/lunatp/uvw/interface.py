@@ -82,13 +82,7 @@ def register_ops(op):
 
         def forward_backward(ctx, g):
             x, y, w = ctx.saved_tensors
-            needs = list(ctx.needs_input_grad[:3])
-            gradients = tp_backward(x, y, w, g, needs)
-            return gradients
-
-        def backward_setup_context(ctx, inputs, output):
-            ctx.save_for_backward(*inputs[:4])
-            ctx.set_materialize_grads(False)
+            return tp_backward(x, y, w, g, list(ctx.needs_input_grad[:3]))
 
         def backward_backward(ctx, rx, ry, rw):
             x, y, w, g = ctx.saved_tensors
@@ -109,7 +103,7 @@ def register_ops(op):
             )
 
         tp_forward.register_autograd(forward_backward, setup_context=setup_context)
-        tp_backward.register_autograd(backward_backward, setup_context=backward_setup_context)
+        tp_backward.register_autograd(backward_backward, setup_context=setup_context)
         tp_double_backward.register_autograd(double_backward_backward, setup_context=setup_context)
 
         return name

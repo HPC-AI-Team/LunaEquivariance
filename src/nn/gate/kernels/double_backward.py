@@ -1,11 +1,21 @@
 """Gate CUDA second gradients, including gate/vector mixed directions."""
 
+from math import gcd
+
+import torch
+
 from ...activation.kernels.backward import BACKWARD_FUNCTIONS, BACKWARD_MATH
 from ...activation.kernels.double_backward import (
-    BINDING, DOUBLE_BACKWARD_MATH, DOUBLE_BACKWARD_RESULT, MODULE_BINDING,
+    DOUBLE_BACKWARD_MATH, DOUBLE_BACKWARD_RESULT,
     required_inputs as activation_required_inputs,
 )
-from .utils import make_binding, make_path_types, make_schedule
+from ...activation.kernels.utils import BINDING, MODULE_BINDING
+from .utils import (
+    DIRECT_STORE_BYTES, DOUBLE_BACKWARD_THREADS, GATE_STORES, MIN_COPY_TILE,
+    SHARED_MEMORY_LIMIT, WARP_SIZE,
+    get_kernel_config, launch_kernel, make_binding,
+    make_path_types, make_schedule,
+)
 
 DOUBLE_BACKWARD_MATH_SOURCE = r'''template<class Path>
 __device__ __forceinline__ void gate_double_backward_scalar(
@@ -22,10 +32,11 @@ __device__ __forceinline__ void gate_double_backward_scalar(
     if constexpr (WriteSX) out_sx[input] = result.sx;
     if constexpr (WriteSG) out_sg[output] = result.sg;
 }
-template<class Path>
+template<class Path, bool SharedOutput = false>
 __device__ __forceinline__ void gate_double_backward_product(
     const Element* x, const Element* grad_out, const Element* rx,
-    Element* out_sx, Element* out_sg, Index row, Index copy) {
+    Element* out_sx, Element* out_sg, Index row, Index copy,
+    Element* shared_sx = nullptr, Element* shared_sg = nullptr) {
     const Index gate_input = row * InWidth + Path::gate_offset + copy;
     const Index input = row * InWidth + Path::input_offset + copy * Path::components;
     const Index output = row * OutWidth + Path::output_offset + copy * Path::components;
@@ -60,12 +71,22 @@ __device__ __forceinline__ void gate_double_backward_product(
     #pragma unroll
     for (int component = 0; component < Path::components; ++component) {
         if constexpr (WriteSX) {
-            out_sx[input + component] = gate_multiply(result.sg, grads[component]);
+            const Element sx = gate_multiply(result.sg, grads[component]);
+            if constexpr (SharedOutput) {
+                shared_sx[(threadIdx.x % 32) * Path::components + component] = sx;
+            } else {
+                out_sx[input + component] = sx;
+            }
         }
         if constexpr (WriteSG) {
-            out_sg[output + component] = gate_add(
+            const Element sg = gate_add(
                 gate_multiply(result.sg, vectors[component]),
                 gate_multiply(directions[component], gate));
+            if constexpr (SharedOutput) {
+                shared_sg[(threadIdx.x % 32) * Path::components + component] = sg;
+            } else {
+                out_sg[output + component] = sg;
+            }
         }
     }
 }'''
@@ -79,7 +100,24 @@ DOUBLE_BACKWARD_KERNEL = r'''__global__ __launch_bounds__(128, 1) void gate_doub
          item < num_items * {count}; item += Index(gridDim.x) * 128) {{
         const Index row = item / {count};
         const Index group = item % {count};
-        {schedule}
+{schedule}
+    }}
+}}'''
+
+
+COALESCED_DOUBLE_BACKWARD_KERNEL = r'''__global__ __launch_bounds__({threads}, 1) void gate_double_backward(
+    const Element* __restrict__ x, const Element* __restrict__ grad_out,
+    const Element* __restrict__ rx, Element* __restrict__ out_sx,
+    Element* __restrict__ out_sg, int64_t num_items) {{
+    __shared__ __align__(16) Element shared_values[{threads} * {max_components} * {buffers}];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const Index tasks = ((num_items + {rows_per_warp} - 1) / {rows_per_warp}) * {tiles};
+    for (Index task = Index(blockIdx.x) * {warps} + warp;
+         task < tasks; task += Index(gridDim.x) * {warps}) {{
+        const Index row = (task / {tiles}) * {rows_per_warp} + lane / {copy_tile};
+        const Index group = task % {tiles};
+{schedule}
     }}
 }}'''
 
@@ -116,17 +154,73 @@ def make_source(meta, config, *, tensor_only=False, fragments=False):
         "gate_double_backward_scalar<{path}>(x, grad_out, rx, out_sx, out_sg, row, copy);",
         "gate_double_backward_product<{path}>(x, grad_out, rx, out_sx, out_sg, row, copy);",
     )
+    max_components = max((path["components"] for path in meta["gated_paths"]), default=1)
+    copy_tile = gcd(WARP_SIZE, *(copies for _, _, copies in paths))
+    rows_per_warp = WARP_SIZE // copy_tile
+    buffers = len(config["active_outputs"])
+    coalesced = (
+        bool(meta["gated_paths"])
+        and max_components * DOUBLE_BACKWARD_THREADS * buffers * (8 if config["dtype"] == torch.float64 else 4) <= SHARED_MEMORY_LIMIT
+        and copy_tile >= MIN_COPY_TILE
+    )
+    if coalesced:
+        declarations.append(GATE_STORES)
+        pointers = []
+        stores = []
+        for name, width in (("sx", "InWidth"), ("sg", "OutWidth")):
+            if name in config["active_outputs"]:
+                offset = len(stores) * DOUBLE_BACKWARD_THREADS * max_components
+                pointers.append(f"shared_values + {offset} + warp * 32 * {max_components}")
+                field = "input_offset" if name == "sx" else "output_offset"
+                stores.append(
+                    f"    gate_store_components<{width}, {{path}}::{field}, {{path}}::components, {{copies}}, {copy_tile}>"
+                    f"({pointers[-1]}, out_{name}, row, copy_base, num_items);\n"
+                )
+            else:
+                pointers.append("nullptr")
+        product_call = (
+            "if constexpr ({path}::components * sizeof(Element) <= " + str(DIRECT_STORE_BYTES) + ") {{\n"
+            "    if (row < num_items && copy < {copies}) gate_double_backward_product<{path}>(x, grad_out, rx, out_sx, out_sg, row, copy);\n"
+            "}} else {{\n"
+            "    if (row < num_items && copy < {copies}) gate_double_backward_product<{path}, true>(x, grad_out, rx, out_sx, out_sg, row, copy, "
+            + ", ".join(pointers) + ");\n    __syncwarp();\n"
+            + "".join(stores) + "    __syncwarp();\n}}"
+        )
+        tiles, schedule = make_schedule(
+            paths,
+            "if (row < num_items && copy < {copies}) gate_double_backward_scalar<{path}>(x, grad_out, rx, out_sx, out_sg, row, copy);",
+            product_call, warp_groups=True, copy_tile=copy_tile,
+        )
+        warps = DOUBLE_BACKWARD_THREADS // WARP_SIZE
+        kernel = COALESCED_DOUBLE_BACKWARD_KERNEL.format(
+            threads=DOUBLE_BACKWARD_THREADS, max_components=max_components, buffers=buffers,
+            warps=warps, tiles=tiles, schedule=schedule,
+            rows_per_warp=rows_per_warp, copy_tile=copy_tile,
+        )
+        geometry = f"<<<std::min<int64_t>(65535,(((num_items+{rows_per_warp-1})/{rows_per_warp})*{tiles}+{warps-1})/{warps}),{DOUBLE_BACKWARD_THREADS},0,stream>>>"
+    else:
+        kernel = DOUBLE_BACKWARD_KERNEL.format(count=count, schedule=schedule)
+        geometry = f"<<<std::min<int64_t>(65535,(num_items*{count}+127)/128),128,0,stream>>>"
     arguments = [f"{name}.data_ptr<Element>()" if name in config["inputs"] else "nullptr"
                  for name in ("x", "grad_out", "rx")]
     arguments += [f"result_{name}.data_ptr<Element>()" if name in config["active_outputs"] else "nullptr"
                   for name in ("sx", "sg")]
     launch = (
-        f"if(num_items>0) gate_double_backward<<<std::min<int64_t>(65535,(num_items*{count}+127)/128),128,0,stream>>>"
+        f"if(num_items>0) gate_double_backward{geometry}"
         f"({','.join(arguments)},num_items);"
     )
     return make_binding(
         meta, config, declarations=declarations,
-        kernel_body=DOUBLE_BACKWARD_KERNEL.format(count=count, schedule=schedule),
+        kernel_body=kernel,
         binding=BINDING, module_binding=MODULE_BINDING, launch=launch,
         tensor_only=tensor_only, fragments=fragments,
     )
+
+
+def gate_double_backward(features, grad_output, grad_grad_input, meta, index_bits, kernel_cache, dtype, *, needs=None):
+    inputs = features, grad_output, grad_grad_input
+    available = tuple(name for name, value in zip(("x", "grad_out", "rx"), inputs) if value is not None)
+    config = get_kernel_config(
+        meta, kernel_cache, 2, needs=needs, available=available, dtype=dtype
+    )
+    return launch_kernel(inputs, config, meta, index_bits, kernel_cache, make_source)

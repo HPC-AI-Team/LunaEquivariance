@@ -11,7 +11,7 @@ from math import prod
 
 import torch
 
-from .kernels.utils import MAX_BATCH_RANK, TASK_ALIGNMENT, build_program, run_kernel, run_raw_forward, select_program
+from .kernels.utils import build_program, run_kernel, select_program
 from .metadata import linear_config, LinearKernelConfig, Instruction
 from ...utils import is_compiling, REGISTER_OPERATOR_LOCK
 from ..irreps import Irreps, irreps_key
@@ -129,52 +129,29 @@ class LinearBackward(torch.autograd.Function):
 
 
 class LinearForward(torch.autograd.Function):
-    """Save X for DW and weight for DX; restore raw-view gradient shapes."""
-
     @staticmethod
-    def forward(ctx, op, x, weight, bias, plan):
+    def forward(ctx, op, x, weight, bias):
         ctx.op = op
         ctx.set_materialize_grads(False)
         ctx.needs = ctx.needs_input_grad[1:4]
         nx, nw, _ = ctx.needs
         ctx.save_for_backward(x if nw else None, weight if nx else None)
-        ctx.raw_shapes = None
-        if plan is None:
-            return run_kernel(op, 0, x, weight, bias, backward_needs=ctx.needs if any(ctx.needs) else None)
-
-        ctx.num_items = plan["n"]
-        ctx.raw_shapes = {
-            role: tuple(value.shape) for role, value in plan["roles"].items() if value is not None
-        }
-        return run_raw_forward(op, plan, backward_needs=ctx.needs if any(ctx.needs) else None)
+        return run_kernel(
+            op, 0, x, weight, bias,
+            backward_needs=ctx.needs if any(ctx.needs) else None,
+        )
 
     @staticmethod
     def backward(ctx, g):
         if g is None:
-            return (None,) * 5
+            return (None,) * 4
         x, weight = ctx.saved_tensors
-        if ctx.raw_shapes is not None:
-            n = ctx.num_items
-            x = x.reshape(n, ctx.op.meta["in_dim"]) if x is not None else None
-            if weight is not None:
-                shape = (
-                    (ctx.op.meta["weight_numel"],)
-                    if ctx.op.shared_weights
-                    else (n, ctx.op.meta["weight_numel"])
-                )
-                weight = weight.reshape(shape)
-
         gradients = (
             LinearBackward.apply(ctx.op, x, weight, g, ctx.needs)
             if torch.is_grad_enabled() and not torch.is_inference_mode_enabled()
             else run_kernel(ctx.op, 1, x, weight, None, g, needs=ctx.needs)
         )
-        if ctx.raw_shapes is not None:
-            gradients = tuple(
-                gradient.reshape(ctx.raw_shapes[role]) if gradient is not None else None
-                for role, gradient in zip(("x", "weight", "bias"), gradients)
-            )
-        return (None, *gradients, None)
+        return (None, *gradients)
 
 
 def linear(features, weight=None, bias=None, *, irreps_in=None, irreps_out=None,
@@ -276,7 +253,6 @@ def linear(features, weight=None, bias=None, *, irreps_in=None, irreps_out=None,
                     weight = weight.reshape(batch + wshape)
             elif count == 1:
                 # e3nn broadcasts its flattened weight batch of one.
-                # Preserve an existing expanded/raw view when possible.
                 if weight.shape[-len(wshape) :] != wshape:
                     weight = weight.reshape(wshape)
                 elif len(weight.shape) - len(wshape) > len(batch):
@@ -332,103 +308,8 @@ def linear(features, weight=None, bias=None, *, irreps_in=None, irreps_out=None,
 
 
 def run_linear(op, x, weight, bias, *, differentiable=False):
-    """Launch normalized native inputs, including strided and broadcast views."""
+    """Normalize inputs once, then launch the dense CUDA path."""
     feature_rank = 1 if op.f_in is None else 2
-    weight_rank = 1 if op.f_in is None else 3
-    contiguous = x.is_contiguous() and all(
-        value is None or value.is_contiguous() for value in (weight, bias)
-    )
-    needs_raw = not contiguous or not op.meta["out_dim"]
-    if not op.shared_weights and weight is not None and op.meta["weight_numel"]:
-        needs_raw = needs_raw or tuple(x.shape[:-feature_rank]) != tuple(
-            weight.shape[:-weight_rank]
-        )
-    if needs_raw:
-        feature_shape = (op.input_dim,) if op.f_in is None else (op.f_in, op.input_dim)
-        batch = tuple(x.shape[: -len(feature_shape)])
-        wshape = (() if op.f_in is None else (op.f_in, op.f_out)) + (op.weight_numel,)
-        bshape = (() if op.f_out is None else (op.f_out,)) + (op.bias_numel,)
-        n = prod(batch)
-        if n > (1 << 63) - 1:
-            raise OverflowError("Linear item count exceeds signed int64 capacity")
-
-        roles = {"x": x, "weight": weight, "bias": bias}
-        x_batch = x.stride()[: -len(feature_shape)]
-        w_batch = (
-            (0,) * len(batch)
-            if op.shared_weights or weight is None
-            else weight.stride()[: -len(wshape)]
-        )
-        axes = []
-        if n:
-            for size, sx, sw in zip(batch, x_batch, w_batch):
-                if size == 1:
-                    continue
-                if axes and all(left == size * right for left, right in zip(axes[-1][1:], (sx, sw))):
-                    previous, _, _ = axes.pop()
-                    axes.append((previous * size, sx, sw))
-                else:
-                    axes.append((size, sx, sw))
-            if len(axes) > MAX_BATCH_RANK:
-                raise OverflowError("Linear raw-view batch rank exceeds signed-int64 capacity")
-
-        xf = (0,) * (2 - len(feature_shape)) + tuple(x.stride()[-len(feature_shape):])
-        wf = (
-            (0, 0, 0) if weight is None
-            else (0,) * (3 - len(wshape)) + tuple(weight.stride()[-len(wshape):])
-        )
-        bf = (
-            (0, 0) if bias is None
-            else (0,) * (2 - len(bshape)) + tuple(bias.stride()[-len(bshape):])
-        )
-        descriptor = (
-            len(axes),
-            *(axis[0] for axis in axes),
-            *(axis[1] for axis in axes),
-            *(axis[2] for axis in axes),
-            *xf,
-            *wf,
-            *bf,
-        )
-
-        spans = {
-            role: (
-                sum((size - 1) * stride for size, stride in zip(value.shape, value.stride()))
-                if value.numel()
-                else 0
-            )
-            for role, value in roles.items()
-            if value is not None
-        }
-        if any(span < 0 or span > (1 << 63) - 1 for span in spans.values()):
-            raise OverflowError("Linear raw-view addresses exceed signed int64 capacity")
-        logical_bound = (
-            n * op.index_batch_span + op.meta["bias_numel"] + 3 * TASK_ALIGNMENT + 65535 * 256
-        )
-        bound = max(logical_bound, *spans.values(), *descriptor)
-        if bound > (1 << 63) - 1:
-            raise OverflowError("Linear raw-view launch indices exceed signed int64 capacity")
-        bits = 64 if bound > (1 << 31) - 1 else op.index_bits
-        output_shape = (op.output_dim,) if op.f_out is None else (op.f_out, op.output_dim)
-        plan = dict(
-            roles=roles,
-            n=n,
-            descriptor=descriptor,
-            index_bits=bits,
-            output_shape=batch + output_shape,
-            contiguous=contiguous,
-        )
-
-        if not plan["contiguous"] or not op.meta["out_dim"]:
-            roles = plan["roles"]
-            if differentiable:
-                result = LinearForward.apply(
-                    op, roles["x"], roles["weight"], roles["bias"], plan
-                )
-            else:
-                result = run_raw_forward(op, plan)
-            return result.reshape(plan["output_shape"])
-
     batch = tuple(x.shape[:-feature_rank])
     if weight is not None:
         shape = (
@@ -436,13 +317,13 @@ def run_linear(op, x, weight, bias, *, differentiable=False):
             if op.shared_weights
             else (prod(batch), op.meta["weight_numel"])
         )
-        weight = weight.reshape(shape)
+        weight = weight.reshape(shape).contiguous()
     if bias is not None:
-        bias = bias.reshape(op.meta["bias_numel"])
-    x = x.reshape(prod(batch), op.meta["in_dim"])
+        bias = bias.reshape(op.meta["bias_numel"]).contiguous()
+    x = x.reshape(prod(batch), op.meta["in_dim"]).contiguous()
 
     result = (
-        LinearForward.apply(op, x, weight, bias, None)
+        LinearForward.apply(op, x, weight, bias)
         if differentiable
         else run_kernel(op, 0, x, weight, bias)
     )

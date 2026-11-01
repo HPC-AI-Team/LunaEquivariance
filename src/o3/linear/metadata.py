@@ -3,7 +3,7 @@
 Only construction uses this module. Execution and autograd live in interface.py.
 """
 
-from collections import OrderedDict, namedtuple
+from collections import namedtuple
 from functools import lru_cache
 from math import prod
 import torch
@@ -13,7 +13,6 @@ from .kernels.utils import MAX_WEIGHT_SPLITS, TASK_ALIGNMENT
 
 
 Instruction = namedtuple("Instruction", "i_in i_out path_shape path_weight")
-LinearSlices = namedtuple("LinearSlices", "slice_1D shape_2D")
 
 
 class LinearLayout:
@@ -92,14 +91,6 @@ class LinearLayout:
 
         self.weight_numel = sum(prod(ins.path_shape) for ins in self.instructions if ins.i_in >= 0)
         self.bias_numel = sum(prod(ins.path_shape) for ins in self.instructions if ins.i_in == -1)
-        self.weight_index_slices = []
-        offset = 0
-        for ins in self.instructions:
-            size = prod(ins.path_shape)
-            self.weight_index_slices.append(
-                LinearSlices(slice(offset, offset + size), ins.path_shape)
-            )
-            offset += size
 
 
 class LinearConfig(torch.nn.Module, LinearLayout):
@@ -241,7 +232,6 @@ class LinearKernelConfig:
 
         self.kernels = {}
         self._programs = {}
-        self.raw_layout_kernels = OrderedDict()
         self.last_execution_backend = None
         self.layout_key = (
             str(self.irreps_in), str(self.irreps_out), self.instructions,

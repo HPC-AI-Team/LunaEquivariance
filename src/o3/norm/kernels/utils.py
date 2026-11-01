@@ -1,6 +1,6 @@
 """Norm specialization, source assembly, and CUDA launch caching."""
 
-from math import prod
+from math import gcd, prod
 
 import torch
 
@@ -9,15 +9,16 @@ from ....utils.indexing import LAYOUT_SOURCE, LAYOUT_HOST
 
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 NATIVE_DTYPES = (torch.float32, torch.float64)
-# (copies, components) layouts eligible for float4 and path-major schedules.
-PACKET_LAYOUT = ((16, 1), (16, 3), (16, 5))
 BLOCK_SIZE = 128
 MAX_BLOCKS = 65535
+MAX_SHARED_BYTES = 48 * 1024
+BACKWARD_MIN_BLOCKS_FP32 = 16
 VECTORIZE_MIN_ROWS = 16384
-PATH_MAJOR_MIN_ROWS = 1024
+MAX_PACKET_ELEMENTS = 32
 TRIPLE_MIN_BLOCKS_FP32 = 8
 TRIPLE_MIN_BLOCKS_FP64 = 5
 TRIPLE_REGISTER_BOUND_COMPONENTS = 9
+
 CUDA_HEADERS = """
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -26,6 +27,7 @@ CUDA_HEADERS = """
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <optional>
+#include <type_traits>
 """
 CUDA_MATH = r"""
 __device__ __forceinline__ float mul_rn(float a, float b) { return __fmul_rn(a, b); }
@@ -82,27 +84,42 @@ def make_source(meta, order, *, strided=False, needs=(), seeds=(False, False)):
     sources = (forward.CUDA_SOURCE, backward.CUDA_SOURCE,
                double_backward.CUDA_SOURCE, triple_backward.CUDA_SOURCE)
     scalar = "double" if meta["dtype"] == torch.float64 else "float"
-    packet_layout = tuple((path["copies"], path["components"]) for path in meta["paths"]) == PACKET_LAYOUT
-    vectorized = order == 0 and not strided and scalar == "float" and not meta["squared"] and packet_layout
-    path_major = order > 0 and packet_layout
     min_blocks = TRIPLE_MIN_BLOCKS_FP64 if scalar == "double" else TRIPLE_MIN_BLOCKS_FP32
     if any(path["components"] > TRIPLE_REGISTER_BOUND_COMPONENTS for path in meta["paths"]):
         min_blocks = 1
-    flags = dict(BLOCK_SIZE=BLOCK_SIZE, MAX_BLOCKS=MAX_BLOCKS,
-                 VECTORIZE_MIN_ROWS=VECTORIZE_MIN_ROWS, PATH_MAJOR_MIN_ROWS=PATH_MAJOR_MIN_ROWS,
+    max_components = max((path["components"] for path in meta["paths"]), default=1)
+    vectorized = (order == 0 and not strided and scalar == "float" and not meta["squared"]
+                  and 4 * max_components <= MAX_PACKET_ELEMENTS
+                  and bool(meta["paths"]) and all(path["copies"] % 4 == 0 for path in meta["paths"]))
+    # Aligned copy groups keep vector stores within a row.
+    copy_tile = gcd(32, *(path["copies"] for path in meta["paths"]))
+    shared_bytes = max_components * BLOCK_SIZE * (8 if scalar == "double" else 4)
+    if order == 3:
+        shared_bytes *= 2
+    coalesced = order > 0 and copy_tile >= 8 and shared_bytes <= MAX_SHARED_BYTES
+    flags = dict(COALESCED=int(coalesced), MAX_COMPONENTS=max_components,
+                 COPY_TILE=copy_tile, ROWS_PER_WARP=32 // copy_tile,
+                 PATH_TILES=sum((p["copies"] + copy_tile - 1) // copy_tile for p in meta["paths"]),
+                 BLOCK_SIZE=BLOCK_SIZE, MAX_BLOCKS=MAX_BLOCKS,
+                 VECTORIZE_MIN_ROWS=VECTORIZE_MIN_ROWS,
                  TRIPLE_MIN_BLOCKS=min_blocks,
                  INPUT_DIM=meta["in_dim"], OUTPUT_DIM=meta["out_dim"],
                  SQUARED=int(meta["squared"]), STRIDED=int(strided), VECTORIZED=int(vectorized),
                  WRITE_X=int(bool(needs and needs[0])),
                  WRITE_G=int(len(needs) > 1 and needs[1]),
                  WRITE_RX=int(len(needs) > 2 and needs[2]),
-                 HAS_BX=int(seeds[0]), HAS_BG=int(seeds[1]), PATH_MAJOR=int(path_major))
+                 HAS_BX=int(seeds[0]), HAS_BG=int(seeds[1]))
+    if order == 1:
+        flags["BACKWARD_MIN_BLOCKS"] = BACKWARD_MIN_BLOCKS_FP32 if coalesced and scalar == "float" else 1
     prefix = CUDA_HEADERS + f"\nusing Element = {scalar};\n"
     prefix += "".join(f"#define {name} {value}\n" for name, value in flags.items())
     prefix += CUDA_MATH
+    if order > 0:
+        prefix += backward.CUDA_TILE_SOURCE
     if order == 0:
-        prefix += LAYOUT_SOURCE + "\nForwardLayout make_forward_layout(at::Tensor x) {\n" + LAYOUT_HOST + "\nreturn x_layout;\n}\n"
-    paths, packets, path_tasks = [], [], []
+        prefix += LAYOUT_SOURCE + "\nForwardLayout make_forward_layout(at::Tensor x) {\n" + LAYOUT_HOST + "\n    return x_layout;\n}\n"
+    paths, packets, tiles = [], [], []
+    tile_offset = 0
     for path in meta["paths"]:
         copies, components = path["copies"], path["components"]
         offset, start = path["input_offset"], path["scalar_offset"]
@@ -114,20 +131,24 @@ def make_source(meta, order, *, strided=False, needs=(), seeds=(False, False)):
             call = f"out[{output}] = norm_forward<{components}>(x + x_row + {position} * stride, stride);"
             packets.append(f"{condition} *reinterpret_cast<float4*>(out + {output}) = norm_forward_packet<{components}>(x + {vector});")
         elif order == 1:
-            call = f"norm_backward<{components}>(x, grad_out[{output}], dx, {vector});"
+            call = f"norm_backward<{components}>(x, grad_out[{output}], dx, {vector}, {vector});"
         elif order == 2:
-            call = f"norm_double_backward<{components}>(x, grad_out[{output}], rx, sx, sg, {vector}, {output});"
+            call = f"norm_double_backward<{components}>(x, grad_out[{output}], rx, sx, sg, {vector}, {output}, {vector});"
         else:
-            call = f"norm_triple_backward<{components}>(x, grad_out[{output}], rx, bx, HAS_BG ? bg[{output}] : Element(0), tx, tg, trx, {vector}, {output});"
+            call = f"norm_triple_backward<{components}>(x, grad_out[{output}], rx, bx, HAS_BG ? bg[{output}] : Element(0), tx, tg, trx, {vector}, {output}, {vector});"
         paths.append(f"{condition} {call}")
-        if order > 0:
-            path_tasks.append(
-                f"if (item >= rows * {start} && item < rows * {start + copies}) {{\n"
-                f"const Index local = item - rows * {start};\n"
-                f"const Index row = local / {copies};\n"
-                f"const Index group = {start} + local % {copies};\n{call}\n}}"
-            )
-    return prefix + sources[order].replace("/* paths */", "\n        ".join(paths)).replace("/* packets */", "\n        ".join(packets)).replace("/* path_major */", "\n        ".join(path_tasks))
+        if order == 1:
+            tiles.append(f"norm_backward_tile<{components}, {copies}, {offset}, {start}, {tile_offset}>(x, grad_out, dx, task, rows, shared);")
+        elif order == 2:
+            tiles.append(f"norm_double_backward_tile<{components}, {copies}, {offset}, {start}, {tile_offset}>(x, grad_out, rx, sx, sg, task, rows, shared);")
+        elif order == 3:
+            tiles.append(f"norm_triple_backward_tile<{components}, {copies}, {offset}, {start}, {tile_offset}>(x, grad_out, rx, bx, bg, tx, tg, trx, task, rows, shared_x, shared_rx);")
+        tile_offset += (copies + copy_tile - 1) // copy_tile
+    return prefix + (
+        sources[order].replace("/* paths */", ("\n            " if order == 0 else "\n        ").join(paths))
+        .replace("/* tiles */", "\n        ".join(tiles))
+        .replace("/* packets */", "\n            ".join(packets))
+    )
 
 
 def load_forward_backward(op, *, arch, index_bits, strided=False):

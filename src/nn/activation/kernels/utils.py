@@ -2,6 +2,7 @@
 
 from functools import partial
 from math import prod
+from textwrap import indent
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +14,61 @@ from ....utils.indexing import LAYOUT_SOURCE, LAYOUT_HOST
 CUDA_INPUT_NAMES = ("x", "grad_out", "rx", "bx", "bg")
 INPUT_NAMES = (("x",), ("x", "grad_out"), ("x", "grad_out", "rx"), CUDA_INPUT_NAMES)
 OUTPUT_NAMES = (("out",), ("dx",), ("sx", "sg"), ("tx", "tg", "trx"))
+VECTOR_MIN_ELEMENTS = 1 << 18
+
+
+CUDA_HEADERS = r'''#include <torch/extension.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <algorithm>'''
+
+BINDING = r'''using Element={scalar};{layout_declarations}
+{declarations}
+{kernel_body}
+{result_type} launch({tensor_parameters},int64_t num_items) {{
+    c10::cuda::CUDAGuard guard({first}.device());
+    auto options={first}.options();
+{allocations}
+    cudaStream_t stream=at::cuda::getCurrentCUDAStream();{layout_host}
+    {launch}
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {result_return};
+}}
+'''
+
+MODULE_BINDING = r'''PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
+    m.def("launch",&launch);
+}
+'''
+
+TENSOR_BINDING = r'''
+torch::Tensor launch_tensor({args}) {{
+    c10::cuda::CUDAGuard guard(x.device());
+    const int64_t num_items=x.numel()/{width};
+    constexpr int64_t padding=65535*128;
+    TORCH_CHECK(num_items<=(std::numeric_limits<int64_t>::max()-padding)/{max_width},"Pointwise task offsets exceed int64");
+{checks}
+{call}
+    auto result={result_value};
+    std::vector<int64_t> shape(x.sizes().begin(),x.sizes().end());
+    shape.back()={result_width};
+    // The fresh output owns its storage. Remove the host reshape's view
+    // metadata before Python autograd attaches the custom backward.
+    return result.reshape(shape).detach();
+}}
+'''
+
+TRAINING_MODULE_BINDING = r'''
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
+    m.def("launch_forward",&forward_impl::launch_tensor);
+    m.def("launch_backward",&backward_impl::launch_tensor);
+    m.def("launch_backward_tuple", [](torch::Tensor x, torch::Tensor grad_out, int64_t num_items) {
+        return pybind11::make_tuple(backward_impl::contiguous::launch(x, grad_out, num_items));
+    });
+}
+'''
 
 
 _FUNCTIONS = {
@@ -106,7 +162,7 @@ def parse_activation(function):
 
 
 def activation_config(function):
-    """Immutable built-in activation settings; no callable ownership in caches."""
+    """Return the built-in activation settings."""
     if function is None:
         return None
     try:
@@ -120,7 +176,7 @@ def activation_config(function):
 
 
 def apply_activation_spec(x, spec):
-    """Evaluate a supported activation for source generation and backward recomputation."""
+    """Evaluate an activation specification with Torch."""
     kind, params = spec["kind"], spec["params"]
     if kind == "identity":
         result = x
@@ -144,7 +200,7 @@ def apply_activation_spec(x, spec):
 
 
 def parse_activation_paths(activation, parsed=None):
-    """Read each e3nn channel block and its activation normalization once."""
+    """Read each e3nn channel block and its activation normalization."""
     paths = []
     for index, (mul, (degree, _), function) in enumerate(activation.paths):
         if parsed is None:
@@ -205,6 +261,7 @@ def make_path_types(activation_paths, in_dim, dtype):
         )
 
     declarations = [
+        f"constexpr int VectorMinElements = {VECTOR_MIN_ELEMENTS};",
         ACTIVATION_TYPES,
         "\n".join(path_declarations), "\n\n".join(FORWARD_FUNCTIONS.values()), FORWARD_MATH,
     ]
@@ -214,8 +271,6 @@ def make_path_types(activation_paths, in_dim, dtype):
 def make_binding(in_dim, config, *, declarations, kernel_body, binding, module_binding,
                 launch, strided=False, tensor_only=False, fragments=False):
     """Bind one order's CUDA launch to its live tensors and requested outputs."""
-    from .forward import CUDA_HEADERS
-
     width = in_dim
     names = config["active_outputs"]
     allocations = "\n".join(
@@ -233,7 +288,7 @@ def make_binding(in_dim, config, *, declarations, kernel_body, binding, module_b
         declarations="\n".join(declarations), kernel_body=kernel_body,
         result_type="torch::Tensor" if tensor_only else "pybind11::tuple",
         tensor_parameters=",".join(f"torch::Tensor {role}" for role in config["inputs"]),
-        first=config["inputs"][0], allocations=allocations,
+        first=config["inputs"][0], allocations=indent(allocations, "    "),
         layout_host=LAYOUT_HOST if strided else "", launch=launch, result_return=result_return,
     )
     headers = CUDA_HEADERS.splitlines() + ["#include <cmath>", "#include <type_traits>"]
@@ -242,18 +297,13 @@ def make_binding(in_dim, config, *, declarations, kernel_body, binding, module_b
     return "\n".join(headers) + "\n" + body + module_binding
 
 
-def get_kernel_config(activation_paths, order, dtype, kernel_cache, *, needs=None, available=None, grad_mode=False, gate_layout=None):
+def get_kernel_config(activation_paths, order, dtype, kernel_cache, *, needs=None, available=None, grad_mode=False):
     needs = tuple(needs) if needs is not None else None
     available = tuple(available) if available is not None else None
-    key = (("gate_config", dtype, order, needs, available, grad_mode) if gate_layout is not None
-           else ("config", order, needs, available, grad_mode, dtype))
+    key = ("config", order, needs, available, grad_mode, dtype)
     config = kernel_cache.get(key)
     if config is not None:
         return config
-    if gate_layout is not None:
-        from ...gate.kernels.utils import get_kernel_config as get_gate_config
-        return get_gate_config(gate_layout, kernel_cache, order, needs=needs, available=available, grad_mode=grad_mode, dtype=dtype)
-
     from . import backward, double_backward, triple_backward
 
     if order not in range(4):
@@ -304,8 +354,8 @@ def get_kernel_config(activation_paths, order, dtype, kernel_cache, *, needs=Non
     return config
 
 
-def launch_kernel(inputs, config, activation_paths, index_bits, kernel_cache, source, gate_layout=None):
-    """Bind a prepared phase to tensors; shared allocation and CUDA loading only."""
+def launch_kernel(inputs, config, activation_paths, index_bits, kernel_cache, source):
+    """Load the kernel and return the requested output tensors."""
     order = config["order"]
     dtype = config["dtype"]
     input_names = INPUT_NAMES[order]
@@ -314,8 +364,7 @@ def launch_kernel(inputs, config, activation_paths, index_bits, kernel_cache, so
     if first is None:
         return tuple(None for _ in config["outputs"])
     shape, device = first.shape, first.device
-    in_dim = gate_layout["in_dim"] if gate_layout is not None else shape[-1]
-    out_dim = gate_layout["out_dim"] if gate_layout is not None else in_dim
+    in_dim = out_dim = shape[-1]
     batch = shape[:-1]
     for role, value in zip(input_names, inputs):
         if value is None:
@@ -355,13 +404,6 @@ def launch_kernel(inputs, config, activation_paths, index_bits, kernel_cache, so
                     launch = extension.training.launch_backward_tuple
                 else:
                     launch = extension.backward.launch
-            elif gate_layout is not None:
-                from ...gate.kernels import forward, backward, double_backward, triple_backward
-                make_source = (forward, backward, double_backward, triple_backward)[order].make_source
-                cuda_source = (
-                    make_source({**gate_layout, "dtype": dtype}, config, strided=True)
-                    if strided_forward else make_source({**gate_layout, "dtype": dtype}, config)
-                )
             else:
                 cuda_source = (
                     source(activation_paths, in_dim, config, strided=True)
@@ -369,10 +411,9 @@ def launch_kernel(inputs, config, activation_paths, index_bits, kernel_cache, so
                 )
             if launch is None:
                 precision = "fp64" if dtype == torch.float64 else "fp32"
-                kind = "gate" if gate_layout is not None else "activation"
                 name = (
-                    f"lunaeq_{kind}_strided_fwd" if strided_forward
-                    else f"lunaeq_{kind}_{order}_{precision}"
+                    f"lunaeq_activation_strided_fwd" if strided_forward
+                    else f"lunaeq_activation_{order}_{precision}"
                 )
                 launch = load_cuda_extension(
                     name, cuda_source, arch=get_cuda_arch(device), index_bits=index_bits,

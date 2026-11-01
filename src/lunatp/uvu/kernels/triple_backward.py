@@ -2,8 +2,10 @@
 
 from collections import defaultdict
 from collections.abc import Mapping
+from textwrap import indent
 import torch
 from ...utils.cg import weight_channel_offset
+from ...utils.layout import build_signed_ij_classes
 from ....utils.precision import cuda_source_for_dtype, float_literal
 from ...utils.runtime import DERIVATIVE_STREAM_SOURCE
 from .utils import make_grid_source, get_uvu_launch_config
@@ -14,7 +16,70 @@ from .backward import (
 )
 
 
-# Instruction math and traversals used by the kernels above.
+def make_uvu_triple_terms(spec, *, need_weight, need_rw, gy=True, gg=True):
+    """Reuse signed CG projections and products within one weight path."""
+    lines = []
+    q_names = set()
+    if gg or need_weight:
+        q_names.update(("q1", "q2"))
+    if gg or need_rw:
+        q_names.add("q3")
+    if need_rw:
+        q_names.add("q0")
+    for cls in build_signed_ij_classes(spec["terms"], spec_y_offset=0, y_name_base=0):
+        entries = cls.members[0].terms
+        _, _, k, coefficient = entries[0]
+        lines += [
+            "    {",
+            f"        float pg = {float_literal(coefficient)} * gov{k};",
+            f"        float pb = {float_literal(coefficient)} * bgv{k};",
+        ]
+        for _, _, k, coefficient in entries[1:]:
+            lines += [
+                f"        pg = fmaf({float_literal(coefficient)}, gov{k}, pg);",
+                f"        pb = fmaf({float_literal(coefficient)}, bgv{k}, pb);",
+            ]
+        for q in sorted(q_names):
+            lines.append(f"        float {q} = 0.0f;")
+        for member in cls.members:
+            i, j = member.i_idx, member.j_name
+            sign = "" if member.relative_sign == 1 else "-"
+            if "q0" in q_names:
+                lines.append(f"        q0 = fmaf({sign}xv{i}, yv{j}, q0);")
+            if "q1" in q_names:
+                lines += [
+                    f"        q1 = fmaf({sign}rxv{i}, yv{j}, q1);",
+                    f"        q1 = fmaf({sign}xv{i}, ryv{j}, q1);",
+                ]
+            if "q2" in q_names:
+                lines += [
+                    f"        q2 = fmaf({sign}rxv{i}, byv{j}, q2);",
+                    f"        q2 = fmaf({sign}bxv{i}, ryv{j}, q2);",
+                ]
+            if "q3" in q_names:
+                lines += [
+                    f"        q3 = fmaf({sign}bxv{i}, yv{j}, q3);",
+                    f"        q3 = fmaf({sign}xv{i}, byv{j}, q3);",
+                ]
+            if gy:
+                lines += [
+                    f"        gy{j} = fmaf({sign}pg, rwv * bxv{i} + bwv * rxv{i}, gy{j});",
+                    f"        gy{j} = fmaf({sign}pb, ww * rxv{i} + rwv * xv{i}, gy{j});",
+                    f"        gry{j} = fmaf({sign}pg, ww * bxv{i} + bwv * xv{i}, gry{j});",
+                    f"        gry{j} = fmaf({sign}pb, ww * xv{i}, gry{j});",
+                ]
+        if need_weight:
+            lines += ["        gw = fmaf(q2, pg, gw);", "        gw = fmaf(q1, pb, gw);"]
+        if need_rw:
+            lines += ["        grw = fmaf(q3, pg, grw);", "        grw = fmaf(q0, pb, grw);"]
+        if gg:
+            lines.append("        const float weighted = ww * q2 + bwv * q1 + rwv * q3;")
+            for _, _, k, coefficient in entries:
+                lines.append(f"        ggo{k} = fmaf({float_literal(coefficient)}, weighted, ggo{k});")
+        lines.append("    }")
+    return lines
+
+
 def make_uvu_triple_backward_source(
     meta: Mapping[str, object],
     *,
@@ -209,36 +274,43 @@ def make_uvu_triple_backward_source(
                         "\n"
                     )
                 )
-            pairs = defaultdict(list)
-            for i, j, k, coefficient in terms:
-                pairs[i, j].append((k, coefficient))
-            for (i, j), entries in sorted(pairs.items()):
-                sy, sr, sb = (f"{r}_s{spec_idx}_{j}" for r in ("y", "ry", "by"))
-                ww, rw, bw = (f"{r}_s{spec_idx}" for r in ("ww", "rw", "bw"))
+            if meta.get("dtype") is torch.float64:
+                pairs = defaultdict(list)
+                for i, j, k, coefficient in terms:
+                    pairs[i, j].append((k, coefficient))
+                projections = [
+                    (entries, ((i, j, 1),))
+                    for (i, j), entries in sorted(pairs.items())
+                ]
+            else:
+                projections = [
+                    (
+                        [(k, c) for _, _, k, c in cls.members[0].terms],
+                        tuple((m.i_idx, m.j_name, m.relative_sign) for m in cls.members),
+                    )
+                    for cls in build_signed_ij_classes(
+                        terms, spec_y_offset=0, y_name_base=0
+                    )
+                ]
+            for entries, members in projections:
                 tg = " + ".join(
                     f"({float_literal(c)} * go_s{spec_idx}_{k})" for k, c in entries
                 )
                 tb = " + ".join(
                     f"({float_literal(c)} * bg_s{spec_idx}_{k})" for k, c in entries
                 )
-                lines += r"""    {{
-    const float tg = {tg};
-    const float tb = {tb};
-    gx{i} = fmaf(tg, {sb} * {rw} + {bw} * {sr}, gx{i});
-    gx{i} = fmaf(tb, {ww} * {sr} + {sy} * {rw}, gx{i});
-    grx{i} = fmaf(tg, {sb} * {ww} + {bw} * {sy}, grx{i});
-    grx{i} = fmaf(tb, {ww} * {sy}, grx{i});
-    }}""".format(
-                    tg=tg,
-                    tb=tb,
-                    i=i,
-                    sb=sb,
-                    rw=rw,
-                    bw=bw,
-                    sr=sr,
-                    ww=ww,
-                    sy=sy,
-                ).split("\n")
+                lines += ["    {", f"    const float tg = {tg};", f"    const float tb = {tb};"]
+                for i, j, relative_sign in members:
+                    sy, sr, sb = (f"{r}_s{spec_idx}_{j}" for r in ("y", "ry", "by"))
+                    ww, rw, bw = (f"{r}_s{spec_idx}" for r in ("ww", "rw", "bw"))
+                    sign = "" if relative_sign == 1 else "-"
+                    lines += [
+                        f"    gx{i} = fmaf({sign}tg, {sb} * {rw} + {bw} * {sr}, gx{i});",
+                        f"    gx{i} = fmaf({sign}tb, {ww} * {sr} + {sy} * {rw}, gx{i});",
+                        f"    grx{i} = fmaf({sign}tg, {sb} * {ww} + {bw} * {sy}, grx{i});",
+                        f"    grx{i} = fmaf({sign}tb, {ww} * {sy}, grx{i});",
+                    ]
+                lines.append("    }")
         for i in range(d1):
             lines.append(f"    gx_out[item_x + {x_offset} + u * {d1} + {i}] = gx{i};")
             lines.append(f"    grx_out[item_x + {x_offset} + u * {d1} + {i}] = grx{i};")
@@ -506,41 +578,44 @@ def make_uvu_triple_backward_source(
                 lines.append("        float gw = 0.0f;")
             if need_grad_rw and weight_mode != "shared":
                 lines.append("        float grw = 0.0f;")
-            pairs = defaultdict(list)
-            for i, j, k, coefficient in terms:
-                pairs[i, j].append((k, coefficient))
-            for (i, j), entries in sorted(pairs.items()):
-                tg = " + ".join(f"({float_literal(c)} * gov{k})" for k, c in entries)
-                tb = " + ".join(f"({float_literal(c)} * bgv{k})" for k, c in entries)
-                lines += r"""        {{
-        const float tg = {tg};
-        const float tb = {tb};
-        const float a = ww * bxv{i} + bwv * xv{i};
-        const float b = rwv * bxv{i} + bwv * rxv{i};
-        const float c = ww * rxv{i} + rwv * xv{i};
-        gy{j} = fmaf(tg, b, gy{j});
-        gy{j} = fmaf(tb, c, gy{j});
-        gry{j} = fmaf(tg, a, gry{j});
-        gry{j} = fmaf(tb, ww * xv{i}, gry{j});""".format(tg=tg, tb=tb, i=i, j=j).split("\n")
-                if need_grad_weight and weight_mode != "shared":
-                    lines += r"""        const float p = bxv{i} * ryv{j} + rxv{i} * byv{j};
+            if meta.get("dtype") is torch.float64:
+                pairs = defaultdict(list)
+                for i, j, k, coefficient in terms:
+                    pairs[i, j].append((k, coefficient))
+                for (i, j), entries in sorted(pairs.items()):
+                    tg = " + ".join(f"({float_literal(c)} * gov{k})" for k, c in entries)
+                    tb = " + ".join(f"({float_literal(c)} * bgv{k})" for k, c in entries)
+                    lines += r"""        {{
+            const float tg = {tg};
+            const float tb = {tb};
+            const float a = ww * bxv{i} + bwv * xv{i};
+            const float b = rwv * bxv{i} + bwv * rxv{i};
+            const float c = ww * rxv{i} + rwv * xv{i};
+            gy{j} = fmaf(tg, b, gy{j});
+            gy{j} = fmaf(tb, c, gy{j});
+            gry{j} = fmaf(tg, a, gry{j});
+            gry{j} = fmaf(tb, ww * xv{i}, gry{j});""".format(tg=tg, tb=tb, i=i, j=j).split("\n")
+                    if need_grad_weight and weight_mode != "shared":
+                        lines += r"""        const float p = bxv{i} * ryv{j} + rxv{i} * byv{j};
         const float q = rxv{i} * yv{j} + xv{i} * ryv{j};
         gw = fmaf(p, tg, gw);
         gw = fmaf(q, tb, gw);""".format(i=i, j=j).split("\n")
-                if need_grad_rw and weight_mode != "shared":
-                    lines += r"""        const float r = bxv{i} * yv{j} + xv{i} * byv{j};
+                    if need_grad_rw and weight_mode != "shared":
+                        lines += r"""        const float r = bxv{i} * yv{j} + xv{i} * byv{j};
         grw = fmaf(r, tg, grw);
         grw = fmaf(xv{i} * yv{j}, tb, grw);""".format(i=i, j=j).split(
-                        "\n"
-                    )
-                lines.append(
-                    f"        const float gg = ryv{j} * a + yv{j} * b + byv{j} * c;"
-                )
-                for k, coefficient in entries:
+                            "\n"
+                        )
                     lines.append(
-                        f"        ggo{k} = fmaf({float_literal(coefficient)}, gg, ggo{k});"
+                        f"        const float gg = ryv{j} * a + yv{j} * b + byv{j} * c;"
                     )
-                lines.append("        }")
+                    for k, coefficient in entries:
+                        lines.append(
+                            f"        ggo{k} = fmaf({float_literal(coefficient)}, gg, ggo{k});"
+                        )
+                    lines.append("        }")
+            else:
+                lines.extend(make_uvu_triple_terms(spec, need_weight=need_grad_weight and weight_mode != "shared", need_rw=need_grad_rw and weight_mode != "shared"))
             lines.append("        if (active) {")
             if need_grad_weight and weight_mode != "shared":
                 lines.append(
@@ -580,39 +655,39 @@ def make_uvu_triple_backward_source(
         y_group_cases.append("\n".join(lines))
     grouped_y_kernel = (
         r"""
-__global__ __launch_bounds__({group_threads})
-void lunatp_uvu_triple_bwd_grouped_y_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    const float* __restrict__ bx,
-    const float* __restrict__ by,
-    const float* __restrict__ bw,
-    const float* __restrict__ bg,
-    float* __restrict__ gy_out,
-    float* __restrict__ gw_out,
-    float* __restrict__ ggo_out,
-    float* __restrict__ gry_out,
-    float* __restrict__ grw_out,
+__global__ __launch_bounds__({group_threads}) void lunatp_uvu_triple_bwd_grouped_y_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    const float *__restrict__ bx,
+    const float *__restrict__ by,
+    const float *__restrict__ bw,
+    const float *__restrict__ bg,
+    float *__restrict__ gy_out,
+    float *__restrict__ gw_out,
+    float *__restrict__ ggo_out,
+    float *__restrict__ gry_out,
+    float *__restrict__ grw_out,
     int64_t num_items) {{
     const Index n = blockIdx.x;
     const int group = blockIdx.y;
     const int u = {group_u};
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (group) {{
 {y_group_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 """.format(
             group_threads=group_threads,
             group_u=group_u,
-            y_group_cases=chr(10).join(y_group_cases),
+            y_group_cases=indent("\n".join(y_group_cases), "        "),
         )
         if use_grouped_y
         else ""
@@ -662,7 +737,7 @@ void lunatp_uvu_triple_bwd_grouped_y_fp32(
             gry.data_ptr<float>(),
             {grw_work_pointer},
             x.size(0));
-{group_weight_reduction}""".format(
+        {group_weight_reduction}""".format(
             gw_work_allocation=gw_work_allocation,
             grw_work_allocation=grw_work_allocation,
             group_threads=group_threads,
@@ -733,14 +808,17 @@ void lunatp_uvu_triple_bwd_grouped_y_fp32(
                 weight_u=weight_u,
             ).split("\n")
         )
-        for i_idx, j_idx, k_idx, coeff in terms:
-            i = i_idx
-            j = j_idx
-            k = k_idx
-            c = float_literal(coeff)
-            lines.extend(r"""    gy{j} = fmaf({c}, bxv{i} * gov{k} * rwv + bwv * gov{k} * rxv{i} + bgv{k} * (ww * rxv{i} + xv{i} * rwv), gy{j});
+        if meta.get("dtype") is torch.float64:
+            for i_idx, j_idx, k_idx, coeff in terms:
+                i = i_idx
+                j = j_idx
+                k = k_idx
+                c = float_literal(coeff)
+                lines.extend(r"""    gy{j} = fmaf({c}, bxv{i} * gov{k} * rwv + bwv * gov{k} * rxv{i} + bgv{k} * (ww * rxv{i} + xv{i} * rwv), gy{j});
     gry{j} = fmaf({c}, bxv{i} * gov{k} * ww + bwv * gov{k} * xv{i} + bgv{k} * ww * xv{i}, gry{j});
     ggo{k} = fmaf({c}, bxv{i} * (ww * ryv{j} + yv{j} * rwv) + byv{j} * (ww * rxv{i} + xv{i} * rwv) + bwv * (yv{j} * rxv{i} + xv{i} * ryv{j}), ggo{k});""".format(j=j, c=c, i=i, k=k).split("\n"))
+        else:
+            lines.extend(make_uvu_triple_terms(spec, need_weight=False, need_rw=False))
         for j in unique_j:
             if use_y_block_reduce:
                 lines.extend(
@@ -814,19 +892,22 @@ void lunatp_uvu_triple_bwd_grouped_y_fp32(
                     "\n"
                 )
             )
-        for i_idx, j_idx, k_idx, coeff in terms:
-            i = i_idx
-            j = j_idx
-            k = k_idx
-            c = float_literal(coeff)
-            if need_grad_weight:
-                lines.append(
-                    f"        gw = fmaf({c}, bxv{i} * gov{k} * ryv{j} + byv{j} * gov{k} * rxv{i} + bgv{k} * (yv{j} * rxv{i} + xv{i} * ryv{j}), gw);"
-                )
-            if need_grad_rw:
-                lines.append(
-                    f"        grw = fmaf({c}, bxv{i} * gov{k} * yv{j} + byv{j} * gov{k} * xv{i} + bgv{k} * xv{i} * yv{j}, grw);"
-                )
+        if meta.get("dtype") is torch.float64:
+            for i_idx, j_idx, k_idx, coeff in terms:
+                i = i_idx
+                j = j_idx
+                k = k_idx
+                c = float_literal(coeff)
+                if need_grad_weight:
+                    lines.append(
+                        f"        gw = fmaf({c}, bxv{i} * gov{k} * ryv{j} + byv{j} * gov{k} * rxv{i} + bgv{k} * (yv{j} * rxv{i} + xv{i} * ryv{j}), gw);"
+                    )
+                if need_grad_rw:
+                    lines.append(
+                        f"        grw = fmaf({c}, bxv{i} * gov{k} * yv{j} + byv{j} * gov{k} * xv{i} + bgv{k} * xv{i} * yv{j}, grw);"
+                    )
+        else:
+            lines.extend(make_uvu_triple_terms(spec, need_weight=need_grad_weight, need_rw=need_grad_rw, gy=False, gg=False))
         lines.append("    }")
         if need_grad_weight:
             lines.append(
@@ -930,115 +1011,113 @@ constexpr int GEN_SPEC_MIN_BLOCKS = {spec_min_blocks};
 constexpr bool GEN_SHARED_WEIGHT_REDUCE = {shared_weight_reduction};
 constexpr bool GEN_GROUPED_Y = {grouped_edges};
 
-{reduction_source}__global__ __launch_bounds__(GEN_X_THREADS, GEN_X_MIN_BLOCKS)
-void lunatp_uvu_triple_bwd_x_fp32(
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    const float* __restrict__ by,
-    const float* __restrict__ bw,
-    const float* __restrict__ bg,
-    float* __restrict__ gx_out,
-    float* __restrict__ grx_out,
+{reduction_source}__global__ __launch_bounds__(GEN_X_THREADS, GEN_X_MIN_BLOCKS) void lunatp_uvu_triple_bwd_x_fp32(
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    const float *__restrict__ by,
+    const float *__restrict__ bw,
+    const float *__restrict__ bg,
+    float *__restrict__ gx_out,
+    float *__restrict__ grx_out,
     int64_t num_items,
     bool shared_weight) {{
     const Index n = blockIdx.x;
     const int group = blockIdx.y;
     const int u = blockIdx.z * GEN_X_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (group) {{
 {x_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_triple_bwd_ywg_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    const float* __restrict__ bx,
-    const float* __restrict__ by,
-    const float* __restrict__ bw,
-    const float* __restrict__ bg,
-    float* __restrict__ gy_out,
-    float* __restrict__ gw_out,
-    float* __restrict__ ggo_out,
-    float* __restrict__ gry_out,
-    float* __restrict__ grw_out,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_triple_bwd_ywg_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    const float *__restrict__ bx,
+    const float *__restrict__ by,
+    const float *__restrict__ bw,
+    const float *__restrict__ bg,
+    float *__restrict__ gy_out,
+    float *__restrict__ gw_out,
+    float *__restrict__ ggo_out,
+    float *__restrict__ gry_out,
+    float *__restrict__ grw_out,
     int64_t num_items,
     bool shared_weight) {{
     const Index n = blockIdx.x;
     const int spec = blockIdx.y;
     const int u = blockIdx.z * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (spec) {{
 {spec_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
 {grouped_y_kernel}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_triple_bwd_shared_ygg_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    const float* __restrict__ rw,
-    const float* __restrict__ bx,
-    const float* __restrict__ by,
-    const float* __restrict__ bw,
-    const float* __restrict__ bg,
-    float* __restrict__ gy_out,
-    float* __restrict__ ggo_out,
-    float* __restrict__ gry_out,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_triple_bwd_shared_ygg_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    const float *__restrict__ rw,
+    const float *__restrict__ bx,
+    const float *__restrict__ by,
+    const float *__restrict__ bw,
+    const float *__restrict__ bg,
+    float *__restrict__ gy_out,
+    float *__restrict__ ggo_out,
+    float *__restrict__ gry_out,
     int64_t num_items) {{
     const Index n = blockIdx.x;
     const int spec = blockIdx.y;
     const int u = blockIdx.z * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (spec) {{
 {shared_ygg_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_triple_bwd_shared_wrw_partial_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ grad_out,
-    const float* __restrict__ rx,
-    const float* __restrict__ ry,
-    const float* __restrict__ bx,
-    const float* __restrict__ by,
-    const float* __restrict__ bg,
-    float* __restrict__ gw_partials,
-    float* __restrict__ grw_partials,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_triple_bwd_shared_wrw_partial_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ grad_out,
+    const float *__restrict__ rx,
+    const float *__restrict__ ry,
+    const float *__restrict__ bx,
+    const float *__restrict__ by,
+    const float *__restrict__ bg,
+    float *__restrict__ gw_partials,
+    float *__restrict__ grw_partials,
     int64_t num_items,
     int items_per_tile) {{
     const int spec = blockIdx.x;
     const int u = blockIdx.y * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
     switch (spec) {{
 {shared_wrw_partial_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
-
 
 std::vector<torch::Tensor> run_third(
     torch::Tensor x,
@@ -1079,7 +1158,7 @@ std::vector<torch::Tensor> run_third(
         static_cast<unsigned int>((GEN_MAX_CHANNELS + GEN_SPEC_CHANNEL_TILE - 1) / GEN_SPEC_CHANNEL_TILE));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
     // Allocations and zero fills above belong to caller; fork only after them.
-    auto& lane = derivative_stream(x.get_device(), stream);
+    auto &lane = derivative_stream(x.get_device(), stream);
     DerivativeFork fork(lane, stream);
     lunatp_uvu_triple_bwd_x_fp32<<<x_grid, x_block, 0, lane.stream>>>(
         y.data_ptr<float>(),
@@ -1095,7 +1174,7 @@ std::vector<torch::Tensor> run_third(
         x.size(0),
         shared_weight);
     if constexpr (GEN_GROUPED_Y) {{
-{group_launch}
+        {group_launch}
     }} else if (use_shared_weight_reduce) {{
         lunatp_uvu_triple_bwd_shared_ygg_fp32<<<spec_grid, spec_block, 0, stream>>>(
             x.data_ptr<float>(),
@@ -1113,7 +1192,8 @@ std::vector<torch::Tensor> run_third(
             ggo.data_ptr<float>(),
             gry.data_ptr<float>(),
             x.size(0));
-{shared_weight_launch}    }} else {{
+        {shared_weight_launch}
+    }} else {{
         lunatp_uvu_triple_bwd_ywg_fp32<<<spec_grid, spec_block, 0, stream>>>(
             x.data_ptr<float>(),
             y.data_ptr<float>(),
@@ -1141,7 +1221,7 @@ std::vector<torch::Tensor> run_third(
     return {{{outputs}}};
 }}
 
-}}  // namespace
+}} // namespace
 
 std::vector<torch::Tensor> lunatp_uvu_triple_bwd_external_fp32(
     torch::Tensor x,
@@ -1199,11 +1279,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
         shared_weight_reduction="true" if enable_shared_weight_reduce else "false",
         grouped_edges="true" if use_grouped_y else "false",
         reduction_source=reduction_source,
-        x_cases=chr(10).join(x_cases),
-        spec_cases=chr(10).join(spec_cases),
+        x_cases=indent("\n".join(x_cases), "        "),
+        spec_cases=indent("\n".join(spec_cases), "        "),
         grouped_y_kernel=grouped_y_kernel,
-        shared_ygg_cases=chr(10).join(shared_ygg_cases),
-        shared_wrw_partial_cases=chr(10).join(shared_wrw_partial_cases),
+        shared_ygg_cases=indent("\n".join(shared_ygg_cases), "        "),
+        shared_wrw_partial_cases=indent("\n".join(shared_wrw_partial_cases), "        "),
         shared_reduce_start=shared_reduce_start,
         input_allocator="zeros_like"
         if (

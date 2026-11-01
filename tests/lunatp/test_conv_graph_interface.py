@@ -11,6 +11,37 @@ from LunaEquivariance import (
 )
 
 
+@pytest.mark.parametrize("dtype,channels", ((torch.float32, 2048), (torch.float64, 1024)))
+def test_wide_uvw_conv_construction(dtype, channels):
+    config = prepare_tensor_product(
+        "4x0e", f"{channels}x2e", "4x2e", [(0, 0, 0, "uvw", True)],
+        dtype=dtype, convolution=True,
+    )
+    config.prepare_indexing()
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype,channels", ((torch.float32, 2048), (torch.float64, 1024)))
+def test_wide_uvw_conv_forward(dtype, channels):
+    torch.manual_seed(1043)
+    reference = o3.TensorProduct(
+        "4x0e", f"{channels}x2e", "4x2e", [(0, 0, 0, "uvw", True)],
+        internal_weights=False, shared_weights=False,
+    ).to(device="cuda", dtype=dtype)
+    module = TensorProductConv(reference, dtype=dtype)
+    src = torch.tensor([1, 0, 1], device="cuda")
+    dst = torch.tensor([0, 0, 1], device="cuda")
+    graph = make_graph(src, dst, 2)
+    x = torch.randn(2, 4, device="cuda", dtype=dtype)
+    y = torch.randn(3, 5 * channels, device="cuda", dtype=dtype)
+    weight = torch.randn(3, reference.weight_numel, device="cuda", dtype=dtype)
+    with torch.no_grad():
+        actual = module(x, y, weight, graph=graph)
+        expected = x.new_zeros(2, 20).index_add(0, dst, reference(x[src], y, weight))
+    tolerance = 2e-5 if dtype == torch.float32 else 3e-12
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
 @pytest.mark.cuda
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
 def test_same_graph_across_modes_and_three_orders(dtype):

@@ -1,6 +1,7 @@
 """UVW convolution triple backward CUDA and native launch."""
 
 from __future__ import annotations
+import textwrap
 import torch
 from ....utils.precision import cuda_source_for_dtype, float_literal
 from ....utils.extension import load_tp_extension, load_cuda_extension
@@ -15,7 +16,7 @@ from .backward import (
 )
 from .utils import get_uvw_conv_node_layout, set_arch
 from .double_backward import (
-    make_uvw_conv_double_backward_output_shared_source,
+    make_uvw_conv_output_cutlass_source,
     make_uvw_conv_q_shared_source,
 )
 
@@ -162,17 +163,14 @@ def make_uvw_conv_apply_shared_source(meta, program, inputs, outputs, *, phase):
         ]
         edge_width = max(map(len, edge_group_components))
         edge_lines = [
-            r"""__global__ __launch_bounds__(GEN_Y_THREADS,4)
-void {edge_kernel_name}(
-{input_pointers}
-    const int32_t* src,const int32_t* dst,
-{output_pointers}
-    int64_t num_edges) {{
-    __shared__ float smem[GEN_Y_WARPS*{shared_edge_stride}];
-    const Index e=blockIdx.x;
-    if(e>=num_edges) return;
-    const int s=__ldg(src+e),t=__ldg(dst+e);
-    const int u=threadIdx.x;""".format(
+            r"""__global__ __launch_bounds__(GEN_Y_THREADS, 4) void {edge_kernel_name}({input_pointers} const int32_t *src, const int32_t *dst,
+{output_pointers} int64_t num_edges) {{
+    __shared__ float smem[GEN_Y_WARPS * {shared_edge_stride}];
+    const Index e = blockIdx.x;
+    if (e >= num_edges)
+    return;
+    const int s = __ldg(src + e), t = __ldg(dst + e);
+    const int u = threadIdx.x;""".format(
                 edge_kernel_name=edge_kernel_name,
                 input_pointers="\n".join(
                     [
@@ -220,18 +218,18 @@ void {edge_kernel_name}(
                     )
                     edge_lines += [
                         "    {",
-                        f"    for({edge_channel_type} u=threadIdx.x;u<{edge_channels};u+=GEN_Y_THREADS) {{",
+                        f"        for({edge_channel_type} u=threadIdx.x;u<{edge_channels};u+=GEN_Y_THREADS) {{",
                     ]
                     for edge_x in sorted({edge_x for edge_x, edge__ in edge_families}):
                         edge_lines += [
-                            f"""        const float xv_{edge_x}_{edge_i}=__ldg(ptr_{edge_x}+Index(s)*{edge_in1_dim}+{edge_spec["x_offset"]}+u*{edge_d1}+{edge_i});"""
+                            f"""            const float xv_{edge_x}_{edge_i}=__ldg(ptr_{edge_x}+Index(s)*{edge_in1_dim}+{edge_spec["x_offset"]}+u*{edge_d1}+{edge_i});"""
                             for edge_i in sorted(
                                 {int(edge_term[0]) for edge_term in edge_spec["terms"]}
                             )
                         ]
                     for edge_z in sorted({edge_z for _, edge_z in edge_families}):
                         edge_lines += [
-                            f"        const float zv_{edge_z}_{edge_k}=__ldg(ptr_{edge_z}+Index(t)*GEN_TOTAL_Z+{z_offsets[edge_spec_index]}+{edge_path}*{edge_d3}+{edge_k});"
+                            f"            const float zv_{edge_z}_{edge_k}=__ldg(ptr_{edge_z}+Index(t)*GEN_TOTAL_Z+{z_offsets[edge_spec_index]}+{edge_path}*{edge_d3}+{edge_k});"
                             for edge_k in sorted(
                                 {int(edge_term[2]) for edge_term in edge_spec["terms"]}
                             )
@@ -242,14 +240,14 @@ void {edge_kernel_name}(
                         )
                         for edge_family, (edge_x, edge_z) in enumerate(edge_families):
                             edge_lines.append(
-                                f"""        acc_{edge_family}_{edge_component}=fmaf({float_literal(float(edge_coefficient), meta.get("dtype"))}*xv_{edge_x}_{int(edge_i)},zv_{edge_z}_{int(edge_k)},acc_{edge_family}_{edge_component});"""
+                                f"""            acc_{edge_family}_{edge_component}=fmaf({float_literal(float(edge_coefficient), meta.get("dtype"))}*xv_{edge_x}_{int(edge_i)},zv_{edge_z}_{int(edge_k)},acc_{edge_family}_{edge_component});"""
                             )
-                    edge_lines += ["    }", "    }"]
+                    edge_lines += ["        }", "    }"]
             for edge_family in range(len(edge_families)):
                 for edge_component_index, edge_j in enumerate(edge_components):
                     edge_lines += [
                         r"""    float sum_{edge_family}_{edge_j}=acc_{edge_family}_{edge_j};
-    #pragma unroll
+#pragma unroll
     for(int delta=16;delta>0;delta>>=1) sum_{edge_family}_{edge_j}+=__shfl_down_sync(0xffffffff,sum_{edge_family}_{edge_j},delta);
     if((threadIdx.x&31)==0) smem[(threadIdx.x>>5)*{shared_edge_stride}+{component_offset}]=sum_{edge_family}_{edge_j};""".format(
                             edge_family=edge_family,
@@ -263,9 +261,11 @@ void {edge_kernel_name}(
             for edge_family in range(len(edge_families)):
                 for edge_component_index, edge_j in enumerate(edge_components):
                     edge_lines += [
-                        r"""        float block_{edge_family}_{edge_j}=threadIdx.x<GEN_Y_WARPS?smem[threadIdx.x*{shared_edge_stride}+{component_offset}]:0.f;
-        #pragma unroll
-        for(int delta=16;delta>0;delta>>=1) block_{edge_family}_{edge_j}+=__shfl_down_sync(0xffffffff,block_{edge_family}_{edge_j},delta);""".format(
+                        r"""        float block_{edge_family}_{edge_j} =
+        threadIdx.x < GEN_Y_WARPS ? smem[threadIdx.x * {shared_edge_stride} + {component_offset}] : 0.f;
+#pragma unroll
+        for (int delta = 16; delta > 0; delta >>= 1)
+        block_{edge_family}_{edge_j} += __shfl_down_sync(0xffffffff, block_{edge_family}_{edge_j}, delta);""".format(
                             edge_family=edge_family,
                             edge_j=edge_j,
                             shared_edge_stride=len(edge_families) * edge_width,
@@ -308,7 +308,7 @@ void {edge_kernel_name}(
                     ]
             edge_lines += ["        }", "    }"]
             if len(edge_groups) > 1:
-                edge_lines += ["    return;", "    }"]
+                edge_lines += ["    return;", "}"]
         edge_lines.append("}")
         edge_grid = "static_cast<unsigned int>(num_edges)"
         if len(edge_groups) > 1:
@@ -357,10 +357,10 @@ constexpr {offset_type} GEN_TOTAL_Z={total_z};
 std::vector<at::Tensor> launch({parameters},std::vector<at::Tensor> zs,at::Tensor src,at::Tensor dst,at::Tensor src_rowptr,at::Tensor edge_by_src,int64_t num_nodes) {{
     c10::cuda::CUDAGuard guard(x.device());
     const int64_t num_edges=y.size(0);
-    {allocations}
+{allocations}
     auto stream=at::cuda::getCurrentCUDAStream();
-    {clears}
-    {launches}
+{clears}
+{launches}
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {{{cg_outputs}}};
 }}
@@ -375,9 +375,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{m.def("launch",&launch);}}
             total_z=total_z,
             kernels=chr(10).join(kernels),
             parameters=parameters,
-            allocations=chr(10).join(allocations),
-            clears=chr(10).join(clears),
-            launches=chr(10).join(launches),
+            allocations=textwrap.indent(chr(10).join(allocations), '    '),
+            clears=textwrap.indent(chr(10).join(clears), '    '),
+            launches=textwrap.indent(chr(10).join(launches), '    '),
             cg_outputs=",".join(cg_outputs),
         ),
         meta.get("dtype", torch.float32),
@@ -396,7 +396,7 @@ def run_envelope_backward(op, order, inputs, graph, needs=None):
     set_arch(op, inputs[0].get_device())
     if op.weight_mode != "shared":
         return run_external(
-            op, order, inputs, graph.src, graph.dst, needs=needs, env=True
+            op, order, inputs, graph, needs=needs, env=True
         )
     program = ENV_PROGRAMS[order]
     outputs = program["outputs"]
@@ -457,12 +457,12 @@ def run_envelope_backward(op, order, inputs, graph, needs=None):
     values = dict(zip(roles, inputs))
     if needed_z and op.node_contraction is None:
         load_node_contraction(op)
-    if queries and op.weight_contraction is None:
+    if any(target in program["w"] for target in selected) and op.weight_contraction is None:
         load_weight_contraction(op)
     if "gg" in selected and op.output_contraction is None:
         op.output_contraction = load_cuda_extension(
             f"lunatp_uvwconv_bwd_output_shared_{op.dtype_tag}",
-            make_uvw_conv_double_backward_output_shared_source(op.meta, arch=op.arch),
+            make_uvw_conv_output_cutlass_source(op.meta),
             arch=op.arch,
             use_fast_math=False,
             index_bits=op.index_bits,
@@ -489,17 +489,16 @@ def run_envelope_backward(op, order, inputs, graph, needs=None):
                     ),
                 )
             )
-            reduce = op.weight_reduce
             for target in selected:
                 products = program["w"].get(target)
                 if products is None:
                     continue
                 if len(products) == 1:
                     query, gradient = products[0]
-                    result[target] = reduce.launch(q[query], values[gradient])
+                    result[target] = op.weight_reduce.launch(q[query], values[gradient])
                 else:
                     (q0, g0), (q1, g1) = products
-                    result[target] = reduce.launch_pair(
+                    result[target] = op.weight_reduce.launch_pair(
                         q[q0], q[q1], values[g0], values[g1]
                     )
             if "gg" in selected:
@@ -514,7 +513,6 @@ def run_envelope_backward(op, order, inputs, graph, needs=None):
             del q
     if cg_outputs:
         z = []
-        node = op.node_contraction
         for name in needed_z:
             products = program["z"][name]
             if len(products) == 1:
@@ -559,159 +557,142 @@ def run(
     op, x, edge_attr, weight, grad_out, rx, ry, rw, bx, by, bw, bg, *, graph, needs=None
 ):
     set_arch(op, x.get_device())
-    src, dst = graph.src, graph.dst
     num_nodes = graph.num_nodes
     if op.weight_mode != "shared":
-        gx, gy, gw, gg, grx, gry, grw = tuple(
-            run_external(
-                op,
-                3,
-                (x, edge_attr, weight, grad_out, rx, ry, rw, bx, by, bw, bg),
-                src,
-                dst,
-                needs=needs,
+        return run_external(
+            op, 3, (x, edge_attr, weight, grad_out, rx, ry, rw, bx, by, bw, bg),
+            graph, needs=needs,
+        )
+    if op.node_contraction is None:
+        load_node_contraction(op)
+    if op.weight_contraction is None:
+        load_weight_contraction(op)
+
+    if op.output_contraction is None:
+        op.output_contraction = load_cuda_extension(
+            f"lunatp_uvwconv_bwd_output_shared_{op.dtype_tag}",
+            make_uvw_conv_output_cutlass_source(
+                op.meta
+            ),
+            arch=op.arch,
+            use_fast_math=False,
+            index_bits=op.index_bits,
+        )
+
+    with torch.no_grad():
+        node_products = op.precontract_z_pair(weight, bg, bw, grad_out, num_nodes)
+        grad_x = op.grad_x_from_z(
+            ry,
+            node_products,
+            graph.dst,
+            graph.src_rowptr,
+            graph.edge_ids_by_src,
+            num_nodes,
+        )
+        grad_rx = op.grad_x_from_z(
+            edge_attr,
+            node_products,
+            graph.dst,
+            graph.src_rowptr,
+            graph.edge_ids_by_src,
+            num_nodes,
+        )
+        grad_edge = op.grad_edge_from_z(rx, node_products, graph.src, graph.dst)
+        grad_ry = op.grad_edge_from_z(x, node_products, graph.src, graph.dst)
+        del node_products
+
+        node_products = op.precontract_z(rw, bg, num_nodes)
+        grad_x.add_(
+            op.grad_x_from_z(
+                edge_attr,
+                node_products,
+                graph.dst,
+                graph.src_rowptr,
+                graph.edge_ids_by_src,
+                num_nodes,
             )
         )
-    else:
-        if op.node_contraction is None:
-            load_node_contraction(op)
-        if op.weight_contraction is None:
-            load_weight_contraction(op)
+        grad_edge.add_(op.grad_edge_from_z(x, node_products, graph.src, graph.dst))
+        del node_products
 
-        if op.output_contraction is None:
-            op.output_contraction = load_cuda_extension(
-                f"lunatp_uvwconv_bwd_output_shared_{op.dtype_tag}",
-                make_uvw_conv_double_backward_output_shared_source(
-                    op.meta, arch=op.arch
-                ),
-                arch=op.arch,
-                use_fast_math=False,
-                index_bits=op.index_bits,
-            )
-
-        with torch.no_grad():
-            node_products = op.precontract_z_pair(weight, bg, bw, grad_out, num_nodes)
-            grad_x = op.grad_x_from_z(
-                ry,
+        node_products = op.precontract_z(rw, grad_out, num_nodes)
+        grad_x.add_(
+            op.grad_x_from_z(
+                by,
                 node_products,
                 graph.dst,
                 graph.src_rowptr,
                 graph.edge_ids_by_src,
                 num_nodes,
             )
-            grad_rx = op.grad_x_from_z(
-                edge_attr,
+        )
+        grad_edge.add_(op.grad_edge_from_z(bx, node_products, graph.src, graph.dst))
+        del node_products
+
+        node_products = op.precontract_z(weight, grad_out, num_nodes)
+        grad_rx.add_(
+            op.grad_x_from_z(
+                by,
                 node_products,
                 graph.dst,
                 graph.src_rowptr,
                 graph.edge_ids_by_src,
                 num_nodes,
             )
-            grad_edge = op.grad_edge_from_z(rx, node_products, graph.src, graph.dst)
-            grad_ry = op.grad_edge_from_z(x, node_products, graph.src, graph.dst)
-            del node_products
+        )
+        grad_ry.add_(op.grad_edge_from_z(bx, node_products, graph.src, graph.dst))
+        del node_products
 
-            node_products = op.precontract_z(rw, bg, num_nodes)
-            grad_x.add_(
-                op.grad_x_from_z(
-                    edge_attr,
-                    node_products,
-                    graph.dst,
-                    graph.src_rowptr,
-                    graph.edge_ids_by_src,
-                    num_nodes,
-                )
-            )
-            grad_edge.add_(op.grad_edge_from_z(x, node_products, graph.src, graph.dst))
-            del node_products
+        # Both consumers read the weight-gradient CG layout directly.
+        # Consume two CG families before creating the next; at most two remain live.
+        direction_products = op.precontract_q_pair(
+            rx,
+            edge_attr,
+            x,
+            ry,
+            graph.src,
+            graph.edge_ids_by_dst,
+            graph.dst_rowptr,
+            num_nodes,
+        )
+        mixed_products = op.precontract_q_pair(
+            bx,
+            ry,
+            rx,
+            by,
+            graph.src,
+            graph.edge_ids_by_dst,
+            graph.dst_rowptr,
+            num_nodes,
+        )
+        grad_weight = op.weight_reduce.launch_pair(
+            direction_products, mixed_products, bg, grad_out
+        )
+        grad_grad_out = op.output_contraction.launch_pair(
+            direction_products, mixed_products, bw, weight, num_nodes
+        )
+        del direction_products, mixed_products
+        grad_products = op.precontract_q_pair(
+            bx,
+            edge_attr,
+            x,
+            by,
+            graph.src,
+            graph.edge_ids_by_dst,
+            graph.dst_rowptr,
+            num_nodes,
+        )
+        op.output_contraction.accumulate(grad_products, rw, grad_grad_out)
 
-            node_products = op.precontract_z(rw, grad_out, num_nodes)
-            grad_x.add_(
-                op.grad_x_from_z(
-                    by,
-                    node_products,
-                    graph.dst,
-                    graph.src_rowptr,
-                    graph.edge_ids_by_src,
-                    num_nodes,
-                )
-            )
-            grad_edge.add_(op.grad_edge_from_z(bx, node_products, graph.src, graph.dst))
-            del node_products
-
-            node_products = op.precontract_z(weight, grad_out, num_nodes)
-            grad_rx.add_(
-                op.grad_x_from_z(
-                    by,
-                    node_products,
-                    graph.dst,
-                    graph.src_rowptr,
-                    graph.edge_ids_by_src,
-                    num_nodes,
-                )
-            )
-            grad_ry.add_(op.grad_edge_from_z(bx, node_products, graph.src, graph.dst))
-            del node_products
-
-            # Both consumers read the weight-gradient CG layout directly.
-            # Consume two CG families before creating the next; at most two remain live.
-            direction_products = op.precontract_q_pair(
-                rx,
-                edge_attr,
-                x,
-                ry,
-                graph.src,
-                graph.edge_ids_by_dst,
-                graph.dst_rowptr,
-                num_nodes,
-            )
-            mixed_products = op.precontract_q_pair(
-                bx,
-                ry,
-                rx,
-                by,
-                graph.src,
-                graph.edge_ids_by_dst,
-                graph.dst_rowptr,
-                num_nodes,
-            )
-            grad_weight = op.weight_reduce.launch_pair(
-                direction_products, mixed_products, bg, grad_out
-            )
-            grad_grad_out = op.output_contraction.launch_pair(
-                direction_products, mixed_products, bw, weight, num_nodes
-            )
-            del direction_products, mixed_products
-            grad_products = op.precontract_q_pair(
-                bx,
-                edge_attr,
-                x,
-                by,
-                graph.src,
-                graph.edge_ids_by_dst,
-                graph.dst_rowptr,
-                num_nodes,
-            )
-            op.output_contraction.accumulate(grad_products, rw, grad_grad_out)
-
-            base_products = op.precontract_q(
-                x,
-                edge_attr,
-                graph.src,
-                graph.edge_ids_by_dst,
-                graph.dst_rowptr,
-                num_nodes,
-            )
-            grad_rw = op.weight_reduce.launch_pair(
-                base_products, grad_products, bg, grad_out
-            )
-            gx, gy, gw, gg, grx, gry, grw = (
-                grad_x,
-                grad_edge,
-                grad_weight,
-                grad_grad_out,
-                grad_rx,
-                grad_ry,
-                grad_rw,
-            )
-    return gx, gy, gw, gg, grx, gry, grw
+        base_products = op.precontract_q(
+            x,
+            edge_attr,
+            graph.src,
+            graph.edge_ids_by_dst,
+            graph.dst_rowptr,
+            num_nodes,
+        )
+        grad_rw = op.weight_reduce.launch_pair(
+            base_products, grad_products, bg, grad_out
+        )
+    return grad_x, grad_edge, grad_weight, grad_grad_out, grad_rx, grad_ry, grad_rw

@@ -1,6 +1,7 @@
 """UVU convolution backward CUDA and native launch."""
 
 from __future__ import annotations
+import textwrap
 from collections import defaultdict
 import re
 import torch
@@ -36,7 +37,7 @@ def emit_raw_l0_contractions(
         return
     address = f"int64_t(e) * {width} + {offsets[path]} + {channel}"
     lines.extend(
-        f"{indent}{{\n{indent}const {scalar_type} raw_l0_seed = grad_l0 ? __ldg(grad_l0 + {address}) : 0.0;".split(
+        f"            {indent}{{\n                {indent}    const {scalar_type} raw_l0_seed = grad_l0 ? __ldg(grad_l0 + {address}) : 0.0;".split(
             "\n"
         )
     )
@@ -58,7 +59,7 @@ def emit_raw_l0_contractions(
                 if not isinstance(target, str)
                 else target
             )
-            lines.append(f"{indent}{variable} += {literal} * ({expressions[role]});")
+            lines.append(f"{indent}    {variable} += {literal} * ({expressions[role]});")
     lines.append(f"{indent}}}")
 
 
@@ -161,49 +162,49 @@ def make_uvu_conv_bwd_source(
         tail = channels % 32 != 0
         lines = [f"case {group_id}: {{"]
         if tail:
-            lines.append(f"const bool active_channel = u < {channels};")
+            lines.append(f"    const bool active_channel = u < {channels};")
         else:
-            lines.append(f"if (u >= {channels}) break;")
+            lines.append(f"    if (u >= {channels}) break;")
         for (x_offset, d1), _ in bundle:
             prefix = prefixes[x_offset]
             lines.append(
-                f"const INDEX {prefix}xb = INDEX(node) * X_DIM + {x_offset} + u * {d1};"
+                f"    const INDEX {prefix}xb = INDEX(node) * X_DIM + {x_offset} + u * {d1};"
             )
             for v in range(vector):
                 for i in range(d1):
                     lines += [
-                        f"const double {prefix}x{v}_{i} = "
+                        f"    const double {prefix}x{v}_{i} = "
                         + ("active_channel ? " if tail else "")
                         + f"__ldg(x + {prefix}xb + {v * d1 + i})"
                         + (" : 0.0" if tail else "")
                         + ";",
-                        f"double {prefix}gx{v}_{i} = 0.0;",
+                        f"    double {prefix}gx{v}_{i} = 0.0;",
                     ]
-        lines += r"""for (Index p = begin; p < end; ++p) {{
+        lines += r"""    for (Index p = begin; p < end; ++p) {{
 {edge_index}
-const INDEX yb = INDEX(e) * Y_DIM;
-const INDEX gb = INDEX(d) * GO_DIM;
-const INDEX wb = INDEX(e) * W_DIM;""".format(
+        const INDEX yb = INDEX(e) * Y_DIM;
+        const INDEX gb = INDEX(d) * GO_DIM;
+        const INDEX wb = INDEX(e) * W_DIM;""".format(
             edge_index=(
-                "const Index e = edge_ids[p];\nconst int d = __ldg(dst + e);"
+                textwrap.indent("const Index e = edge_ids[p];\nconst int d = __ldg(dst + e);", '        ')
             ),
         ).split("\n")
         if with_env:
-            lines.append("const double env_scale = __ldg(env + e);")
+            lines.append("        const double env_scale = __ldg(env + e);")
         if need_grad_env:
-            lines.append("double ge_value = 0.0;")
+            lines.append("        double ge_value = 0.0;")
         for (yo, d2), ypaths in sorted(
             by_y.items(),
             key=lambda group: sum(len(spec["terms"]) for _, spec in group[1]),
             reverse=True,
         ):
-            lines.append("{")
+            lines.append("        {")
             for j in range(d2):
-                lines += f"const double y{j} = __ldg(y + yb + {yo + j});\ndouble gy{j} = 0.0;".split(
+                lines += f"            const double y{j} = __ldg(y + yb + {yo + j});\n            double gy{j} = 0.0;".split(
                     "\n"
                 )
             if tail:
-                lines.append("if (active_channel) {")
+                lines.append("            if (active_channel) {")
             for path_id, spec in ypaths:
                 d1 = int(spec["d1"])
                 prefix = prefixes[int(spec["x_offset"])]
@@ -212,30 +213,30 @@ const INDEX wb = INDEX(e) * W_DIM;""".format(
                     int(spec["out_offset"]),
                     int(spec["d3"]),
                 )
-                lines.append("{")
+                lines.append("            {")
                 if vector == 2:
                     lines.append(
-                        f"const double2 weights = __ldg(reinterpret_cast<const double2*>(weight + wb + {wo} + {weight_channel_offset(spec)}));"
+                        f"                const double2 weights = __ldg(reinterpret_cast<const double2*>(weight + wb + {wo} + {weight_channel_offset(spec)}));"
                     )
                     for k in range(d3):
                         lines.append(
-                            f"const double2 g{k} = __ldg(reinterpret_cast<const double2*>(grad_out + gb + {go} + u * {d3}) + {k});"
+                            f"                const double2 g{k} = __ldg(reinterpret_cast<const double2*>(grad_out + gb + {go} + u * {d3}) + {k});"
                         )
                 for v in range(vector):
-                    lines.append(f"double gw{v} = 0.0;")
+                    lines.append(f"                double gw{v} = 0.0;")
                 for v in range(vector):
-                    lines.append("{")
+                    lines.append("                {")
                     weight_expr = (
                         f"""weights.{("x" if v == 0 else "y")}"""
                         if vector == 2
                         else f"__ldg(weight + wb + {wo} + {weight_channel_offset(spec)})"
                     )
                     lines.append(
-                        f"const double w = {weight_expr}"
+                        f"                    const double w = {weight_expr}"
                         + (" * env_scale;" if with_env else ";")
                     )
-                    lines += [f"double a{i} = 0.0;" for i in range(d1)]
-                    lines += [f"double b{j} = 0.0;" for j in range(d2)]
+                    lines += [f"                    double a{i} = 0.0;" for i in range(d1)]
+                    lines += [f"                    double b{j} = 0.0;" for j in range(d2)]
                     for ci, cl in enumerate(
                         build_signed_ij_classes(
                             list(spec["terms"]), spec_y_offset=yo, y_name_base=yo
@@ -253,19 +254,19 @@ const INDEX wb = INDEX(e) * W_DIM;""".format(
                                 value = f"({value} + __ldg(grad_l0 + int64_t(e) * {l0_dim} + {l0_offsets[path_id]} + u + {v}))"
                             products.append(f"{float(co):.17e} * {value}")
                         lines.append(
-                            f"""const double q{ci} = {" + ".join(products)};"""
+                            f"""                    const double q{ci} = {" + ".join(products)};"""
                         )
                         for m in cl.members:
                             sign = "+=" if m.relative_sign > 0 else "-="
-                            lines += f"a{m.i_idx} {sign} y{m.j_name} * q{ci};\nb{m.j_name} {sign} {prefix}x{v}_{m.i_idx} * q{ci};".split(
+                            lines += f"                    a{m.i_idx} {sign} y{m.j_name} * q{ci};\n                    b{m.j_name} {sign} {prefix}x{v}_{m.i_idx} * q{ci};".split(
                                 "\n"
                             )
                     for i in range(d1):
-                        lines += f"{prefix}gx{v}_{i} += w * a{i};\ngw{v} += {prefix}x{v}_{i} * a{i};".split(
+                        lines += f"                    {prefix}gx{v}_{i} += w * a{i};\n                    gw{v} += {prefix}x{v}_{i} * a{i};".split(
                             "\n"
                         )
-                    lines += [f"gy{j} += w * b{j};" for j in range(d2)]
-                    lines.append("}")
+                    lines += [f"                    gy{j} += w * b{j};" for j in range(d2)]
+                    lines.append("                }")
                 for v in range(vector):
                     if need_grad_env:
                         raw_weight = (
@@ -273,9 +274,9 @@ const INDEX wb = INDEX(e) * W_DIM;""".format(
                             if vector == 2
                             else f"__ldg(weight + wb + {wo} + {weight_channel_offset(spec)})"
                         )
-                        lines.append(f"ge_value += gw{v} * {raw_weight};")
+                        lines.append(f"                ge_value += gw{v} * {raw_weight};")
                     if with_env:
-                        lines.append(f"gw{v} *= env_scale;")
+                        lines.append(f"                gw{v} *= env_scale;")
                     if with_env and path_id in l0_offsets:
                         channel = "u" if v == 0 else f"u + {v}"
                         emit_raw_l0_contractions(
@@ -308,35 +309,35 @@ const INDEX wb = INDEX(e) * W_DIM;""".format(
                         )
                 if vector == 2:
                     lines.append(
-                        f'asm volatile("st.global.cs.v2.f64 [%0], {{%1, %2}};" :: "l"(grad_weight + wb + {wo} + {weight_channel_offset(spec)}), "d"(gw0), "d"(gw1) : "memory");'
+                        f'                asm volatile("st.global.cs.v2.f64 [%0], {{%1, %2}};" :: "l"(grad_weight + wb + {wo} + {weight_channel_offset(spec)}), "d"(gw0), "d"(gw1) : "memory");'
                     )
                 else:
                     lines.append(
-                        f"store_cs(grad_weight + wb + {wo} + {weight_channel_offset(spec)}, gw0);"
+                        f"                store_cs(grad_weight + wb + {wo} + {weight_channel_offset(spec)}, gw0);"
                     )
-                lines.append("}")
+                lines.append("            }")
             if tail:
-                lines.append("}")
+                lines.append("        }")
             for j in range(d2):
-                lines.append(f"const double sy{j} = warp_sum(gy{j});")
+                lines.append(f"            const double sy{j} = warp_sum(gy{j});")
                 if with_env:
                     lines.append(
-                        f"store_lane_zero(gy_partial + (int64_t({partial_base} + tile * (blockDim.x / 32) + warp) * edges + e) * Y_DIM + {yo + j}, sy{j}, lane);"
+                        f"            store_lane_zero(gy_partial + (int64_t({partial_base} + tile * (blockDim.x / 32) + warp) * edges + e) * Y_DIM + {yo + j}, sy{j}, lane);"
                     )
                 else:
                     lines += [
-                        "if (lane == 0) {",
-                        f"const int part = {partial_base} + tile * (blockDim.x / 32) + warp;",
-                        f"gy_partial[(int64_t(part) * edges + e) * Y_DIM + {yo + j}] = sy{j};",
-                        "}",
+                        "            if (lane == 0) {",
+                        f"                const int part = {partial_base} + tile * (blockDim.x / 32) + warp;",
+                        f"                gy_partial[(int64_t(part) * edges + e) * Y_DIM + {yo + j}] = sy{j};",
+                        "            }",
                     ]
-            lines.append("}")
+            lines.append("        }")
         if need_grad_env:
             lines += [
-                "const double ge_sum = warp_sum(ge_value);",
-                f"store_lane_zero(ge_partial + int64_t({partial_base} + tile * (blockDim.x / 32) + warp) * edges + e, ge_sum, lane);",
+                "        const double ge_sum = warp_sum(ge_value);",
+                f"        store_lane_zero(ge_partial + int64_t({partial_base} + tile * (blockDim.x / 32) + warp) * edges + e, ge_sum, lane);",
             ]
-        lines.append("}")
+        lines.append("    }")
         for (x_offset, d1), _ in bundle:
             prefix = prefixes[x_offset]
             for v in range(vector):
@@ -345,14 +346,14 @@ const INDEX wb = INDEX(e) * W_DIM;""".format(
                         ("if (active_channel) " if tail else "")
                         + f"gx_partial[int64_t(segment) * X_DIM + {x_offset} + u * {d1} + {v * d1 + i}] = {prefix}gx{v}_{i};"
                     )
-        lines += ["break;", "}"]
+        lines += ["    break;", "}"]
         bodies.append("\n".join(lines))
         launches.append(
             r"""{kernel}<<<segments * {tiles}, {threads}, 0, stream>>>(
-            x.data_ptr<double>(), y.data_ptr<double>(), weight.data_ptr<double>(), go.data_ptr<double>(),
-            dst.data_ptr<int32_t>(), edge_ids.data_ptr<EdgeIndex>(), segment_nodes.data_ptr<int32_t>(),
-            segment_begin.data_ptr<EdgeIndex>(), segment_end.data_ptr<EdgeIndex>(), segment_order.data_ptr<{source_index_type}>(),
-            gx_partial.data_ptr<double>(), gy_partial.data_ptr<double>(), gw.data_ptr<double>(), edges{kernel_args});""".format(
+x.data_ptr<double>(), y.data_ptr<double>(), weight.data_ptr<double>(), go.data_ptr<double>(),
+dst.data_ptr<int32_t>(), edge_ids.data_ptr<EdgeIndex>(), segment_nodes.data_ptr<int32_t>(),
+segment_begin.data_ptr<EdgeIndex>(), segment_end.data_ptr<EdgeIndex>(), segment_order.data_ptr<{source_index_type}>(),
+gx_partial.data_ptr<double>(), gy_partial.data_ptr<double>(), gw.data_ptr<double>(), edges{kernel_args});""".format(
                 kernel=kernel,
                 tiles=tiles,
                 threads=threads,
@@ -362,7 +363,7 @@ const INDEX wb = INDEX(e) * W_DIM;""".format(
         )
     index_types = ("Index",) if op.compute_dtype == torch.float32 else ("int64_t",)
     cache_setup = "\n".join(
-        f"""        C10_CUDA_CHECK(cudaFuncSetCacheConfig({kernel.replace(", INDEX>", ", " + index_type + ">")}, cudaFuncCachePreferL1));"""
+        f"""C10_CUDA_CHECK(cudaFuncSetCacheConfig({kernel.replace(", INDEX>", ", " + index_type + ">")}, cudaFuncCachePreferL1));"""
         for index_type in index_types
         for kernel in kernels
     )
@@ -372,7 +373,7 @@ const INDEX wb = INDEX(e) * W_DIM;""".format(
         # Their reductions run only after all groups have completed.
         stream_state = r"""
 struct SourceStreams {
-    SourceStreams(int device, const std::vector<int64_t>& handles)
+    SourceStreams(int device, const std::vector<int64_t> &handles)
         : worker(at::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(handles.at(0)), device)) {
         c10::cuda::CUDAGuard guard(device);
         C10_CUDA_CHECK(cudaEventCreateWithFlags(&start, cudaEventDisableTiming));
@@ -380,44 +381,50 @@ struct SourceStreams {
     }
     ~SourceStreams() noexcept {
         int previous = -1;
-        if (cudaGetDevice(&previous) != cudaSuccess) return;
+        if (cudaGetDevice(&previous) != cudaSuccess)
+            return;
         const int device = worker.device_index();
-        if (previous != device && cudaSetDevice(device) != cudaSuccess) return;
+        if (previous != device && cudaSetDevice(device) != cudaSuccess)
+            return;
         cudaEventDestroy(start);
         cudaEventDestroy(done);
-        if (previous != device) cudaSetDevice(previous);
+        if (previous != device)
+            cudaSetDevice(previous);
     }
-    SourceStreams(const SourceStreams&) = delete;
-    SourceStreams& operator=(const SourceStreams&) = delete;
+    SourceStreams(const SourceStreams &) = delete;
+    SourceStreams &operator=(const SourceStreams &) = delete;
     at::cuda::CUDAStream worker;
     cudaEvent_t start = nullptr, done = nullptr;
 };
 """
         state_parameter = "SourceStreams& state, "
         stream_binding = r"""
-pybind11::class_<SourceStreams>(m, "_Streams", pybind11::module_local())
-    .def(pybind11::init<int, const std::vector<int64_t>&>());
-m.attr("_Streams").attr("stream_count") = 1;
-m.attr("_Streams").attr("stream_priority") = 0;
+    pybind11::class_<SourceStreams>(m, "_Streams", pybind11::module_local())
+        .def(pybind11::init<int, const std::vector<int64_t> &>());
+    m.attr("_Streams").attr("stream_count") = 1;
+    m.attr("_Streams").attr("stream_priority") = 0;
 """
-        launches = ["C10_CUDA_CHECK(cudaEventRecord(state.start, stream));", "C10_CUDA_CHECK(cudaStreamWaitEvent(state.worker, state.start, 0));"] + [
+        launches = ["        C10_CUDA_CHECK(cudaEventRecord(state.start, stream));", "C10_CUDA_CHECK(cudaStreamWaitEvent(state.worker, state.start, 0));"] + [
             launch.replace(", 0, stream>>>", ", 0, state.worker>>>")
             for launch in launches[1::2]
         ] + ["C10_CUDA_CHECK(cudaEventRecord(state.done, state.worker));"] + launches[::2] + ["C10_CUDA_CHECK(cudaStreamWaitEvent(stream, state.done, 0));"]
     launch_body = "\n".join(launches)
     launch_body = launch_body.replace(", INDEX>", ", " + index_types[0] + ">")
     env_reduce = r"""
-__global__ void lunatp_uvuconv_bwd_env_reduce_fp64(const double* partial, double* ge, int64_t edges) {
+__global__ void lunatp_uvuconv_bwd_env_reduce_fp64(const double *partial, double *ge, int64_t edges) {
     const int64_t e = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (e >= edges) return;
+    if (e >= edges)
+        return;
     double value = 0.0;
-    for (int p = 0; p < PARTS; ++p) value += partial[int64_t(p) * edges + e];
+    for (int p = 0; p < PARTS; ++p)
+        value += partial[int64_t(p) * edges + e];
     ge[e] = value;
 }
 """ if need_grad_env else ""
     env_launch = (
-        """    if (edges > 0) lunatp_uvuconv_bwd_env_reduce_fp64<<<(edges + 255) / 256, 256, 0, stream>>>(
-        ge_partial->data_ptr<double>(), ge->data_ptr<double>(), edges);
+        """if (edges > 0)
+        lunatp_uvuconv_bwd_env_reduce_fp64<<<(edges + 255) / 256, 256, 0, stream>>>(ge_partial->data_ptr<double>(),
+            ge->data_ptr<double>(), edges);
 """
         if need_grad_env
         else ""
@@ -425,9 +432,9 @@ __global__ void lunatp_uvuconv_bwd_env_reduce_fp64(const double* partial, double
     # Keep warp-leader writes predicated when optional operands change NVCC's
     # branch heuristics; divergent stores otherwise duplicate address arithmetic.
     env_store = r"""
-__device__ __forceinline__ void store_lane_zero(double* ptr, double value, int lane) {
-    asm volatile("{ .reg .pred p; setp.eq.u32 p, %2, 0; @p st.global.f64 [%0], %1; }"
-        :: "l"(ptr), "d"(value), "r"(lane) : "memory");
+__device__ __forceinline__ void store_lane_zero(double *ptr, double value, int lane) {
+    asm volatile("{ .reg .pred p; setp.eq.u32 p, %2, 0; @p st.global.f64 [%0], %1; }" ::"l"(ptr), "d"(value), "r"(lane)
+                                   : "memory");
 }
 """ if with_env else ""
     source = r"""
@@ -496,13 +503,13 @@ __global__ void lunatp_uvuconv_bwd_reduce_fp64(const double* __restrict__ gx_par
 }}
 {env_reduce}{stream_state}}}
 void run_uvu_conv_bwd({state_parameter}torch::Tensor x, torch::Tensor y, torch::Tensor weight, torch::Tensor go,
-    torch::Tensor dst, torch::Tensor edge_ids, torch::Tensor segment_nodes,
-    torch::Tensor segment_begin, torch::Tensor segment_end, torch::Tensor segment_order,
-    torch::Tensor segment_rowptr, torch::Tensor gx_partial, torch::Tensor gy_partial,
-    torch::Tensor gx, torch::Tensor gy, torch::Tensor gw, int64_t nodes, int64_t edges,
-    int64_t segments, std::optional<torch::Tensor> env,
-    std::optional<torch::Tensor> ge_partial, std::optional<torch::Tensor> ge,
-    std::optional<torch::Tensor> grad_l0) {{
+                 torch::Tensor dst, torch::Tensor edge_ids, torch::Tensor segment_nodes,
+                 torch::Tensor segment_begin, torch::Tensor segment_end, torch::Tensor segment_order,
+                 torch::Tensor segment_rowptr, torch::Tensor gx_partial, torch::Tensor gy_partial,
+                 torch::Tensor gx, torch::Tensor gy, torch::Tensor gw, int64_t nodes, int64_t edges,
+                 int64_t segments, std::optional<torch::Tensor> env,
+                 std::optional<torch::Tensor> ge_partial, std::optional<torch::Tensor> ge,
+                 std::optional<torch::Tensor> grad_l0) {{
     c10::cuda::CUDAGuard device_guard(x.device());
     auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
     static thread_local int configured_device = -1;
@@ -516,9 +523,9 @@ void run_uvu_conv_bwd({state_parameter}torch::Tensor x, torch::Tensor y, torch::
     const int64_t node_blocks = {clear_input_grid};
     const int64_t edge_blocks = (edges * Y_DIM + 255) / 256;
     if (node_blocks + edge_blocks > 0) lunatp_uvuconv_bwd_reduce_fp64<<<node_blocks + edge_blocks, 256, 0, stream>>>(
-        gx_partial.data_ptr<double>(), gy_partial.data_ptr<double>(), segment_rowptr.data_ptr<EdgeIndex>(),
-        gx.data_ptr<double>(), gy.data_ptr<double>(), nodes, edges);
-{env_launch}    C10_CUDA_KERNEL_LAUNCH_CHECK();
+            gx_partial.data_ptr<double>(), gy_partial.data_ptr<double>(), segment_rowptr.data_ptr<EdgeIndex>(),
+            gx.data_ptr<double>(), gy.data_ptr<double>(), nodes, edges);
+    {env_launch}    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{ {stream_binding}m.def("run_uvu_conv_bwd", &run_uvu_conv_bwd); }}
 """.format(
@@ -536,11 +543,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{ {stream_binding}m.def("run_uvu_conv_
         kernel_params=kernel_params,
         source_node="segment_nodes[segment]" if segmented else "segment",
         source_row="segment" if segmented else "segment + 1",
-        bodies=chr(10).join(bodies),
+        bodies=textwrap.indent(chr(10).join(bodies), '        '),
         clear_input_grid="(nodes * X_DIM + 255) / 256" if segmented else "0",
         env_reduce=env_reduce,
-        cache_setup=cache_setup,
-        launch_body=launch_body,
+        cache_setup=textwrap.indent(cache_setup, '        '),
+        launch_body=textwrap.indent(launch_body, '        '),
         env_launch=env_launch,
     )
     if op.compute_dtype == torch.float32:

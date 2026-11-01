@@ -1,19 +1,21 @@
 """Sorted e3nn scalar gates with fused native CUDA gradients."""
 
 from collections import OrderedDict
+from hashlib import sha256
 
 import torch
 
 from ..activation.kernels.utils import apply_activation_spec, activation_config
 from ...o3.irreps import irreps_key
-from ..activation.interface import ActivationFunction, register_ops
-from ...utils import is_compiling
+from ...utils import REGISTER_OPERATOR_LOCK, is_compiling
+from .kernels import backward, double_backward, forward, triple_backward
+from .kernels.utils import get_kernel_config
 from .utils import prepare_gate
 
 
 @torch.compiler.assume_constant_result
 def register_module_ops(self):
-    return register_ops(self.activation_paths, 32, self.meta)
+    return register_ops(self.meta, 32)
 
 
 def gate(features, irreps_scalars=None, act_scalars=None, irreps_gates=None,
@@ -35,16 +37,12 @@ def gate(features, irreps_scalars=None, act_scalars=None, irreps_gates=None,
     if kernel_cache is None:
         kernel_cache = OrderedDict()
     if is_compiling():
-        operator_layout = {
-            key: layout[key]
-            for key in ("in_dim", "out_dim", "scalar_paths", "gated_paths", "scalar_activation", "has_grad")
-        }
-        name = register_ops(layout["scalar_activation"], 32, operator_layout)
+        name = register_ops(layout, 32)
         return getattr(torch.ops.lunaeq, name).default(features)
     if torch.is_inference_mode_enabled():
         with torch.no_grad():
-            return ActivationFunction.apply(features, layout["scalar_activation"], 32, kernel_cache, layout)
-    return ActivationFunction.apply(features, layout["scalar_activation"], 32, kernel_cache, layout)
+            return GateFunction.apply(features, layout, 32, kernel_cache)
+    return GateFunction.apply(features, layout, 32, kernel_cache)
 
 
 def gate_torch(features, layout):
@@ -95,6 +93,235 @@ def gate_torch(features, layout):
         *features.shape[:-1], layout["out_dim"] - scalars.shape[-1]
     )
     return torch.cat((scalars, result), dim=-1)
+
+
+@torch.compiler.assume_constant_result
+def register_ops(meta, index_bits):
+    """Register the static Gate tensor operators."""
+    meta = {key: meta[key] for key in (
+        "in_dim", "out_dim", "scalar_paths", "gated_paths", "scalar_activation", "has_grad"
+    )}
+    suffix = sha256(repr((meta, index_bits)).encode()).hexdigest()[:24]
+    name = f"gate_{suffix}_forward"
+    with REGISTER_OPERATOR_LOCK:
+        if hasattr(torch.ops.lunaeq, name):
+            return name
+        bits, cache = index_bits, OrderedDict()
+
+        @torch.library.custom_op(f"lunaeq::gate_{suffix}_forward", mutates_args=())
+        def gate_forward_op(x: torch.Tensor) -> torch.Tensor:
+            return forward.gate_forward(x, meta, bits, cache)[0]
+
+        @gate_forward_op.register_fake
+        def gate_forward_fake(x):
+            width = meta["out_dim"]
+            return x.new_empty((*x.shape[:-1], width))
+
+        def gate_backward_fake_outputs(order, inputs, needs=None, grad_mode=False):
+            names = (("x", "grad_out"), ("x", "grad_out", "rx"), ("x", "grad_out", "rx", "bx", "bg"))[order - 1]
+            available = tuple(name for name, value in zip(names, inputs) if value is not None)
+            x = next(value for value in inputs if value is not None)
+            program = get_kernel_config(meta, cache, order, dtype=x.dtype, needs=needs, available=available,
+                                        grad_mode=grad_mode)
+            in_dim, out_dim = meta["in_dim"], meta["out_dim"]
+            return tuple(
+                x.new_empty((*x.shape[:-1], out_dim if name in ("sg", "tg") else in_dim))
+                if name in program["active_outputs"] else None
+                for name in program["outputs"]
+            )
+
+        @torch.library.custom_op(f"lunaeq::gate_{suffix}_backward", mutates_args=())
+        def gate_backward_op(x: torch.Tensor, g: torch.Tensor, grad_mode: bool) -> torch.Tensor:
+            return backward.gate_backward(x, g, meta, bits, cache, x.dtype, grad_mode=grad_mode)
+
+        @gate_backward_op.register_fake
+        def gate_backward_fake(x, g, grad_mode):
+            return gate_backward_fake_outputs(1, (x, g), grad_mode=grad_mode)[0]
+
+        @torch.library.custom_op(f"lunaeq::gate_{suffix}_double_backward", mutates_args=(),
+                                 schema="(Tensor x, Tensor g, Tensor rx, bool[] needs) -> (Tensor?, Tensor?)")
+        def gate_double_backward_op(x: torch.Tensor, g: torch.Tensor, rx: torch.Tensor,
+                                          needs: list[bool]) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+            return double_backward.gate_double_backward(x, g, rx, meta, bits, cache, x.dtype, needs=needs)
+
+        @gate_double_backward_op.register_fake
+        def gate_double_backward_fake(x, g, rx, needs):
+            return gate_backward_fake_outputs(2, (x, g, rx), needs)
+
+        @torch.library.custom_op(f"lunaeq::gate_{suffix}_triple_backward", mutates_args=(),
+                                 schema="(Tensor x, Tensor g, Tensor rx, Tensor? bx, Tensor? bg, bool[] needs) -> (Tensor?, Tensor?, Tensor?)")
+        def gate_triple_backward_op(x: torch.Tensor, g: torch.Tensor, rx: torch.Tensor,
+                                          bx: torch.Tensor | None, bg: torch.Tensor | None,
+                                          needs: list[bool]) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+            return triple_backward.gate_triple_backward(x, g, rx, bx, bg, meta, bits, cache,
+                                                               x.dtype, needs=needs)
+
+        @gate_triple_backward_op.register_fake
+        def gate_triple_backward_fake(x, g, rx, bx, bg, needs):
+            return gate_backward_fake_outputs(3, (x, g, rx, bx, bg), needs)
+
+        def gate_forward_setup(ctx, inputs, output):
+            (x,) = inputs
+            ctx.set_materialize_grads(False)
+            ctx.save_for_backward(x)
+            program = get_kernel_config(meta, cache, 1, dtype=x.dtype, grad_mode=True)
+            if not program["active_outputs"]:
+                ctx.mark_non_differentiable(output)
+
+        def gate_forward_backward(ctx, g):
+            (x,) = ctx.saved_tensors
+            return (None if g is None else gate_backward_op(x, g, torch.is_grad_enabled())),
+
+        def gate_backward_setup(ctx, inputs, output):
+            x, g, _ = inputs
+            ctx.set_materialize_grads(False)
+            ctx.save_for_backward(x, g)
+
+        def gate_backward_backward(ctx, rx):
+            if rx is None:
+                return None, None, None
+            x, g = ctx.saved_tensors
+            sx, sg = gate_double_backward_op(x, g, rx, list(ctx.needs_input_grad[:2]))
+            return sx, sg, None
+
+        def gate_double_backward_setup(ctx, inputs, output):
+            x, g, rx, _ = inputs
+            ctx.set_materialize_grads(False)
+            ctx.save_for_backward(x, g, rx)
+
+        def gate_double_backward_backward(ctx, bx, bg):
+            x, g, rx = ctx.saved_tensors
+            result = gate_triple_backward_op(x, g, rx, bx, bg, list(ctx.needs_input_grad[:3]))
+            return *result, None
+
+        gate_forward_op.register_autograd(gate_forward_backward, setup_context=gate_forward_setup)
+        gate_backward_op.register_autograd(gate_backward_backward, setup_context=gate_backward_setup)
+        gate_double_backward_op.register_autograd(gate_double_backward_backward,
+                                                       setup_context=gate_double_backward_setup)
+        return name
+
+
+class GateFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, features, meta, index_bits, kernel_cache):
+        result, backward_kernel, differentiable, save_input = forward.gate_forward(
+            features, meta, index_bits, kernel_cache
+        )
+        if ctx.needs_input_grad[0]:
+            ctx.meta = meta
+            ctx.index_bits = index_bits
+            ctx.kernel_cache = kernel_cache
+            ctx.backward_kernel = backward_kernel
+            ctx.set_materialize_grads(False)
+            ctx.save_for_backward(features if save_input or features.numel() == 0 else None)
+            if not differentiable:
+                ctx.mark_non_differentiable(result)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None, None
+
+        (features,) = ctx.saved_tensors
+        if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
+            grad_input = GateBackward.apply(
+                features, grad_output, ctx.meta, ctx.index_bits,
+                ctx.kernel_cache, grad_output.dtype,
+            )
+        elif ctx.backward_kernel is not None:
+            grad_input = ctx.backward_kernel(features, grad_output)
+        else:
+            grad_input = backward.gate_backward(
+                features, grad_output, ctx.meta, ctx.index_bits,
+                ctx.kernel_cache, grad_output.dtype,
+            )
+        return grad_input, None, None, None
+
+
+class GateBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, features, grad_output, meta, index_bits, kernel_cache, dtype):
+        ctx.meta = meta
+        ctx.index_bits = index_bits
+        ctx.kernel_cache = kernel_cache
+        ctx.dtype = dtype
+        ctx.set_materialize_grads(False)
+
+        result = backward.gate_backward(
+            features, grad_output, meta, index_bits, kernel_cache, dtype, grad_mode=True
+        )
+
+        config = get_kernel_config(
+            meta, kernel_cache, 2, dtype=dtype, needs=ctx.needs_input_grad[:2],
+            available=("x", "grad_out", "rx"),
+        )
+        ctx.save_for_backward(
+            features if features is not None and ("x" in config["inputs"] or features.numel() == 0) else None,
+            grad_output if grad_output is not None and ("grad_out" in config["inputs"] or grad_output.numel() == 0) else None,
+        )
+        if result is not None and not config["active_outputs"]:
+            ctx.mark_non_differentiable(result)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_grad_input):
+        features, grad_output = ctx.saved_tensors
+        needs = ctx.needs_input_grad[:2]
+        if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
+            gradients = GateDoubleBackward.apply(
+                features, grad_output, grad_grad_input, ctx.meta, ctx.index_bits,
+                ctx.kernel_cache, ctx.dtype, needs,
+            )
+        else:
+            gradients = double_backward.gate_double_backward(
+                features, grad_output, grad_grad_input, ctx.meta, ctx.index_bits,
+                ctx.kernel_cache, ctx.dtype, needs=needs,
+            )
+        return *gradients, None, None, None, None
+
+
+class GateDoubleBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, features, grad_output, grad_grad_input, meta, index_bits, kernel_cache, dtype, needs):
+        ctx.meta = meta
+        ctx.index_bits = index_bits
+        ctx.kernel_cache = kernel_cache
+        ctx.dtype = dtype
+        ctx.set_materialize_grads(False)
+
+        result = double_backward.gate_double_backward(
+            features, grad_output, grad_grad_input, meta, index_bits,
+            kernel_cache, dtype, needs=needs,
+        )
+
+        required = set()
+        for output, grad_name in zip(result, ("bx", "bg")):
+            if output is None:
+                continue
+            config = get_kernel_config(
+                meta, kernel_cache, 3, dtype=dtype, needs=ctx.needs_input_grad[:3],
+                available=("x", "grad_out", "rx", grad_name),
+            )
+            required.update(config["inputs"])
+            if not config["active_outputs"]:
+                ctx.mark_non_differentiable(output)
+        ctx.save_for_backward(
+            features if features is not None and ("x" in required or features.numel() == 0) else None,
+            grad_output if grad_output is not None and ("grad_out" in required or grad_output.numel() == 0) else None,
+            grad_grad_input if grad_grad_input is not None and ("rx" in required or grad_grad_input.numel() == 0) else None,
+        )
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_input, grad_grad_output):
+        features, grad_output, grad_grad_input = ctx.saved_tensors
+        gradients = triple_backward.gate_triple_backward(
+            features, grad_output, grad_grad_input, grad_input, grad_grad_output,
+            ctx.meta, ctx.index_bits, ctx.kernel_cache, ctx.dtype,
+            needs=ctx.needs_input_grad[:3],
+        )
+        return *gradients, None, None, None, None, None
 
 
 __all__ = ['gate']

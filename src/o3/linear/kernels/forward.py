@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from textwrap import indent
 
 import torch
 
 from ....utils.precision import get_fp64_mma, float_literal
-from .utils import MAX_BATCH_RANK
 
 
-def make_feature_kernel(meta, name, pairs, broadcast, *, backward=False, layout=False):
+def make_feature_kernel(meta, name, pairs, broadcast, *, backward=False):
     roles = tuple(dict.fromkeys(role for term in (*pairs, *broadcast) for role in term))
     parameters = ", ".join(f"const Element* __restrict__ {role}" for role in roles)
     dest = "in_dim" if backward else "out_dim"
@@ -24,8 +24,8 @@ def make_feature_kernel(meta, name, pairs, broadcast, *, backward=False, layout=
     lines = []
     for (offset, channels, components), specs in groups.items():
         lines.append((r"""if (q >= {offset} && q < {end}) {{
-const int channel=(q-{offset})/{components};
-const int component=(q-{offset})%{components};""").format(
+    const int channel = (q - {offset}) / {components};
+    const int component = (q - {offset}) % {components};""").format(
             offset=offset, end=offset+channels*components, components=components,
         ))
         for spec in specs:
@@ -39,18 +39,17 @@ const int component=(q-{offset})%{components};""").format(
             for a, w in pairs:
                 feature_index = f"n*{meta[src]}+{source_offset}+k*{components}+component"
                 weight_index = f"{batch}{weight_offset}+{windex}"
-                feature = (
-                    f"layout_{a}({a},{feature_index},layout)" if layout else f"{a}[{feature_index}]"
-                )
-                weight = (
-                    f"layout_{w}({w},{weight_index},layout)" if layout else f"{w}[{weight_index}]"
-                )
-                lines.append((r"""{{ Element part=Element(0);
+                feature = f"{a}[{feature_index}]"
+                weight = f"{w}[{weight_index}]"
+                lines.append((r"""    {{
+        Element part = Element(0);
 #pragma unroll {unroll}
-for(int k=0;k<{width};++k) part={fma}({feature}, {weight}, part);
-value={fma}(part,Element({coefficient}),value); }}""").format(
+        for (int k = 0; k < {width}; ++k)
+            part = {fma}({feature}, {weight}, part);
+        value = {fma}(part, Element({coefficient}), value);
+    }}""").format(
                     unroll=1 if width>32 else 4, width=width,
-                    fma='__fma_rn' if meta['dtype'] is torch.float64 else '__fmaf_rn',
+                    fma='__fma_rn',
                     feature=feature, weight=weight, coefficient=coeff,
                 ))
         lines.append("}")
@@ -59,27 +58,27 @@ value={fma}(part,Element({coefficient}),value); }}""").format(
             start, count = spec["out_offset"], spec["channels"]
             for (b,) in broadcast:
                 bias_index = f"q-{start}+{spec['bias_offset']}"
-                bias = f"layout_{b}({b},{bias_index},layout)" if layout else f"{b}[{bias_index}]"
+                bias = f"{b}[{bias_index}]"
                 lines.append(("if(q>={start} && q<{end}) value+={bias};").format(start=start, end=start+count, bias=bias))
 
     code = (
         (r"""
-__global__ void {name}({parameters}{parameter_separator} Element* __restrict__ out, Index count{layout_parameter}) {{
-    for(Index index=Index(blockIdx.x)*blockDim.x+threadIdx.x;index<count;index+=Index(blockDim.x)*gridDim.x) {{
-        const Index n=index/{dimension};
-        const int q=index%{dimension};
-        Element value=Element(0);
-        {contractions}
-        out[index]=value;
+__global__ void {name}({parameters}{parameter_separator} Element* __restrict__ out, Index count) {{
+    for (Index index = Index(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
+         index += Index(blockDim.x) * gridDim.x) {{
+        const Index n = index / {dimension};
+        const int q = index % {dimension};
+        Element value = Element(0);
+{contractions}
+        out[index] = value;
     }}
 }}
 """).format(
             name=name,
             parameters=parameters,
             parameter_separator=',' if roles else '',
-            layout_parameter=',ForwardLayout layout' if layout else '',
             dimension=meta[dest],
-            contractions="\n".join(lines),
+            contractions=indent("\n".join(lines), "        "),
         )
         if meta[dest]
         else ""
@@ -88,7 +87,7 @@ __global__ void {name}({parameters}{parameter_separator} Element* __restrict__ o
     args = ", ".join(f"{role}.data_ptr<Element>()" for role in roles)
     count = f"num_items*int64_t({meta[dest]})"
     launch = (
-        f"if ({count}>0) {name}<<<std::min<int64_t>(65535,({count}+255)/256),256,0,stream>>>({args}{',' if args else ''} out.data_ptr<Element>(),{count}{',layout_' if layout else ''});"
+        f"if ({count}>0) {name}<<<std::min<int64_t>(65535,({count}+255)/256),256,0,stream>>>({args}{',' if args else ''} out.data_ptr<Element>(),{count});"
         if code
         else ""
     )
@@ -96,11 +95,10 @@ __global__ void {name}({parameters}{parameter_separator} Element* __restrict__ o
 
 
 def make_tiled_feature_kernel(
-    meta, name, pairs, broadcast, *, backward=False, arch, layout=False
+    meta, name, pairs, broadcast, *, backward=False, arch
 ):
     """Implicit AoS GEMM with static path bodies and one CTA dispatcher."""
-    fp64 = meta["dtype"] is torch.float64
-    tile_m, tile_n, tile_k, threads = (32, 64, 16, 128) if fp64 else (32, 64, 32, 128)
+    tile_m, tile_n, tile_k, threads = (32, 64, 16, 128)
     dest = meta["in_dim" if backward else "out_dim"]
     src = meta["out_dim" if backward else "in_dim"]
     groups = defaultdict(list)
@@ -140,17 +138,19 @@ def make_tiled_feature_kernel(
         offsets.append(offset)
         reductions.append(ktotal)
         dispatch.append(
-            ("if(task<cursor+({tasks})) {{{name}_body<{group}>({body_args}{separator}out,shared_a,shared_b,((task-cursor)/{tiles})*{tile_m},((task-cursor)%{tiles})*{tile_n},num_items{layout_argument}); return;}} cursor+=({tasks});").format(
+            ("if(task<cursor+({tasks})) {{\n    {name}_body<{group}>({body_args}{separator}out,shared_a,shared_b,((task-cursor)/{tiles})*{tile_m},((task-cursor)%{tiles})*{tile_n},num_items);\n    return;\n}}\ncursor+=({tasks});").format(
                 tasks=tasks, name=name, group=group, body_args=body_args,
                 separator=',' if roles else '', tiles=nt, tile_m=tile_m, tile_n=tile_n,
-                layout_argument=',layout' if layout else '',
             )
         )
         la = [(r"""case {group}: {{
-if(row>=num_items*int64_t({components})) return Element(0);
-const Index n=row/{components}; const int component=row%{components};""").format(group=group, components=d)]
+    if (row >= num_items * int64_t({components}))
+        return Element(0);
+    const Index n = row / {components};
+    const int component = row % {components};""").format(group=group, components=d)]
         lb = [(r"""case {group}: {{
-if(column>={channels}) return Element(0);""").format(group=group, channels=channels)]
+    if (column >= {channels})
+        return Element(0);""").format(group=group, channels=channels)]
         base = 0
         for spec in specs:
             count = spec["out_channels" if backward else "in_channels"]
@@ -159,18 +159,18 @@ if(column>={channels}) return Element(0);""").format(group=group, channels=chann
             wi = f"column*{cout}+local_k" if backward else f"local_k*{cout}+column"
             feature_index = f"n*{src}+{so}+local_k*{d}+component"
             weight_index = f"{wo}+{wi}"
-            feature = f"layout_x(a,{feature_index},layout)" if layout else f"a[{feature_index}]"
-            weight = f"layout_weight(b,{weight_index},layout)" if layout else f"b[{weight_index}]"
+            feature = f"a[{feature_index}]"
+            weight = f"b[{weight_index}]"
             la += [
-                ("if(k>={base} && k<{end}) {{const int local_k=k-{base}; return {feature};}}").format(base=base, end=base+count, feature=feature)
+                ("    if(k>={base} && k<{end}) {{\n        const int local_k=k-{base};\n        return {feature};\n    }}").format(base=base, end=base+count, feature=feature)
             ]
             lb += [
-                ("if(k>={base} && k<{end}) {{const int local_k=k-{base}; return {weight}*Element({coefficient});}}").format(base=base, end=base+count, weight=weight,
+                ("    if(k>={base} && k<{end}) {{\n        const int local_k=k-{base};\n        return {weight}*Element({coefficient});\n    }}").format(base=base, end=base+count, weight=weight,
                                         coefficient=float_literal(spec['path_weight'], meta['dtype']))
             ]
             base += count
-        la += ["return Element(0);}"]
-        lb += ["return Element(0);}"]
+        la += ["    return Element(0);\n}"]
+        lb += ["    return Element(0);\n}"]
         loads_a.extend(la)
         loads_b.extend(lb)
         for bs in meta["bias_specs"]:
@@ -181,96 +181,62 @@ if(column>={channels}) return Element(0);""").format(group=group, channels=chann
             ):
                 for (role,) in broadcast:
                     bias_index = f"{bs['bias_offset']}+column*components+component-{bs['out_offset']-offset}"
-                    bias = (
-                        f"layout_{role}({role},{bias_index},layout)" if layout else f"{role}[{bias_index}]"
-                    )
+                    bias = f"{role}[{bias_index}]"
                     bias_add.append(
                         ("if(group=={group} && column*components+component>={start} && column*components+component<{end}) value+={bias};").format(group=group, start=bs['out_offset']-offset,
                                                  end=bs['out_offset']-offset+bs['channels'], bias=bias)
                     )
 
-    layout_parameter = ",const ForwardLayout& layout" if layout else ""
-    layout_argument = ",layout" if layout else ""
-    loader_args = "const Element* a,int group,Index row,int k,int64_t num_items" + layout_parameter
-    header = ""
-    if fp64:
-        header, mma = get_fp64_mma(arch)
-        unique = name + "_Mma"
-        header = header.replace("Fp64Mma16x8x16", unique)
-        mma = mma.replace("Fp64Mma16x8x16", unique)
-        init = ("Element acc[4][4]={}; const int lane=threadIdx.x&31,warp=threadIdx.x>>5;")
-        calculate = (r"""
-        #pragma unroll
-        for(int k=0;k<{tile_k};k+=16) {{
-            Element a[8];
-            #pragma unroll
-            for(int i=0;i<8;++i) a[i]=shared_a[((warp>>1)*16+(lane>>2)+(i&1)*8)*{tile_k}+((k+(lane&3)+(i>>1)*4)^(((lane>>2)&3)<<2))];
-            #pragma unroll
-            for(int n=0;n<4;++n) {{
-                Element b[4];
-                #pragma unroll
-                for(int i=0;i<4;++i) b[i]=shared_b[(k+(lane&3)+i*4)*{tile_n}+(((warp&1)*32+n*8+(lane>>2))^((lane&3)<<2))];
-                {mma}::fma(acc[n][0],acc[n][1],acc[n][2],acc[n][3],a[0],a[1],a[2],a[3],a[4],a[5],a[6],a[7],b[0],b[1],b[2],b[3],acc[n][0],acc[n][1],acc[n][2],acc[n][3]);
-            }}
-        }}
+    loader_args = "const Element* a,int group,Index row,int k,int64_t num_items"
+    header, mma = get_fp64_mma(arch)
+    unique = name + "_Mma"
+    header = header.replace("Fp64Mma16x8x16", unique)
+    mma = mma.replace("Fp64Mma16x8x16", unique)
+    init = ("Element acc[4][4]={}; const int lane=threadIdx.x&31,warp=threadIdx.x>>5;")
+    calculate = (r"""
+#pragma unroll
+for (int k = 0; k < {tile_k}; k += 16) {{
+    Element a[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+        a[i] = shared_a[((warp >> 1) * 16 + (lane >> 2) + (i & 1) * 8) * {tile_k} +
+                        ((k + (lane & 3) + (i >> 1) * 4) ^ (((lane >> 2) & 3) << 2))];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) {{
+        Element b[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            b[i] = shared_b[(k + (lane & 3) + i * 4) * {tile_n} +
+                            (((warp & 1) * 32 + n * 8 + (lane >> 2)) ^ ((lane & 3) << 2))];
+        {mma}::fma(acc[n][0], acc[n][1], acc[n][2], acc[n][3], a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], b[0],
+            b[1], b[2], b[3], acc[n][0], acc[n][1], acc[n][2], acc[n][3]);
+    }}
+}}
 """).format(
-            tile_k=tile_k,
-            tile_n=tile_n,
-            mma=mma,
-        )
-        loops = ("for(int j=0;j<4;++j) { for(int i=0;i<4;++i) {")
-        coords = ("const Index row=tile_row+(warp>>1)*16+(lane>>2)+(i>>1)*8; const int column=tile_column+(warp&1)*32+j*8+(lane&3)*2+(i&1); Element value=acc[j][i];")
-    else:
-        init = ("Element acc[4][4]={}; const int local_row=(threadIdx.x>>4)*4,local_column=(threadIdx.x&15);")
-        shared_b_index = (
-            f"k*{tile_n}+((local_column+j*16)^k)" if backward
-            else f"k*{tile_n}+local_column+j*16"
-        )
-        calculate = (r"""
-        #pragma unroll
-        for(int k=0;k<{tile_k};++k) {{
-            Element a[4],b[4];
-            #pragma unroll
-            for(int i=0;i<4;++i) a[i]=shared_a[(local_row+i)*{tile_k}+(k^(((local_row+i)&3)<<3))];
-            #pragma unroll
-            for(int j=0;j<4;++j) b[j]=shared_b[{shared_b_index}];
-            #pragma unroll
-            for(int i=0;i<4;++i) {{
-                #pragma unroll
-                for(int j=0;j<4;++j) acc[i][j]=__fmaf_rn(a[i],b[j],acc[i][j]);
-            }}
-        }}
-""").format(
-            tile_k=tile_k,
-            tile_n=tile_n,
-            shared_b_index=shared_b_index,
-        )
-        loops = ("for(int i=0;i<4;++i) { for(int j=0;j<4;++j) {")
-        coords = ("const Index row=tile_row+local_row+i; const int column=tile_column+local_column+j*16; Element value=acc[i][j];")
-    a_store = ("(index/{tile_k})*{tile_k}+((index%{tile_k})^(((index/{tile_k})&3)<<{shift}))").format(tile_k=tile_k, shift=2 if fp64 else 3)
-    b_store = (
-        ("(index/{tile_n})*{tile_n}+((index%{tile_n})^(((index/{tile_n})&3)<<2))").format(tile_n=tile_n)
-        if fp64
-        else "index"
+        tile_k=tile_k,
+        tile_n=tile_n,
+        mma=mma,
     )
+    loops = ("for(int j=0;j<4;++j) {\n    for(int i=0;i<4;++i) {")
+    coords = ("const Index row=tile_row+(warp>>1)*16+(lane>>2)+(i>>1)*8;\nconst int column=tile_column+(warp&1)*32+j*8+(lane&3)*2+(i&1);\nElement value=acc[j][i];")
+    a_store = ("(index/{tile_k})*{tile_k}+((index%{tile_k})^(((index/{tile_k})&3)<<{shift}))").format(tile_k=tile_k, shift=2)
+    b_store = "(index/{tile_n})*{tile_n}+((index%{tile_n})^(((index/{tile_n})&3)<<2))".format(tile_n=tile_n)
 
     b_k, b_column = f"index/{tile_n}", f"index%{tile_n}"
-    if not fp64 and backward:
-        # Read transposed weights along contiguous K, then transpose in shared memory.
-        b_k, b_column = f"index%{tile_k}", f"index/{tile_k}"
-        b_store = f"(index%{tile_k})*{tile_n}+((index/{tile_k})^(index%{tile_k}))"
 
     products = []
     for a, b in pairs:
         products.append(
             (r"""
-        for(Index first_k=0;first_k<reduction_size;first_k+={tile_k}) {{
-            for(int index=threadIdx.x;index<{a_elements};index+={threads}) shared_a[{a_store}]={name}_a({a},group,tile_row+index/{tile_k},first_k+index%{tile_k},num_items{layout_argument});
-            for(int index=threadIdx.x;index<{b_elements};index+={threads}) shared_b[{b_store}]={name}_b({b},group,first_k+{b_k},tile_column+{b_column}{layout_argument});
-            __syncthreads();
-            {calculate}
-            __syncthreads();
-        }}
+for (Index first_k = 0; first_k < reduction_size; first_k += {tile_k}) {{
+    for (int index = threadIdx.x; index < {a_elements}; index += {threads})
+        shared_a[{a_store}] = {name}_a({a}, group, tile_row + index / {tile_k}, first_k + index % {tile_k}, num_items);
+    for (int index = threadIdx.x; index < {b_elements}; index += {threads})
+        shared_b[{b_store}] = {name}_b({b}, group, first_k + {b_k}, tile_column + {b_column});
+    __syncthreads();
+{calculate}
+    __syncthreads();
+}}
 """).format(
                 tile_k=tile_k,
                 a_elements=tile_m * tile_k,
@@ -278,14 +244,13 @@ if(column>={channels}) return Element(0);""").format(group=group, channels=chann
                 a_store=a_store,
                 name=name,
                 a=a,
-                layout_argument=layout_argument,
                 b_elements=tile_k * tile_n,
                 b_store=b_store,
                 b_k=b_k,
                 b_column=b_column,
                 b=b,
                 tile_n=tile_n,
-                calculate=calculate,
+                calculate=indent(calculate, "    "),
             )
         )
 
@@ -293,133 +258,294 @@ if(column>={channels}) return Element(0);""").format(group=group, channels=chann
     source = (
         header
         + (r"""
-__device__ __forceinline__ Element {name}_a({loader_args}) {{ switch(group) {{{feature_loads} default:return Element(0);}} }}
-__device__ __forceinline__ Element {name}_b(const Element* b,int group,int k,int column{layout_parameter}) {{ switch(group) {{{weight_loads} default:return Element(0);}} }}
-template<int Group>
-__device__ __forceinline__ void {name}_body({parameters}{parameter_separator} Element* out,Element* shared_a,Element* shared_b,Index tile_row,int tile_column,int64_t num_items{layout_parameter}) {{
-    constexpr int group_widths[]={{{group_widths}}};
-    constexpr int group_components[]={{{group_components}}};
-    constexpr int group_offsets[]={{{group_offsets}}};
-    constexpr int group_reductions[]={{{group_reductions}}};
-    constexpr int group=Group,width=group_widths[Group],components=group_components[Group];
-    constexpr int out_offset=group_offsets[Group],reduction_size=group_reductions[Group];
-    {init}
-    {products}
-    #pragma unroll
-    {loops}
-        {coords}
-        if(row<num_items*int64_t(components) && column<width) {{
-            const Index item=row/components;
-            const int component=row%components;
-            {bias_add}
-            out[item*{dest}+out_offset+column*components+component]=value;
-        }}
-    }} }}
+__device__ __forceinline__ Element {name}_a({loader_args}) {{
+    switch (group) {{
+{feature_loads}
+        default: return Element(0);
+    }}
 }}
-__global__ __launch_bounds__({threads},2) void {name}({parameters}{parameter_separator} Element* out,int64_t num_items{kernel_layout_parameter}) {{
-    __shared__ Element shared_a[{a_elements}],shared_b[{b_elements}];
-    const Index task=blockIdx.x;
-    Index cursor=0;
-    {task_dispatch}
+__device__ __forceinline__ Element {name}_b(const Element* b, int group, int k, int column) {{
+    switch (group) {{
+{weight_loads}
+        default: return Element(0);
+    }}
+}}
+template <int Group>
+__device__ __forceinline__ void {name}_body({parameters}{parameter_separator} Element* out, Element* shared_a, Element* shared_b, Index tile_row,
+    int tile_column, int64_t num_items) {{
+    constexpr int group_widths[] = {{{group_widths}}};
+    constexpr int group_components[] = {{{group_components}}};
+    constexpr int group_offsets[] = {{{group_offsets}}};
+    constexpr int group_reductions[] = {{{group_reductions}}};
+    constexpr int group = Group, width = group_widths[Group], components = group_components[Group];
+    constexpr int out_offset = group_offsets[Group], reduction_size = group_reductions[Group];
+{init}
+{products}
+#pragma unroll
+{loops}
+{coords}
+            if (row < num_items * int64_t(components) && column < width) {{
+                const Index item = row / components;
+                const int component = row % components;
+{bias_add}
+                out[item * {dest} + out_offset + column * components + component] = value;
+            }}
+        }}
+    }}
+}}
+__global__ __launch_bounds__({threads}, 2) void {name}({parameters}{parameter_separator} Element* out, int64_t num_items) {{
+    __shared__ Element shared_a[{a_elements}], shared_b[{b_elements}];
+    const Index task = blockIdx.x;
+    Index cursor = 0;
+{task_dispatch}
 }}
 """).format(
             name=name,
             loader_args=loader_args,
-            feature_loads="\n".join(loads_a),
-            layout_parameter=layout_parameter,
-            weight_loads="\n".join(loads_b),
+            feature_loads=indent("\n".join(loads_a), "        "),
+            weight_loads=indent("\n".join(loads_b), "        "),
             parameters=parameters,
             parameter_separator=',' if parameters else '',
             group_widths=','.join(map(str, widths)),
             group_components=','.join(map(str, component_counts)),
             group_offsets=','.join(map(str, offsets)),
             group_reductions=','.join(map(str, reductions)),
-            init=init,
-            products="\n".join(products),
-            loops=loops,
-            coords=coords,
-            bias_add="\n".join(bias_add),
+            init=indent(init, "    "),
+            products=indent("\n".join(products), "    "),
+            loops=indent(loops, "    "),
+            coords=indent(coords, "            "),
+            bias_add=indent("\n".join(bias_add), "                "),
             dest=dest,
             threads=threads,
-            kernel_layout_parameter=',ForwardLayout layout' if layout else '',
             a_elements=tile_m * tile_k,
             b_elements=tile_k * tile_n,
-            task_dispatch="\n".join(dispatch),
+            task_dispatch=indent("\n".join(dispatch), "    "),
         )
     )
 
     args = ", ".join(f"{r}.data_ptr<Element>()" for r in roles)
-    launch = f"if(num_items>0 && {dest}>0) {name}<<<{total},{threads},0,stream>>>({args}{',' if args else ''}out.data_ptr<Element>(),num_items{',layout_' if layout else ''});"
+    launch = f"if(num_items>0 && {dest}>0) {name}<<<{total},{threads},0,stream>>>({args}{',' if args else ''}out.data_ptr<Element>(),num_items);"
     return dict(source=source, launch=launch)
 
 
-def make_forward_source(
-    meta, program, *, arch, layout=False, f_in=None, f_out=None, scaled=None,
-):
-    """Generate forward with dense or explicitly described strided inputs."""
-    headers, declarations = "", ""
-    if layout:
-        xi = max(1, meta["in_dim"] // (f_in or 1))
-        wi = max(1, meta["weight_numel"] // ((f_in or 1) * (f_out or 1)))
-        bi = max(1, meta["bias_numel"] // (f_out or 1))
-        fo = f_out or 1
-        weight_batch = "Index(0)" if meta["shared_weights"] else f"flat/{max(1,meta['weight_numel'])}"
-        weight_field = "flat" if meta["shared_weights"] else f"flat%{max(1,meta['weight_numel'])}"
-        prefix = (r"""
-struct ForwardLayout {{
-    int rank;
-    Index sizes[{MAX_BATCH_RANK}],x_stride[{MAX_BATCH_RANK}],w_stride[{MAX_BATCH_RANK}];
-    Index x_feature[2],w_feature[3],b_feature[2];
-}};
-__device__ __forceinline__ Index layout_batch(const ForwardLayout& layout,Index item,bool weight) {{
-    Index offset=0;
-    for(int axis=layout.rank-1;axis>0;--axis) {{
-        const Index coordinate=item%layout.sizes[axis]; item/=layout.sizes[axis];
-        offset+=coordinate*(weight?layout.w_stride[axis]:layout.x_stride[axis]);
-    }}
-    if(layout.rank) offset+=item*(weight?layout.w_stride[0]:layout.x_stride[0]);
-    return offset;
-}}
-""").format(
-            MAX_BATCH_RANK=MAX_BATCH_RANK,
-        )
-        bodies = (
-            (r"""    const Index item=flat/{dimension}; const int q=flat%{dimension};
-    const Index address=layout_batch(layout,item,false)+(q/{xi})*layout.x_feature[0]+(q%{xi})*layout.x_feature[1];
-    return pointer[address];""").format(
-                dimension=max(1, meta['in_dim']),
-                xi=xi,
-            ),
-            (r"""    const Index item={weight_batch}; const int q={weight_field};
-    const Index address={batch_address}+
-        (q/{wi}/{fo})*layout.w_feature[0]+((q/{wi})%{fo})*layout.w_feature[1]+(q%{wi})*layout.w_feature[2];
-    return pointer[address];""").format(
-                weight_batch=weight_batch,
-                weight_field=weight_field,
-                batch_address='Index(0)' if meta['shared_weights'] else 'layout_batch(layout,item,true)',
-                wi=wi,
-                fo=fo,
-            ),
-            f"    return pointer[(flat/{bi})*layout.b_feature[0]+(flat%{bi})*layout.b_feature[1]];",
-        )
-        flags = (tuple(scaled) + (False, False, False))[:3] if scaled is not None else (False,) * 3
-        readers = []
-        for role, body, flag, field in zip(
-            ("x", "weight", "bias"),
-            bodies,
-            flags,
-            ("x_feature[1]", "w_feature[2]", "b_feature[1]"),
-        ):
-            if flag:
-                body = f"    return pointer[flat*layout.{field}];"
-            readers.append(
-                f"__device__ __forceinline__ Element layout_{role}(const Element* pointer,Index flat,const ForwardLayout& layout) {{\n"
-                + body
-                + "\n}\n"
-            )
-        declarations = prefix + "".join(readers)
-        headers = "\n#include <vector>\n#include <limits>\n#include <pybind11/stl.h>"
+def make_cutlass_feature_kernel(meta, name, pairs, broadcast, *, backward=False):
+    """Group AoS GEMMs in one launch without packing features or weights."""
+    dest = meta["in_dim" if backward else "out_dim"]
+    source_dim = meta["out_dim" if backward else "in_dim"]
+    groups = defaultdict(list)
+    for spec in meta["generated_specs"]:
+        groups[(spec["x_offset" if backward else "out_offset"], spec["in_channels" if backward else "out_channels"], spec["components"])].append(spec)
+    cursor = 0
+    for offset, channels, components in sorted(groups):
+        if offset > cursor:
+            groups[(cursor, offset - cursor, 1)] = []
+        cursor = max(cursor, offset + channels * components)
+    if cursor < dest:
+        groups[(cursor, dest - cursor, 1)] = []
+    if not groups:
+        return dict(source="", launch="")
 
+    tile_m, tile_n = 64, 64
+    max_components = max(d for _, _, d in groups)
+    tile_bound = sum(((channels + tile_n - 1) // tile_n) * d for _, channels, d in groups)
+    chunk_items = min((2**31 - tile_m) // max_components, (2**31 - 1) // max(1, tile_bound))
+    shared = meta["shared_weights"]
+    dispatch, totals, storage = [], [], []
+    roles = tuple(dict.fromkeys(role for term in (*pairs, *broadcast) for role in term))
+    for group, ((offset, channels, components), specs) in enumerate(groups.items()):
+        ntiles = (channels + tile_n - 1) // tile_n
+        rows = f"num_items*int64_t({components})" if shared else str(components)
+        mtiles = f"(({rows}+{tile_m-1})/{tile_m})"
+        tasks = f"{mtiles}*{ntiles}" + ("" if shared else "*num_items")
+        totals.append(tasks)
+        body = []
+        term = 0
+        bias = next((b for b in meta["bias_specs"] if b["out_offset"] == offset and b["channels"] == channels and components == 1 and not backward), None)
+        for spec in specs:
+            for feature, weight in pairs:
+                gemm = f"{name}_Kernel<{components}>"
+                storage.append(f"typename {gemm}::GemmKernel::SharedStorage s{group}_{term};")
+                if term:
+                    source, ldc, beta = f"out+{offset}", dest, "1.0f"
+                elif bias and broadcast:
+                    source = f"{broadcast[0][0]}+{bias['bias_offset']}"
+                    ldc, beta = 0, "1.0f"
+                else:
+                    source, ldc, beta = f"out+{offset}", dest, "0.0f"
+                mode = "kGemm" if shared else "kBatched"
+                batches = "1" if shared else "int(num_items)"
+                a_stride = 0 if shared else source_dim
+                b_stride = 0 if shared else meta["weight_numel"]
+                c_stride = dest if (not shared and term) else 0
+                d_stride = 0 if shared else dest
+                body.append(f"""{{
+    using Kernel = typename {gemm}::GemmKernel;
+    typename Kernel::Params p;
+    p.problem_size = {{int({rows}), {channels}, {spec['out_channels' if backward else 'in_channels']}}};
+    p.grid_tiled_shape = {{int({mtiles}), {ntiles}, {batches}}};
+    p.gemm_k_size = {spec['out_channels' if backward else 'in_channels']};
+    p.mode = cutlass::gemm::GemmUniversalMode::{mode};
+    p.batch_count = {batches};
+    p.params_A = typename Kernel::Mma::IteratorA::Params(cutlass::layout::RowMajor({source_dim}));
+    p.params_B = typename Kernel::Mma::IteratorB::Params(cutlass::layout::{'ColumnMajor' if backward else 'RowMajor'}({spec['out_channels']}));
+    p.params_C = typename Kernel::Epilogue::OutputTileIterator::Params(cutlass::layout::RowMajor({ldc}));
+    p.params_D = typename Kernel::Epilogue::OutputTileIterator::Params(cutlass::layout::RowMajor({dest}));
+    p.output_op = typename Kernel::EpilogueOutputOp::Params({float_literal(spec['path_weight'],meta['dtype'])}, {beta});
+    p.ptr_A = const_cast<Element*>({feature} + {spec['out_offset' if backward else 'x_offset']});
+    p.ptr_B = const_cast<Element*>({weight} + {spec['weight_offset']});
+    p.ptr_C = const_cast<Element*>({source});
+    p.ptr_D = out + {offset};
+    p.batch_stride_A = {a_stride};
+    p.batch_stride_B = {b_stride};
+    p.batch_stride_C = {c_stride};
+    p.batch_stride_D = {d_stride};
+    p.ptr_gather_A_indices = nullptr;
+    p.ptr_gather_B_indices = nullptr;
+    p.ptr_scatter_D_indices = nullptr;
+    Kernel kernel;
+    kernel.run_with_swizzle(p, shared_storage.s{group}_{term}, swizzle);
+    __syncthreads();
+}}""")
+                term += 1
+        # An output with no contraction is still written, including bias-only outputs.
+        if not term:
+            additions=[]
+            for b in (() if backward else meta["bias_specs"]):
+                if offset <= b["out_offset"] and b["out_offset"] + b["channels"] <= offset + channels * components:
+                    for (role,) in broadcast:
+                        additions.append(f"if(q>={b['out_offset']} && q<{b['out_offset']+b['channels']}) value+={role}[q-{b['out_offset']}+{b['bias_offset']}];")
+            body.append(f"""for (int i = threadIdx.x; i < {tile_m*tile_n}; i += 128) {{
+    const int64_t row = tile_m * {tile_m} + i / {tile_n};
+    const int column = tile_n * {tile_n} + i % {tile_n};
+    if (row < {rows} && column < {channels}) {{
+        const int64_t item = {'row/'+str(components) if shared else 'batch'};
+        const int q = {offset} + column * {components} + row % {components};
+        Element value = 0;
+{indent(chr(10).join(additions), '        ')}
+        out[item * {dest} + q] = value;
+    }}
+}}""")
+        dispatch.append(f"""if(task<cursor+({tasks})) {{
+    const int64_t local=task-cursor;
+    const int tile_n=local%{ntiles};
+    const int tile_m=(local/{ntiles})%{mtiles};
+    const int batch={'0' if shared else f'local/({ntiles}*{mtiles})'};
+    {name}_Swizzle swizzle;
+    swizzle.tile={{tile_m,tile_n,batch}};
+{indent(chr(10).join(body), '    ')}
+    return;
+}}
+cursor+=({tasks});""")
+    params = ', '.join(f'const Element* {r}' for r in roles)
+    feature_roles = {a for a, _ in pairs}
+    weight_roles = {b for _, b in pairs}
+    args = ', '.join(
+        f'{r}.data_ptr<Element>()+first_item*int64_t({source_dim if r in feature_roles else meta["weight_numel"] if r in weight_roles and not shared else 0})'
+        for r in roles
+    )
+    source = f"""
+#include <cutlass/gemm/device/gemm_universal.h>
+
+// Permute logical [item * component, channel] coordinates into e3nn storage.
+template <int Components> struct {name}_Layout {{
+    using Index = int32_t;
+    using LongIndex = int64_t;
+    Index stride;
+    CUTLASS_HOST_DEVICE {name}_Layout(cutlass::MatrixCoord, Index s) : stride(s) {{}}
+    CUTLASS_HOST_DEVICE {name}_Layout(cutlass::layout::PitchLinearCoord, Index s) : stride(s) {{}}
+    CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::MatrixCoord q) const {{
+        return LongIndex(q.row() / Components) * stride + LongIndex(q.column()) * Components + q.row() % Components;
+    }}
+    CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::layout::PitchLinearCoord q) const {{
+        return operator()(cutlass::MatrixCoord(q.strided(), q.contiguous()));
+    }}
+}};
+struct {name}_Swizzle : cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<> {{
+    cutlass::gemm::GemmCoord tile;
+    CUTLASS_DEVICE cutlass::gemm::GemmCoord get_tile_offset(int) const {{ return tile; }}
+}};
+template <int Components>
+using {name}_Gemm = cutlass::gemm::device::GemmUniversal<float, cutlass::layout::RowMajor, float, cutlass::layout::{'ColumnMajor' if backward else 'RowMajor'},
+    float, cutlass::layout::RowMajor, float, cutlass::arch::OpClassSimt, cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<{tile_m}, {tile_n}, 8>, cutlass::gemm::GemmShape<32, 32, 8>, cutlass::gemm::GemmShape<1, 1, 1>,
+    cutlass::epilogue::thread::LinearCombination<float, 1, float, float>, {name}_Swizzle, 2, 1, 1,
+    cutlass::arch::OpMultiplyAdd, cutlass::ComplexTransform::kNone, cutlass::ComplexTransform::kNone, false, false,
+    false, {name}_Layout<Components>, {name}_Layout<Components>>;
+// CUTLASS's PermuteD iterator permutes stores only. Read C with the same
+// AoS addressing when several paths or derivative terms share an output.
+template <typename Iterator, int Components> struct {name}_OutputIterator : Iterator {{
+    using ThreadMap = typename Iterator::ThreadMap;
+    using Fragment = typename Iterator::Fragment;
+    using Params = typename Iterator::Params;
+    Element* pointer;
+    int64_t stride;
+    CUTLASS_DEVICE {name}_OutputIterator(Params const& params, Element* p, cutlass::MatrixCoord extent, int thread,
+        cutlass::MatrixCoord offset = {{}}, int const* indices = nullptr)
+        : Iterator(params, p, extent, thread, offset, indices), pointer(p), stride(params.stride / sizeof(Element)) {{}}
+    CUTLASS_DEVICE void add_pointer_offset(int64_t offset) {{
+        Iterator::add_pointer_offset(offset);
+        pointer += offset;
+    }}
+    CUTLASS_DEVICE void load(Fragment& fragment) const {{
+        typename Iterator::Mask mask;
+        this->get_mask(mask);
+#pragma unroll
+        for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster; ++cluster) {{
+#pragma unroll
+            for (int group = 0; group < ThreadMap::Iterations::kGroup; ++group) {{
+#pragma unroll
+                for (int row = 0; row < ThreadMap::Iterations::kRow; ++row) {{
+                    const int r = this->thread_start_row() + row * ThreadMap::Delta::kRow +
+                                  group * ThreadMap::Delta::kGroup + cluster * ThreadMap::Delta::kCluster;
+                    const int fragment_row =
+                        row + ThreadMap::Iterations::kRow * (group + ThreadMap::Iterations::kGroup * cluster);
+#pragma unroll
+                    for (int column = 0; column < ThreadMap::Iterations::kColumn; ++column) {{
+                        const int c = this->thread_start_column() + column * ThreadMap::Delta::kColumn;
+                        Element value = 0;
+                        if (r < this->extent_row() && mask.predicates[column])
+                            value =
+                                pointer[int64_t(r / Components) * stride + int64_t(c) * Components + r % Components];
+                        fragment[fragment_row * ThreadMap::Iterations::kColumn + column] = value;
+                    }}
+                }}
+            }}
+        }}
+    }}
+}};
+template <int Components> struct {name}_Kernel {{
+    using DefaultKernel = typename {name}_Gemm<Components>::GemmKernel;
+    using DefaultEpilogue = typename DefaultKernel::Epilogue;
+    using Epilogue = cutlass::epilogue::threadblock::Epilogue<typename DefaultEpilogue::Shape,
+        typename DefaultEpilogue::WarpMmaOperator, DefaultEpilogue::kPartitionsK,
+        {name}_OutputIterator<typename DefaultEpilogue::OutputTileIterator, Components>,
+        typename DefaultEpilogue::AccumulatorFragmentIterator, typename DefaultEpilogue::WarpTileIterator,
+        typename DefaultEpilogue::SharedLoadIterator, typename DefaultEpilogue::OutputOp,
+        typename DefaultEpilogue::Padding>;
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<typename DefaultKernel::Mma, Epilogue, {name}_Swizzle>;
+}};
+__global__ void {name}({params}{',' if params else ''} Element* out, int64_t num_items) {{
+    union Storage {{
+{indent(chr(10).join(storage) if storage else 'float unused;', '        ')}
+    }};
+    __shared__ Storage shared_storage;
+    const int64_t task = blockIdx.x;
+    int64_t cursor = 0;
+{indent(chr(10).join(dispatch), '    ')}
+}}
+"""
+    total = '+'.join(f'({t})' for t in totals)
+    launch = f"""if (num_items > 0) {{
+    const int64_t total_items = num_items;
+    for (int64_t first_item = 0; first_item < total_items; first_item += {chunk_items}) {{
+        const int64_t num_items = std::min<int64_t>({chunk_items}, total_items - first_item);
+        {name}<<<{total}, 128, 0, stream>>>({args}{',' if args else ''}out.data_ptr<Element>() + first_item * int64_t({dest}), num_items);
+    }}
+}}"""
+    return dict(source=source, launch=launch)
+
+
+def make_forward_source(meta, program, *, arch):
     sources = []
     launches = []
     returns = []
@@ -431,16 +557,19 @@ __device__ __forceinline__ Index layout_batch(const ForwardLayout& layout,Index 
         phase = ('forward', 'backward', 'double_backward', 'triple_backward')[program['order']]
         kernel = f"linear_{phase}_{name}"
         broadcast = program["broadcast"].get(name, ())
-        if meta["shared_weights"] and meta["max_channels"] >= 32:
+        if meta["dtype"] is torch.float32:
+            emitted = make_cutlass_feature_kernel(meta, kernel, pairs, broadcast)
+        elif meta["shared_weights"] and meta["max_channels"] >= 32:
             emitted = make_tiled_feature_kernel(
-                meta, kernel, pairs, broadcast, arch=arch, layout=layout,
+                meta, kernel, pairs, broadcast, arch=arch,
             )
         else:
-            emitted = make_feature_kernel(meta, kernel, pairs, broadcast, layout=layout)
+            emitted = make_feature_kernel(meta, kernel, pairs, broadcast)
         shape = f"{{num_items,int64_t({meta['out_dim']})}}"
         sources.append(emitted["source"])
         launches.append(
-            f"auto result_{slot}=torch::empty({shape},options);\n{{auto out=result_{slot};\n{emitted['launch']}\n}}"
+            f"auto result_{slot}=torch::empty({shape},options);\n{{\n    auto out=result_{slot};\n"
+            + indent(emitted["launch"], "    ") + "\n}"
         )
         returns.append(f"pybind11::cast(result_{slot})")
 
@@ -455,63 +584,29 @@ __device__ __forceinline__ Index layout_batch(const ForwardLayout& layout,Index 
 #include <c10/cuda/CUDAException.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
-#include <cmath>{headers}
-using Element={scalar};{declarations}
+#include <cmath>
+using Element = {scalar};
+
 {kernels}
 """).format(
-        headers=headers,
         scalar=scalar,
-        declarations=declarations,
         kernels="\n".join(sources),
     )
     body = (r"""
-    const c10::cuda::CUDAGuard guard({first}.device());
-    auto options={first}.options();
-    cudaStream_t stream=at::cuda::getCurrentCUDAStream();
-    {launches}
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return pybind11::make_tuple({results});
+const c10::cuda::CUDAGuard guard({first}.device());
+auto options = {first}.options();
+cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+{launches}
+C10_CUDA_KERNEL_LAUNCH_CHECK();
+return pybind11::make_tuple({results});
 """).format(
         first=first,
         launches="\n".join(launches),
         results=','.join(returns),
     )
     parameters += ",int64_t num_items"
-    if not layout:
-        return (
-            prefix
-            + f"pybind11::tuple launch({parameters}) {{{body}}}\n"
-            + 'PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("launch",&launch);}\n'
-        )
-    source = prefix
-    launch_body = body.removesuffix("\n")
-    source += (r"""
-class RawLayoutLauncher {{
-    ForwardLayout layout_{{}};
-public:
-    explicit RawLayoutLauncher(const std::vector<int64_t>& values) {{
-        const int64_t rank=values[0];
-        layout_.rank=int(rank);
-        auto value=[&](int64_t index) {{
-            return Index(values[index]);
-        }};
-        for(int64_t axis=0;axis<rank;++axis) {{
-            layout_.sizes[axis]=value(1+axis); layout_.x_stride[axis]=value(1+rank+axis); layout_.w_stride[axis]=value(1+2*rank+axis);
-        }}
-        for(int j=0;j<2;++j) layout_.x_feature[j]=value(1+3*rank+j);
-        for(int j=0;j<3;++j) layout_.w_feature[j]=value(3+3*rank+j);
-        for(int j=0;j<2;++j) layout_.b_feature[j]=value(6+3*rank+j);
-    }}
-    pybind11::tuple launch({parameters}) {{{launch_body}
-    }}
-}};
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{
-    pybind11::class_<RawLayoutLauncher>(m,"RawLayoutLauncher",pybind11::module_local())
-        .def(pybind11::init<const std::vector<int64_t>&>()).def("launch",&RawLayoutLauncher::launch);
-}}
-""").format(
-        MAX_BATCH_RANK=MAX_BATCH_RANK,
-        parameters=parameters,
-        launch_body=launch_body,
+    return (
+        prefix
+        + f"pybind11::tuple launch({parameters}) {{\n" + indent(body.lstrip("\n"), "    ") + "}\n"
+        + 'PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {\n    m.def("launch",&launch);\n}\n'
     )
-    return source

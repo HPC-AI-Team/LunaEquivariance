@@ -1,6 +1,8 @@
 """CUDA computations for Activation triple backward."""
 
-from .utils import make_path_types, make_binding, get_kernel_config, launch_kernel
+from .utils import (
+    BINDING, MODULE_BINDING, make_path_types, make_binding, get_kernel_config, launch_kernel,
+)
 from .backward import BACKWARD_FUNCTIONS, BACKWARD_MATH
 from .double_backward import DOUBLE_BACKWARD_RESULT, DOUBLE_BACKWARD_MATH
 
@@ -193,25 +195,6 @@ void run_activation_triple_backward(
 }'''
 
 
-BINDING = r'''using Element={scalar};{layout_declarations}
-{declarations}
-{kernel_body}
-{result_type} launch({tensor_parameters},int64_t num_items) {{
-    c10::cuda::CUDAGuard guard({first}.device());
-    auto options={first}.options();
-    {allocations}
-    cudaStream_t stream=at::cuda::getCurrentCUDAStream();{layout_host}
-    {launch}
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {result_return};
-}}
-'''
-
-
-MODULE_BINDING = r'''PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("launch",&launch);}
-'''
-
-
 def required_inputs(paths, available):
     """Inputs for gradients with respect to x, grad_out, and rx, respectively."""
     if "bx" not in available and "bg" not in available:
@@ -281,10 +264,10 @@ def make_source(activation_paths, in_dim, config, *, tensor_only=False, fragment
     )
 
 
-def activation_triple_backward(features, grad_output, grad_grad_input, grad_input, grad_grad_output, paths, index_bits, kernel_cache, gate_layout, dtype, *, needs=None):
+def activation_triple_backward(features, grad_output, grad_grad_input, grad_input, grad_grad_output, paths, index_bits, kernel_cache, dtype, *, needs=None):
     inputs = features, grad_output, grad_grad_input, grad_input, grad_grad_output
     available = tuple(name for name, value in zip(("x", "grad_out", "rx", "bx", "bg"), inputs) if value is not None)
     config = get_kernel_config(
-        paths, 3, dtype, kernel_cache, needs=needs, available=available, gate_layout=gate_layout
+        paths, 3, dtype, kernel_cache, needs=needs, available=available
     )
-    return launch_kernel(inputs, config, paths, index_bits, kernel_cache, make_source, gate_layout)
+    return launch_kernel(inputs, config, paths, index_bits, kernel_cache, make_source)

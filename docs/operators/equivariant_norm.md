@@ -140,6 +140,15 @@ for mode in ("layer", "rms"):
     )
 ```
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: 2,083 atoms, 64 channels per degree, `Lmax=2–6`
+- Normalization: affine layer normalization
+
+![EquivariantNorm FP32 throughput and peak memory](../assets/performance/equ_norm.png)
+
 ## Limitations
 
 - FP32 and FP64; CPU and FP16/BF16 inputs fall back to PyTorch.

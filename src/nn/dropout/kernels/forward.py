@@ -168,14 +168,15 @@ Layout layout_for(const at::Tensor &x) {
 
 __device__ __forceinline__ void copy_for(int column,int64_t batch,
         int &group,int &component,int64_t &copy,int64_t &mask_copy) {
-    '''
-    source += '\n    '.join(
-        f"if(column>={feature_begin} && column<{feature_begin + mul * dim}) {{ group={group}; "
-        f"component=(column-{feature_begin})%{dim}; "
-        f"copy=batch*{mul}+(column-{feature_begin})/{dim}; "
-        f"mask_copy=batch*COPIES+{copy_begin}+(column-{feature_begin})/{dim}; "
-        f"return; "
-        f"}}"
+'''
+    source += '\n'.join(
+        f"    if(column>={feature_begin} && column<{feature_begin + mul * dim}) {{\n"
+        f"        group={group};\n"
+        f"        component=(column-{feature_begin})%{dim};\n"
+        f"        copy=batch*{mul}+(column-{feature_begin})/{dim};\n"
+        f"        mask_copy=batch*COPIES+{copy_begin}+(column-{feature_begin})/{dim};\n"
+        f"        return;\n"
+        f"    }}"
         for group, mul, dim, feature_begin, copy_begin in group_layout
         if mul
     )
