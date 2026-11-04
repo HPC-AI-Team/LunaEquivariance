@@ -4,23 +4,28 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import copy
-from functools import lru_cache
+from functools import lru_cache, partial
+from threading import RLock
 
 import torch
+from torch.utils._python_dispatch import _disable_current_modes
 
 from ..o3.irreps import Irreps
-from .utils.layout import TensorProductPaths, configure_indexing, prepare_indexing
-from .uuu.interface import lunatp_uuu_func, register_ops as register_uuu_ops
+from ..utils.operator_config import encode_config
+from .utils.layout import (
+    Instruction, TensorProductPaths, configure_indexing, prepare_indexing, compiled_config,
+)
+from .uuu.interface import lunatp_uuu_func
 from .uuu.kernels.utils import build_uuu_metadata
-from .uuu_conv.interface import lunatp_uuu_conv_func, register_ops as register_uuu_conv_ops
+from .uuu_conv.interface import lunatp_uuu_conv_func
 from .uuu_conv.kernels.utils import build_uuu_conv_metadata, configure_uuu_conv
-from .uvu.interface import lunatp_uvu_func, register_ops as register_uvu_ops
+from .uvu.interface import lunatp_uvu_func
 from .uvu.kernels.utils import build_uvu_metadata
-from .uvu_conv.interface import lunatp_uvu_conv_func, register_ops as register_uvu_conv_ops
+from .uvu_conv.interface import lunatp_uvu_conv_func
 from .uvu_conv.kernels.utils import build_uvu_conv_metadata, configure_uvu_conv
-from .uvw.interface import lunatp_uvw_func, register_ops as register_uvw_ops
+from .uvw.interface import lunatp_uvw_func
 from .uvw.kernels.utils import build_uvw_metadata
-from .uvw_conv.interface import lunatp_uvw_conv_func, register_ops as register_uvw_conv_ops
+from .uvw_conv.interface import lunatp_uvw_conv_func
 from .uvw_conv.kernels.utils import (
     FORWARD_SPLIT_CHANNELS, BACKWARD_NEIGHBOR_SPLITS,
     NODE_NEIGHBOR_SPLITS, reset_launch_caches, get_uvw_conv_backward_grid_tasks,
@@ -28,149 +33,64 @@ from .uvw_conv.kernels.utils import (
 )
 
 
-class LunaTPUUU:
-    prepare_indexing = prepare_indexing
-    register_ops = register_uuu_ops
-    run = staticmethod(lunatp_uuu_func)
-    index_bits = 32
-    compute_dtype = torch.float32
-
-    def __init__(self, tp, *, dtype=None, index_bits=32):
-        tp = TensorProductPaths.from_tensor_product(tp)
-        self.tp = tp
-        self.compute_dtype = tp.dtype if dtype is None else dtype
-        if self.compute_dtype not in (torch.float32, torch.float64):
-            raise ValueError("UUU supports float32 and float64 inputs")
-
-        self.meta = build_uuu_metadata(tp, self.compute_dtype)
-        self.weight_mode = self.meta["weight_mode"]
-        configure_indexing(self, self.meta, "uuu", index_bits)
-        self.kernels = {}
+BOUND_OPERATORS = {}
+OPERATOR_BINDING_LOCK = RLock()
 
 
-class LunaTPUVU:
-    prepare_indexing = prepare_indexing
-    register_ops = register_uvu_ops
-    run = staticmethod(lunatp_uvu_func)
-    index_bits = 32
-    compute_dtype = torch.float32
-
-    def __init__(self, tp, *, dtype=None, index_bits=32):
-        tp = TensorProductPaths.from_tensor_product(tp)
-        self.tp = tp
-        self.compute_dtype = tp.dtype if dtype is None else dtype
-        if self.compute_dtype not in (torch.float32, torch.float64):
-            raise ValueError("UVU supports float32 and float64 inputs")
-
-        self.meta = build_uvu_metadata(tp, self.compute_dtype)
-        self.weight_mode = self.meta["weight_mode"]
-        configure_indexing(self, self.meta, "uvu", index_bits)
-        self.kernels = {}
+@torch.compiler.assume_constant_result
+def register_ops(op):
+    """Bind a prepared configuration for model adapters that store an op name."""
+    operator_name = f"{op.index_mode}_forward"
+    key = operator_name, op._torch_config
+    with OPERATOR_BINDING_LOCK:
+        name = BOUND_OPERATORS.get(key)
+        if name is None:
+            name = f"_lunaeq_legacy_{len(BOUND_OPERATORS)}"
+            function = partial(getattr(torch.ops.lunatp, operator_name).default,
+                               config=op._torch_config)
+            function.default = function
+            setattr(torch.ops.lunatp, name, function)
+            BOUND_OPERATORS[key] = name
+        return name
 
 
-class LunaTPUVW:
-    prepare_indexing = prepare_indexing
-    register_ops = register_uvw_ops
-    run = staticmethod(lunatp_uvw_func)
-    index_bits = 32
-    compute_dtype = torch.float32
-
-    def __init__(self, tp, *, dtype=None, index_bits=32):
-        tp = TensorProductPaths.from_tensor_product(tp)
-        self.tp = tp
-        self.compute_dtype = tp.dtype if dtype is None else dtype
-        if self.compute_dtype not in (torch.float32, torch.float64):
-            raise ValueError(
-                f"UVW requires float32 or float64, got {self.compute_dtype}"
-            )
-
-        self.meta = build_uvw_metadata(tp, self.compute_dtype)
-        self.weight_mode = self.meta["weight_mode"]
-        configure_indexing(self, self.meta, "uvw", index_bits)
-        self.wide_forward = all(
-            spec["out_channels"] >= 128 for spec in self.meta["generated_specs"]
+def compiled_operator_config(op):
+    """Keep the full static layout in the graph; item counts and topology stay inputs."""
+    config = dict(
+        mode=op.index_mode, dtype=op.compute_dtype, index_bits=op.index_bits,
+        out_dim=op.meta["out_dim"], l0_dim=getattr(op, "l0_dim", 0),
+        weight_mode=getattr(op, "weight_mode", "external"),
+    )
+    if op.index_mode in ("uuu_conv", "uvu_conv"):
+        config["meta"] = op.meta
+    else:
+        tp = op.tp
+        config["paths"] = (
+            str(tp.irreps_in1), str(tp.irreps_in2), str(tp.irreps_out),
+            tuple(tuple(instruction) for instruction in tp.instructions),
+            tp.internal_weights, tp.shared_weights, tp.weight_numel,
         )
-        self.arch = None
-        self.arch_device = -1
-        self.kernels = {}
+    return encode_config(config)
 
 
-class LunaTPUUUConv:
-    prepare_indexing = prepare_indexing
-    register_ops = register_uuu_conv_ops
-    run = staticmethod(lunatp_uuu_conv_func)
-    mode = "uuu_conv"
-
-    def __init__(
-        self, meta: Mapping[str, object], *, dtype=torch.float32, index_bits=32
-    ):
-        if dtype not in (torch.float32, torch.float64):
-            raise ValueError("UUU convolution requires float32 or float64.")
-        configure_uuu_conv(self, meta, dtype, index_bits)
-
-
-class LunaTPUVUConv:
-    prepare_indexing = prepare_indexing
-    register_ops = register_uvu_conv_ops
-    run = staticmethod(lunatp_uvu_conv_func)
-    mode = "uvu_conv"
-
-    def __init__(
-        self,
-        meta: Mapping[str, object],
-        *,
-        dtype: torch.dtype = torch.float32,
-        index_bits=32,
-    ):
-        configure_uvu_conv(self, meta, dtype, index_bits)
-
-
-class LunaTPUVWConv:
-    prepare_indexing = prepare_indexing
-    register_ops = register_uvw_conv_ops
-    run = staticmethod(lunatp_uvw_conv_func)
-    mode = "uvw_conv"
-    index_bits = 32
-    compute_dtype = torch.float32
-
-    def __init__(self, official_tp, *, dtype=None, index_bits=32):
-        official_tp = TensorProductPaths.from_tensor_product(official_tp)
-        self.tp = official_tp
-        self.compute_dtype = official_tp.dtype if dtype is None else dtype
-        if self.compute_dtype not in (torch.float32, torch.float64):
-            raise ValueError(
-                f"UVW convolution requires float32 or float64, got {self.compute_dtype}"
-            )
-        self.dtype_tag = "fp64" if self.compute_dtype == torch.float64 else "fp32"
-        self.arch = None
-        self.arch_device = -1
-
-        self.meta = build_uvw_metadata(official_tp, self.compute_dtype)
-        self.weight_mode = self.meta["weight_mode"]
-        configure_indexing(self, self.meta, "uvw_conv", index_bits)
-        if self.weight_mode != "shared":
-            # Node partitions can exhaust the launch grid before feature offsets.
-            specs = self.meta["generated_specs"]
-            tile_n = 32
-            groups = {}
-            for spec in specs:
-                key = (spec["out_offset"], spec["out_channels"], spec["d3"])
-                groups[key] = max(groups.get(key, 0), spec["path_channels"])
-            forward_tasks = NODE_NEIGHBOR_SPLITS * sum(
-                ((channels + tile_n - 1) // tile_n)
-                * ((paths + FORWARD_SPLIT_CHANNELS - 1) // FORWARD_SPLIT_CHANNELS)
-                for (_, channels, _), paths in groups.items()
-            )
-            node_tasks = max(forward_tasks, get_uvw_conv_backward_grid_tasks(self.meta), 1)
-            edge_tasks = get_uvw_conv_tr_grid_tasks(self.meta)
-            self.index_edge_limit = min(self.index_edge_limit, ((1 << 31) - 1) // edge_tasks)
-            self.index_node_limit = min(self.index_node_limit, ((1 << 31) - 1) // node_tasks)
-            self.wide_node_limit = min(self.wide_node_limit, ((1 << 63) - 1024) // node_tasks)
-            self.wide_edge_limit = min(
-                self.wide_edge_limit,
-                ((1 << 63) - 1024) // max(edge_tasks, NODE_NEIGHBOR_SPLITS, BACKWARD_NEIGHBOR_SPLITS),
-            )
-        reset_launch_caches(self)
+@lru_cache(maxsize=128)
+def restore_compiled_operator(config):
+    settings = compiled_config(config)
+    mode, dtype, bits = settings["mode"], settings["dtype"], settings["index_bits"]
+    with _disable_current_modes():
+        if mode in ("uuu_conv", "uvu_conv"):
+            operator = LunaTPUUUConv if mode == "uuu_conv" else LunaTPUVUConv
+            return operator(settings["meta"], dtype=dtype, index_bits=bits)
+        in1, in2, out, instructions, internal, shared, weights = settings["paths"]
+        # Paths are already normalized; restore attributes without normalizing twice.
+        paths = TensorProductPaths.__new__(TensorProductPaths)
+        paths.irreps_in1, paths.irreps_in2, paths.irreps_out = Irreps(in1), Irreps(in2), Irreps(out)
+        paths.instructions = tuple(Instruction(*instruction) for instruction in instructions)
+        paths.internal_weights, paths.shared_weights = internal, shared
+        paths.weight_numel, paths.dtype = weights, dtype
+        operator = {"uuu": LunaTPUUU, "uvu": LunaTPUVU, "uvw": LunaTPUVW,
+                    "uvw_conv": LunaTPUVWConv}[mode]
+        return operator(paths, dtype=dtype, index_bits=bits)
 
 
 def create_uuu_conv_operator(official_tp_or_meta, *, dtype=None):
@@ -343,3 +263,154 @@ def tensor_product_conv(
 
 
 __all__ = ["tensor_product", "tensor_product_conv", "prepare_tensor_product"]
+
+
+class LunaTPUUU:
+    register_ops = register_ops
+    prepare_indexing = prepare_indexing
+    run = staticmethod(lunatp_uuu_func)
+    index_bits = 32
+    compute_dtype = torch.float32
+
+    def __init__(self, tp, *, dtype=None, index_bits=32):
+        tp = TensorProductPaths.from_tensor_product(tp)
+        self.tp = tp
+        self.compute_dtype = tp.dtype if dtype is None else dtype
+        if self.compute_dtype not in (torch.float32, torch.float64):
+            raise ValueError("UUU supports float32 and float64 inputs")
+
+        self.meta = build_uuu_metadata(tp, self.compute_dtype)
+        self.weight_mode = self.meta["weight_mode"]
+        configure_indexing(self, self.meta, "uuu", index_bits)
+        self.kernels = {}
+        self._torch_config = compiled_operator_config(self)
+
+
+class LunaTPUVU:
+    register_ops = register_ops
+    prepare_indexing = prepare_indexing
+    run = staticmethod(lunatp_uvu_func)
+    index_bits = 32
+    compute_dtype = torch.float32
+
+    def __init__(self, tp, *, dtype=None, index_bits=32):
+        tp = TensorProductPaths.from_tensor_product(tp)
+        self.tp = tp
+        self.compute_dtype = tp.dtype if dtype is None else dtype
+        if self.compute_dtype not in (torch.float32, torch.float64):
+            raise ValueError("UVU supports float32 and float64 inputs")
+
+        self.meta = build_uvu_metadata(tp, self.compute_dtype)
+        self.weight_mode = self.meta["weight_mode"]
+        configure_indexing(self, self.meta, "uvu", index_bits)
+        self.kernels = {}
+        self._torch_config = compiled_operator_config(self)
+
+
+class LunaTPUVW:
+    register_ops = register_ops
+    prepare_indexing = prepare_indexing
+    run = staticmethod(lunatp_uvw_func)
+    index_bits = 32
+    compute_dtype = torch.float32
+
+    def __init__(self, tp, *, dtype=None, index_bits=32):
+        tp = TensorProductPaths.from_tensor_product(tp)
+        self.tp = tp
+        self.compute_dtype = tp.dtype if dtype is None else dtype
+        if self.compute_dtype not in (torch.float32, torch.float64):
+            raise ValueError(
+                f"UVW requires float32 or float64, got {self.compute_dtype}"
+            )
+
+        self.meta = build_uvw_metadata(tp, self.compute_dtype)
+        self.weight_mode = self.meta["weight_mode"]
+        configure_indexing(self, self.meta, "uvw", index_bits)
+        self.wide_forward = all(
+            spec["out_channels"] >= 128 for spec in self.meta["generated_specs"]
+        )
+        self.arch = None
+        self.arch_device = -1
+        self.kernels = {}
+        self._torch_config = compiled_operator_config(self)
+
+
+class LunaTPUUUConv:
+    register_ops = register_ops
+    prepare_indexing = prepare_indexing
+    run = staticmethod(lunatp_uuu_conv_func)
+    mode = "uuu_conv"
+
+    def __init__(
+        self, meta: Mapping[str, object], *, dtype=torch.float32, index_bits=32
+    ):
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError("UUU convolution requires float32 or float64.")
+        configure_uuu_conv(self, meta, dtype, index_bits)
+        self._torch_config = compiled_operator_config(self)
+
+
+class LunaTPUVUConv:
+    register_ops = register_ops
+    prepare_indexing = prepare_indexing
+    run = staticmethod(lunatp_uvu_conv_func)
+    mode = "uvu_conv"
+
+    def __init__(
+        self,
+        meta: Mapping[str, object],
+        *,
+        dtype: torch.dtype = torch.float32,
+        index_bits=32,
+    ):
+        configure_uvu_conv(self, meta, dtype, index_bits)
+        self._torch_config = compiled_operator_config(self)
+
+
+class LunaTPUVWConv:
+    register_ops = register_ops
+    prepare_indexing = prepare_indexing
+    run = staticmethod(lunatp_uvw_conv_func)
+    mode = "uvw_conv"
+    index_bits = 32
+    compute_dtype = torch.float32
+
+    def __init__(self, official_tp, *, dtype=None, index_bits=32):
+        official_tp = TensorProductPaths.from_tensor_product(official_tp)
+        self.tp = official_tp
+        self.compute_dtype = official_tp.dtype if dtype is None else dtype
+        if self.compute_dtype not in (torch.float32, torch.float64):
+            raise ValueError(
+                f"UVW convolution requires float32 or float64, got {self.compute_dtype}"
+            )
+        self.dtype_tag = "fp64" if self.compute_dtype == torch.float64 else "fp32"
+        self.arch = None
+        self.arch_device = -1
+
+        self.meta = build_uvw_metadata(official_tp, self.compute_dtype)
+        self.weight_mode = self.meta["weight_mode"]
+        configure_indexing(self, self.meta, "uvw_conv", index_bits)
+        if self.weight_mode != "shared":
+            # Node partitions can exhaust the launch grid before feature offsets.
+            specs = self.meta["generated_specs"]
+            tile_n = 32
+            groups = {}
+            for spec in specs:
+                key = (spec["out_offset"], spec["out_channels"], spec["d3"])
+                groups[key] = max(groups.get(key, 0), spec["path_channels"])
+            forward_tasks = NODE_NEIGHBOR_SPLITS * sum(
+                ((channels + tile_n - 1) // tile_n)
+                * ((paths + FORWARD_SPLIT_CHANNELS - 1) // FORWARD_SPLIT_CHANNELS)
+                for (_, channels, _), paths in groups.items()
+            )
+            node_tasks = max(forward_tasks, get_uvw_conv_backward_grid_tasks(self.meta), 1)
+            edge_tasks = get_uvw_conv_tr_grid_tasks(self.meta)
+            self.index_edge_limit = min(self.index_edge_limit, ((1 << 31) - 1) // edge_tasks)
+            self.index_node_limit = min(self.index_node_limit, ((1 << 31) - 1) // node_tasks)
+            self.wide_node_limit = min(self.wide_node_limit, ((1 << 63) - 1024) // node_tasks)
+            self.wide_edge_limit = min(
+                self.wide_edge_limit,
+                ((1 << 63) - 1024) // max(edge_tasks, NODE_NEIGHBOR_SPLITS, BACKWARD_NEIGHBOR_SPLITS),
+            )
+        reset_launch_caches(self)
+        self._torch_config = compiled_operator_config(self)

@@ -8,10 +8,10 @@ High-performance SO(3)-equivariant operators for graph neural networks.
 
 ## Features
 
-- **Performance:** order-of-magnitude speedups across a range of operators.
+- **Performance:** order-of-magnitude speedups (peaking at over 1000×, with 500× memory reduction).
 - **Operator coverage:** equivariant layers, fused graph convolutions and attention.
 - **Differentiation and precision:** derivatives up to third order, with FP32/FP64 support.
-- **PyTorch integration:** easy integration into PyTorch models, with `torch.compile` support.
+- **PyTorch integration:** easy integration into PyTorch models, with `torch.compile` and `AOTInductor` support.
 
 ## Installation and user guides
 
@@ -27,7 +27,7 @@ See the [documentation](https://hpc-ai-team.github.io/LunaEquivariance/) for ins
 
 | Category | Operators |
 |---|---|
-| Tensor products | [`TensorProduct`](https://hpc-ai-team.github.io/LunaEquivariance/operators/tensor_product.html), [`TensorProductConv`](https://hpc-ai-team.github.io/LunaEquivariance/operators/tensor_product_conv.html) |
+| Tensor products | [`TensorProduct`](https://hpc-ai-team.github.io/LunaEquivariance/operators/tensor_product.html), [`TensorProductConv`](https://hpc-ai-team.github.io/LunaEquivariance/operators/tensor_product_conv.html), [`o3.SymmetricContraction`](https://hpc-ai-team.github.io/LunaEquivariance/operators/symmetric_contraction.html) |
 | Geometry and linear layers | [`o3.SphericalHarmonics`](https://hpc-ai-team.github.io/LunaEquivariance/operators/spherical_harmonics.html), [`o3.Linear`](https://hpc-ai-team.github.io/LunaEquivariance/operators/linear.html), [`o3.Norm`](https://hpc-ai-team.github.io/LunaEquivariance/operators/norm.html) |
 | Activations and regularization | [`nn.Activation`](https://hpc-ai-team.github.io/LunaEquivariance/operators/activation.html), [`nn.Gate`](https://hpc-ai-team.github.io/LunaEquivariance/operators/gate.html), [`nn.NormActivation`](https://hpc-ai-team.github.io/LunaEquivariance/operators/norm_activation.html), [`nn.Dropout`](https://hpc-ai-team.github.io/LunaEquivariance/operators/dropout.html) |
 | Normalization | [`nn.EquivariantNorm`](https://hpc-ai-team.github.io/LunaEquivariance/operators/equivariant_norm.html), [`nn.GraphSoftmax`](https://hpc-ai-team.github.io/LunaEquivariance/operators/graph_softmax.html) |

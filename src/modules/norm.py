@@ -16,7 +16,7 @@ from ..o3.norm.interface import (
     IRREPS_MISSING,
     build_norm_metadata,
     norm,
-    register_ops,
+    norm_operator_config,
 )
 from ..o3.norm.kernels.utils import NormKernels, SUPPORTED_DTYPES
 from ..o3.norm.state import TensorProductState
@@ -124,8 +124,10 @@ class LunaEqNorm(torch.nn.Module):
 
     def forward(self, features):
         if torch.compiler.is_compiling() and features.is_cuda and features.dtype in (torch.float32, torch.float64):
-            name = register_ops(self.compile_irreps, bool(self.squared), 32, features.dtype)
-            return getattr(torch.ops.lunaeq, name).default(features)
+            descriptor = norm_operator_config(
+                self.compile_irreps, bool(self.squared), 32, features.dtype,
+            )
+            return torch.ops.lunaeq.norm_forward.default(features, descriptor)
         config = self.active_config
         if config is None or config.compute_dtype != features.dtype or config.meta["squared"] != bool(self.squared):
             config = self.specialize(features.dtype)

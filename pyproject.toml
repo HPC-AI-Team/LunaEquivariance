@@ -85,6 +85,8 @@ packages = [
     "LunaEquivariance.o3.norm.kernels",
     "LunaEquivariance.o3.spherical_harmonics",
     "LunaEquivariance.o3.spherical_harmonics.kernels",
+    "LunaEquivariance.o3.symmetric_contraction",
+    "LunaEquivariance.o3.symmetric_contraction.kernels",
     "LunaEquivariance.utils",
 ]
 include-package-data = false

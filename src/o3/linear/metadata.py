@@ -240,10 +240,10 @@ class LinearKernelConfig:
         )
 
     @torch.compiler.assume_constant_result
-    def register_ops(self, dtype):
-        from .interface import register_ops
+    def compiled_config(self, dtype):
+        from .interface import linear_operator_config
 
-        return register_ops(self.layout_key, dtype)
+        return linear_operator_config(self.layout_key, dtype)
 
 
 @lru_cache(maxsize=128)

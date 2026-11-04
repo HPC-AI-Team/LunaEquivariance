@@ -12,6 +12,7 @@ except ModuleNotFoundError as error:
     Activation = None
 
 from ..nn.activation.interface import _IRREPS_MISSING, activation
+from ..utils.operator_config import encode_config
 from ..nn.activation.kernels.utils import parse_activation, parse_activation_paths
 from ..o3.irreps import PublicIrreps as Irreps
 
@@ -56,6 +57,7 @@ class LunaEqActivation(torch.nn.Module):
         self.irreps_in, self.irreps_out = Irreps(str(official.irreps_in)), Irreps(str(official.irreps_out))
         self.in_dim, self.out_dim = self.irreps_in.dim, self.irreps_out.dim
         self.activation_paths = parse_activation_paths(official, parsed)
+        self.operator_config = encode_config((self.activation_paths, 32))
         self.kernel_cache = OrderedDict()
         object.__setattr__(self, "last_execution_backend", None)
         self._device_marker = torch.empty(0, dtype=self.compute_dtype)
@@ -83,7 +85,7 @@ class LunaEqActivation(torch.nn.Module):
         object.__setattr__(self, "last_execution_backend", backend)
         return activation(
             features, dim=dim, paths=self.activation_paths,
-            kernel_cache=self.kernel_cache,
+            kernel_cache=self.kernel_cache, operator_config=self.operator_config,
         )
 
 

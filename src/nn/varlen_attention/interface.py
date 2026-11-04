@@ -6,17 +6,190 @@ from ...utils import is_compiling
 from .kernels import backward, double_backward, forward, triple_backward
 
 
-def varlen_attention(
-    q,
-    k,
-    v,
-    csr,
-    *,
-    num_heads=1,
-    bias=None,
-    softmax_scale=None,
-    causal=False,
+def attention_config(q, v, bias, softmax_scale, causal):
+    dim, value_dim, heads = q.shape[2], v.shape[2], q.shape[1]
+    scale = dim**-0.5 if softmax_scale is None else softmax_scale
+    return (dim, value_dim, heads, scale, causal, 0 if bias is None else 1 if bias.ndim == 2 else 2)
+
+
+@torch.library.custom_op(
+    "lunaeq::attention_forward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor csr, "
+        "float? scale, bool causal) -> (Tensor, Tensor)"
+    ),
+)
+def attention_forward(q, k, v, bias, csr, scale, causal):
+    config = attention_config(q, v, bias, scale, causal)
+    return forward.attention_forward((q, k, v, bias, None), csr, config)
+
+
+@attention_forward.register_fake
+def attention_forward_fake(q, k, v, bias, csr, scale, causal):
+    return (
+        torch.empty_like(v, memory_format=torch.contiguous_format),
+        v.new_empty((*v.shape[:2], 2), dtype=torch.float32),
+    )
+
+
+@torch.library.custom_op(
+    "lunaeq::attention_backward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor g, "
+        "Tensor csr, Tensor state, float? scale, bool causal, "
+        "bool[] needs, Tensor output) -> (Tensor?, Tensor?, Tensor?, Tensor?)"
+    ),
+)
+def attention_backward(q, k, v, bias, g, csr, state, scale, causal, needs, output):
+    config = attention_config(q, v, bias, scale, causal)
+    return backward.attention_backward((q, k, v, bias, g), csr, state, config, needs, output)
+
+
+@attention_backward.register_fake
+def attention_backward_fake(q, k, v, bias, g, csr, state, scale, causal, needs, output):
+    return tuple(
+        (
+            torch.empty_like(value, memory_format=torch.contiguous_format)
+            if need and value is not None
+            else None
+        )
+        for value, need in zip((q, k, v, bias), needs)
+    )
+
+
+@torch.library.custom_op(
+    "lunaeq::attention_double_backward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor g, "
+        "Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, "
+        "Tensor csr, Tensor state, float? scale, bool causal, bool[] needs) "
+        "-> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
+    ),
+)
+def attention_double_backward(q, k, v, bias, g, rq, rk, rv, rb, csr, state, scale, causal, needs):
+    config = attention_config(q, v, bias, scale, causal)
+    return double_backward.attention_double_backward(
+        (q, k, v, bias, g, rq, rk, rv, rb), csr, state, config, needs
+    )
+
+
+@attention_double_backward.register_fake
+def attention_double_backward_fake(q, k, v, bias, g, rq, rk, rv, rb, csr, state, scale, causal, needs):
+    return tuple(
+        (
+            torch.empty_like(value, memory_format=torch.contiguous_format)
+            if need and value is not None
+            else None
+        )
+        for value, need in zip((q, k, v, bias, g), needs)
+    )
+
+
+@torch.library.custom_op(
+    "lunaeq::attention_triple_backward",
+    mutates_args=(),
+    schema=(
+        "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor g, "
+        "Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, "
+        "Tensor? sq, Tensor? sk, Tensor? sv, Tensor? sb, Tensor? sg, "
+        "Tensor csr, Tensor state, float? scale, bool causal, bool[] needs) "
+        "-> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
+    ),
+)
+def attention_triple_backward(
+    q, k, v, bias, g, rq, rk, rv, rb, sq, sk, sv, sb, sg, csr, state, scale, causal, needs
 ):
+    config = attention_config(q, v, bias, scale, causal)
+    return triple_backward.attention_triple_backward(
+        (q, k, v, bias, g, rq, rk, rv, rb, sq, sk, sv, sb, sg), csr, state, config, needs
+    )
+
+
+@attention_triple_backward.register_fake
+def attention_triple_backward_fake(
+    q, k, v, bias, g, rq, rk, rv, rb, sq, sk, sv, sb, sg, csr, state, scale, causal, needs
+):
+    return tuple(
+        (
+            torch.empty_like(value, memory_format=torch.contiguous_format)
+            if need and value is not None
+            else None
+        )
+        for value, need in zip((q, k, v, bias, g, rq, rk, rv, rb), needs)
+    )
+
+
+def attention_forward_setup(ctx, inputs, output):
+    ctx.config = inputs[5:]
+    q, k, v, bias, csr = inputs[:5]
+    ctx.save_for_backward(q, k, v, bias, csr, output[1], output[0])
+    ctx.mark_non_differentiable(output[1])
+    ctx.set_materialize_grads(False)
+
+
+def attention_forward_backward(ctx, g, unused_state):
+    if g is None:
+        return (None,) * 7
+    q, k, v, bias, csr, state, output = ctx.saved_tensors
+    gradients = attention_backward(
+        q, k, v, bias, g, csr, state, *ctx.config, list(ctx.needs_input_grad[:4]), output
+    )
+    return *gradients, None, None, None
+
+
+def attention_backward_setup(ctx, inputs, output):
+    ctx.config = inputs[7:9]
+    ctx.save_for_backward(*inputs[:7])
+    ctx.set_materialize_grads(False)
+
+
+def attention_backward_backward(ctx, rq, rk, rv, rb):
+    if all(value is None for value in (rq, rk, rv, rb)):
+        return (None,) * 11
+    q, k, v, bias, g, csr, state = ctx.saved_tensors
+    gradients = attention_double_backward(
+        q, k, v, bias, g, rq, rk, rv, rb, csr, state, *ctx.config, list(ctx.needs_input_grad[:5])
+    )
+    return *gradients, None, None, None, None, None, None
+
+
+def attention_double_backward_setup(ctx, inputs, output):
+    ctx.config = inputs[11:13]
+    ctx.save_for_backward(*inputs[:11])
+    ctx.set_materialize_grads(False)
+
+
+def attention_double_backward_backward(ctx, sq, sk, sv, sb, sg):
+    if all(value is None for value in (sq, sk, sv, sb, sg)):
+        return (None,) * 14
+    q, k, v, bias, g, rq, rk, rv, rb, csr, state = ctx.saved_tensors
+    gradients = attention_triple_backward(
+        q,
+        k,
+        v,
+        bias,
+        g,
+        rq,
+        rk,
+        rv,
+        rb,
+        sq,
+        sk,
+        sv,
+        sb,
+        sg,
+        csr,
+        state,
+        *ctx.config,
+        list(ctx.needs_input_grad[:9]),
+    )
+    return *gradients, None, None, None, None, None
+
+
+def varlen_attention(q, k, v, csr, *, num_heads=1, bias=None, softmax_scale=None, causal=False):
     """Attend within each CSR sequence; output has the same shape as v.
 
     q/k/v accept [edges, heads * dim] or [edges, heads, dim]. Already split
@@ -70,9 +243,7 @@ def varlen_attention(
         raise ValueError("csr must be a 1D int32/int64 tensor.")
     edges = q.shape[0]
     if csr.numel() < 1 or edges > 2**31 - 1 or csr.numel() > 2**31 - 1:
-        raise ValueError(
-            "CSR must contain its initial offset; row counts must fit int32."
-        )
+        raise ValueError("CSR must contain its initial offset; row counts must fit int32.")
     sequences = csr.numel() - 1
     if edges and not sequences:
         raise ValueError("Nonempty edge input needs at least one CSR sequence.")
@@ -88,13 +259,9 @@ def varlen_attention(
         ):
             kind = 2
         else:
-            raise ValueError(
-                "bias must be [all_edge, heads] or [sequences, heads, max_length, max_length]."
-            )
+            raise ValueError("bias must be [all_edge, heads] or [sequences, heads, max_length, max_length].")
     if is_compiling():
-        output, _ = attention_forward(
-            q, k, v, bias, csr, softmax_scale, causal
-        )
+        output, _ = attention_forward(q, k, v, bias, csr, softmax_scale, causal)
     else:
         dim, value_dim = q.shape[2], v.shape[2]
         scale = dim**-0.5 if softmax_scale is None else float(softmax_scale)
@@ -106,9 +273,7 @@ def varlen_attention(
 class VarlenAttentionForward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, config, csr, q, k, v, bias):
-        output, state = forward.attention_forward(
-            (q, k, v, bias, None), csr, config
-        )
+        output, state = forward.attention_forward((q, k, v, bias, None), csr, config)
         ctx.config = config
         ctx.save_for_backward(q, k, v, bias, csr, state, output)
         ctx.set_materialize_grads(False)
@@ -121,25 +286,11 @@ class VarlenAttentionForward(torch.autograd.Function):
         q, k, v, bias, csr, state, output = ctx.saved_tensors
         if not torch.is_grad_enabled():
             gradients = backward.attention_backward(
-                (q, k, v, bias, g),
-                csr,
-                state,
-                ctx.config,
-                ctx.needs_input_grad[2:6],
-                output,
+                (q, k, v, bias, g), csr, state, ctx.config, ctx.needs_input_grad[2:6], output
             )
             return None, None, *gradients
         gradients = VarlenAttentionBackward.apply(
-            ctx.config,
-            ctx.needs_input_grad[2:6],
-            csr,
-            state,
-            q,
-            k,
-            v,
-            bias,
-            g,
-            output,
+            ctx.config, ctx.needs_input_grad[2:6], csr, state, q, k, v, bias, g, output
         )
         return None, None, *gradients
 
@@ -157,19 +308,7 @@ class VarlenAttentionBackward(torch.autograd.Function):
     def backward(ctx, rq, rk, rv, rb):
         q, k, v, bias, g, csr, state = ctx.saved_tensors
         result = VarlenAttentionDoubleBackward.apply(
-            ctx.config,
-            ctx.needs_input_grad[4:9],
-            csr,
-            state,
-            q,
-            k,
-            v,
-            bias,
-            g,
-            rq,
-            rk,
-            rv,
-            rb,
+            ctx.config, ctx.needs_input_grad[4:9], csr, state, q, k, v, bias, g, rq, rk, rv, rb
         )
         return (None,) * 4 + result + (None,)
 
@@ -181,9 +320,7 @@ class VarlenAttentionDoubleBackward(torch.autograd.Function):
         ctx.config = config
         ctx.save_for_backward(*inputs, csr, state)
         ctx.set_materialize_grads(False)
-        return double_backward.attention_double_backward(
-            inputs, csr, state, config, needs
-        )
+        return double_backward.attention_double_backward(inputs, csr, state, config, needs)
 
     @staticmethod
     def backward(ctx, sq, sk, sv, sb, sg):
@@ -191,198 +328,17 @@ class VarlenAttentionDoubleBackward(torch.autograd.Function):
         inputs = saved[:9]
         csr, state = saved[9:]
         result = triple_backward.attention_triple_backward(
-            (*inputs, sq, sk, sv, sb, sg),
-            csr,
-            state,
-            ctx.config,
-            ctx.needs_input_grad[4:13],
+            (*inputs, sq, sk, sv, sb, sg), csr, state, ctx.config, ctx.needs_input_grad[4:13]
         )
         return (None,) * 4 + result
 
 
-def attention_config(q, v, bias, softmax_scale, causal):
-    dim, value_dim, heads = q.shape[2], v.shape[2], q.shape[1]
-    scale = dim**-0.5 if softmax_scale is None else softmax_scale
-    return (
-        dim, value_dim, heads, scale, causal,
-        0 if bias is None else 1 if bias.ndim == 2 else 2,
-    )
+attention_forward.register_autograd(attention_forward_backward, setup_context=attention_forward_setup)
 
 
-def register_ops():
-    @torch.library.custom_op(
-        "lunaeq::attention_forward",
-        mutates_args=(),
-        schema=(
-            "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor csr, "
-            "float? scale, bool causal) -> (Tensor, Tensor)"
-        ),
-    )
-    def attention_forward(q, k, v, bias, csr, scale, causal):
-        config = attention_config(q, v, bias, scale, causal)
-        return forward.attention_forward((q, k, v, bias, None), csr, config)
-
-    @attention_forward.register_fake
-    def attention_forward_fake(q, k, v, bias, csr, scale, causal):
-        return (
-            torch.empty_like(v, memory_format=torch.contiguous_format),
-            v.new_empty((*v.shape[:2], 2), dtype=torch.float32),
-        )
-
-    @torch.library.custom_op(
-        "lunaeq::attention_backward",
-        mutates_args=(),
-        schema=(
-            "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor g, "
-            "Tensor csr, Tensor state, float? scale, bool causal, "
-            "bool[] needs, Tensor output) -> (Tensor?, Tensor?, Tensor?, Tensor?)"
-        ),
-    )
-    def attention_backward(q, k, v, bias, g, csr, state, scale, causal, needs, output):
-        config = attention_config(q, v, bias, scale, causal)
-        return backward.attention_backward(
-            (q, k, v, bias, g), csr, state, config, needs, output
-        )
-
-    @attention_backward.register_fake
-    def attention_backward_fake(
-        q, k, v, bias, g, csr, state, scale, causal, needs, output
-    ):
-        return tuple(
-            torch.empty_like(value, memory_format=torch.contiguous_format)
-            if need and value is not None else None
-            for value, need in zip((q, k, v, bias), needs)
-        )
-
-    @torch.library.custom_op(
-        "lunaeq::attention_double_backward",
-        mutates_args=(),
-        schema=(
-            "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor g, "
-            "Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, "
-            "Tensor csr, Tensor state, float? scale, bool causal, bool[] needs) "
-            "-> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
-        ),
-    )
-    def attention_double_backward(
-        q, k, v, bias, g, rq, rk, rv, rb,
-        csr, state, scale, causal, needs,
-    ):
-        config = attention_config(q, v, bias, scale, causal)
-        return double_backward.attention_double_backward(
-            (q, k, v, bias, g, rq, rk, rv, rb), csr, state, config, needs
-        )
-
-    @attention_double_backward.register_fake
-    def attention_double_backward_fake(
-        q, k, v, bias, g, rq, rk, rv, rb,
-        csr, state, scale, causal, needs,
-    ):
-        return tuple(
-            torch.empty_like(value, memory_format=torch.contiguous_format)
-            if need and value is not None else None
-            for value, need in zip((q, k, v, bias, g), needs)
-        )
-
-    @torch.library.custom_op(
-        "lunaeq::attention_triple_backward",
-        mutates_args=(),
-        schema=(
-            "(Tensor q, Tensor k, Tensor v, Tensor? bias, Tensor g, "
-            "Tensor? rq, Tensor? rk, Tensor? rv, Tensor? rb, "
-            "Tensor? sq, Tensor? sk, Tensor? sv, Tensor? sb, Tensor? sg, "
-            "Tensor csr, Tensor state, float? scale, bool causal, bool[] needs) "
-            "-> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)"
-        ),
-    )
-    def attention_triple_backward(
-        q, k, v, bias, g, rq, rk, rv, rb, sq, sk, sv, sb, sg,
-        csr, state, scale, causal, needs,
-    ):
-        config = attention_config(q, v, bias, scale, causal)
-        return triple_backward.attention_triple_backward(
-            (q, k, v, bias, g, rq, rk, rv, rb, sq, sk, sv, sb, sg),
-            csr,
-            state,
-            config,
-            needs,
-        )
-
-    @attention_triple_backward.register_fake
-    def attention_triple_backward_fake(
-        q, k, v, bias, g, rq, rk, rv, rb, sq, sk, sv, sb, sg,
-        csr, state, scale, causal, needs,
-    ):
-        return tuple(
-            torch.empty_like(value, memory_format=torch.contiguous_format)
-            if need and value is not None else None
-            for value, need in zip((q, k, v, bias, g, rq, rk, rv, rb), needs)
-        )
-
-    def attention_forward_setup(ctx, inputs, output):
-        ctx.config = inputs[5:]
-        q, k, v, bias, csr = inputs[:5]
-        ctx.save_for_backward(q, k, v, bias, csr, output[1], output[0])
-        ctx.mark_non_differentiable(output[1])
-        ctx.set_materialize_grads(False)
-
-    def attention_forward_backward(ctx, g, unused_state):
-        if g is None:
-            return (None,) * 7
-        q, k, v, bias, csr, state, output = ctx.saved_tensors
-        gradients = attention_backward(
-            q, k, v, bias, g, csr, state,
-            *ctx.config, list(ctx.needs_input_grad[:4]), output,
-        )
-        return *gradients, None, None, None
-
-    def attention_backward_setup(ctx, inputs, output):
-        ctx.config = inputs[7:9]
-        ctx.save_for_backward(*inputs[:7])
-        ctx.set_materialize_grads(False)
-
-    def attention_backward_backward(ctx, rq, rk, rv, rb):
-        if all(value is None for value in (rq, rk, rv, rb)):
-            return (None,) * 11
-        q, k, v, bias, g, csr, state = ctx.saved_tensors
-        gradients = attention_double_backward(
-            q, k, v, bias, g, rq, rk, rv, rb, csr, state,
-            *ctx.config, list(ctx.needs_input_grad[:5]),
-        )
-        return *gradients, None, None, None, None, None, None
-
-    def attention_double_backward_setup(ctx, inputs, output):
-        ctx.config = inputs[11:13]
-        ctx.save_for_backward(*inputs[:11])
-        ctx.set_materialize_grads(False)
-
-    def attention_double_backward_backward(ctx, sq, sk, sv, sb, sg):
-        if all(value is None for value in (sq, sk, sv, sb, sg)):
-            return (None,) * 14
-        q, k, v, bias, g, rq, rk, rv, rb, csr, state = ctx.saved_tensors
-        gradients = attention_triple_backward(
-            q, k, v, bias, g, rq, rk, rv, rb, sq, sk, sv, sb, sg,
-            csr, state, *ctx.config, list(ctx.needs_input_grad[:9]),
-        )
-        return *gradients, None, None, None, None, None
-
-    attention_forward.register_autograd(
-        attention_forward_backward, setup_context=attention_forward_setup
-    )
-    attention_backward.register_autograd(
-        attention_backward_backward, setup_context=attention_backward_setup
-    )
-    attention_double_backward.register_autograd(
-        attention_double_backward_backward, setup_context=attention_double_backward_setup
-    )
-
-    return (
-        attention_forward, attention_backward,
-        attention_double_backward, attention_triple_backward,
-    )
+attention_backward.register_autograd(attention_backward_backward, setup_context=attention_backward_setup)
 
 
-(
-    attention_forward, attention_backward,
-    attention_double_backward, attention_triple_backward,
-) = register_ops()
+attention_double_backward.register_autograd(
+    attention_double_backward_backward, setup_context=attention_double_backward_setup
+)

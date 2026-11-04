@@ -4,7 +4,10 @@ from collections import OrderedDict
 
 import torch
 
-from ..o3.spherical_harmonics.interface import register_ops, UNSET, SphericalHarmonicsConfig, spherical_harmonics, parse_irreps
+from ..o3.spherical_harmonics.interface import (
+    UNSET, SphericalHarmonicsConfig, parse_irreps, spherical_harmonics,
+    spherical_harmonics_operator_config,
+)
 
 
 class LunaEqSphericalHarmonics(torch.nn.Module):
@@ -113,8 +116,10 @@ class LunaEqSphericalHarmonics(torch.nn.Module):
                 x, self._ls_list, self.normalize, self.normalization
             )
         if torch.compiler.is_compiling() and x.is_cuda and x.dtype in (torch.float32, torch.float64) and x.shape[-1] == 3:
-            name = register_ops(tuple(self._ls_list), self.normalize, self.normalization, 32, x.dtype)
-            return getattr(torch.ops.lunaeq, name).default(x)
+            descriptor = spherical_harmonics_operator_config(
+                tuple(self._ls_list), self.normalize, self.normalization, 32, x.dtype,
+            )
+            return torch.ops.lunaeq.spherical_harmonics_forward.default(x, descriptor)
         config = self.specialize(x.dtype)
         result = spherical_harmonics(
             self._ls_list, x, self.normalize, self.normalization, config=config

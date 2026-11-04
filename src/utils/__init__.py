@@ -1,14 +1,8 @@
 """Shared CUDA compilation, indexing, precision and scalar-expression utilities."""
 
-from threading import RLock
-
 import torch
 from torch.fx.experimental.proxy_tensor import get_proxy_mode
 from torch.utils._python_dispatch import is_in_torch_dispatch_mode
-
-
-# Serialize first registration of configuration-specific operators, never execution.
-REGISTER_OPERATOR_LOCK = RLock()
 
 
 def is_compiling():

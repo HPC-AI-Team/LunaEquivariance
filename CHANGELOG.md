@@ -2,6 +2,10 @@
 
 ## 0.2.0
 
+### New operator
+
+- Add the `SymmetricContraction` operation with support for uniform and non-uniform irreps.
+
 ### Performance and memory
 
 - Optimized FP32 Linear, UVW and UVWConv kernels. UVW contractions avoid large intermediate tensors and reduce repeated input reads in double-backward and triple-backward.
@@ -16,11 +20,6 @@
 ### Documentation
 
 - Added per-operator throughput and peak-memory benchmarks, covering forward through triple-backward.
-- Added a NequIP AOTI example that saves and restores model-specific operator registrations.
-
-### Compatibility
-
-- Use a Tensor return for nonconstant spherical-harmonics backward operators so AOTInductor can export force models; constant harmonics retain their absent input gradient.
 
 ## 0.1.0
 

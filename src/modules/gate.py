@@ -12,7 +12,7 @@ except ModuleNotFoundError as error:
         raise
     Gate = None
 
-from ..nn.gate.interface import gate, register_module_ops
+from ..nn.gate.interface import gate, gate_config
 from ..nn.activation.kernels.utils import parse_activation, parse_activation_paths
 from ..o3.irreps import PublicIrreps as Irreps
 from .activation import LunaEqActivation
@@ -73,6 +73,7 @@ class LunaEqGate(LunaEqActivation):
         )
         self.irreps_in, self.irreps_out = official.irreps_in, official.irreps_out
         self.meta = self.build_metadata(parsed_scalars, parsed_gates)
+        self.operator_config = gate_config(self.meta)
         self.in_dim, self.out_dim = self.irreps_in.dim, self.irreps_out.dim
         self.activation_paths = self.meta["scalar_activation"]
         self.irreps_in, self.irreps_out = self.meta["irreps_in"], self.meta["irreps_out"]
@@ -197,13 +198,11 @@ class LunaEqGate(LunaEqActivation):
             has_grad=bool(scalar_activation or offset),
         )
 
-    register_module_ops = register_module_ops
-
     def forward(self, features):
         native = (features.is_cuda and features.dtype in (torch.float32, torch.float64)
                   and features.ndim and features.shape[-1] == self.in_dim)
         if torch.compiler.is_compiling() and native:
-            return getattr(torch.ops.lunaeq, self.register_module_ops()).default(features)
+            return torch.ops.lunaeq.gate_forward.default(features, self.operator_config)
         backend = "cuda_fused" if native else "torch_compat"
         object.__setattr__(self, "last_execution_backend", backend)
         return gate(features, layout=self.meta, kernel_cache=self.kernel_cache)

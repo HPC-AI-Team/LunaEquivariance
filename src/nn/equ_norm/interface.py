@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import math
-from hashlib import sha256
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import lru_cache
 
 import torch
 
 from ...o3.irreps import PublicIrreps, irreps_key
 from .kernels.utils import load_kernel
-from ...utils import REGISTER_OPERATOR_LOCK, is_compiling
+from ...utils import is_compiling
+from ...utils.operator_config import encode_config, decode_config
 
 
 @dataclass(frozen=True)
@@ -77,112 +77,137 @@ def equivariant_norm_torch(x, weight, bias, plan):
     return torch.cat(output, -1).reshape_as(x).to(dtype)
 
 
-@torch.compiler.assume_constant_result
-def register_ops(self):
-    plan = self.plan
-    suffix = sha256(repr(plan).encode()).hexdigest()[:24]
-    name = f"equ_norm_{suffix}_forward"
-    with REGISTER_OPERATOR_LOCK:
-        if hasattr(torch.ops.lunaeq, name):
-            return name
-        op = object.__new__(EquNormOperator)
-        op.plan = plan
-        op.compiled_modules, op.device_arches = {}, {}
-        channels = plan.blocks[0].channels
-        op.input_channels = channels if all(block.channels == channels for block in plan.blocks) else None
+@lru_cache(maxsize=128)
+def get_equ_norm_operator(config):
+    metadata = decode_config(config)
+    metadata["blocks"] = tuple(NormBlock(**block) for block in metadata["blocks"])
+    plan = NormPlan(**metadata)
+    op = object.__new__(EquNormOperator)
+    op.plan = plan
+    op.operator_config = config
+    op.compiled_modules, op.device_arches = {}, {}
+    channels = plan.blocks[0].channels
+    op.input_channels = channels if all(block.channels == channels for block in plan.blocks) else None
+    return op
 
-        @torch.library.custom_op(f"lunaeq::equ_norm_{suffix}_forward", mutates_args=())
-        def equ_norm_forward_op(x: torch.Tensor, gamma: torch.Tensor | None, beta: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-            return op.forward(x, gamma, beta)
 
-        @equ_norm_forward_op.register_fake
-        def equ_norm_forward_fake(x, gamma, beta):
-            plan = op.plan
-            return x.new_empty(x.shape), x.new_empty((x.shape[0], plan.num_centers + plan.num_groups))
+@torch.library.custom_op("lunaeq::equ_norm_forward", mutates_args=())
+def equ_norm_forward_op(
+    x: torch.Tensor, gamma: torch.Tensor | None, beta: torch.Tensor | None, config: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    op = get_equ_norm_operator(config)
+    return op.forward(x, gamma, beta)
 
-        def equ_norm_backward_fake_outputs(inputs, needs):
-            return tuple(value.new_empty(value.shape) if need and value is not None else None
-                         for value, need in zip(inputs, needs))
 
-        @torch.library.custom_op(f"lunaeq::equ_norm_{suffix}_backward", mutates_args=(),
-                                 schema="(Tensor x, Tensor? gamma, Tensor? beta, Tensor g, Tensor stats, bool[] needs) -> (Tensor?, Tensor?, Tensor?)")
-        def equ_norm_backward_op(x: torch.Tensor, gamma: torch.Tensor | None, beta: torch.Tensor | None,
-                                 g: torch.Tensor, stats: torch.Tensor,
-                                 needs: list[bool]) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-            return op.run_backward(1, (x, gamma, beta, g), stats, needs)
+@equ_norm_forward_op.register_fake
+def equ_norm_forward_fake(x, gamma, beta, config):
+    plan = get_equ_norm_operator(config).plan
+    return x.new_empty(x.shape), x.new_empty((x.shape[0], plan.num_centers + plan.num_groups))
 
-        @equ_norm_backward_op.register_fake
-        def equ_norm_backward_fake(x, gamma, beta, g, stats, needs):
-            return equ_norm_backward_fake_outputs((x, gamma, beta), needs)
 
-        @torch.library.custom_op(f"lunaeq::equ_norm_{suffix}_double_backward", mutates_args=(),
-                                 schema="(Tensor x, Tensor? gamma, Tensor? beta, Tensor g, Tensor? rx, Tensor? rgamma, Tensor? rbeta, Tensor stats, bool[] needs) -> (Tensor?, Tensor?, Tensor?, Tensor?)")
-        def equ_norm_double_backward_op(x: torch.Tensor, gamma: torch.Tensor | None, beta: torch.Tensor | None,
-                                        g: torch.Tensor, rx: torch.Tensor | None, rgamma: torch.Tensor | None,
-                                        rbeta: torch.Tensor | None, stats: torch.Tensor,
-                                        needs: list[bool]) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-            return op.run_backward(2, (x, gamma, beta, g, rx, rgamma, rbeta), stats, needs)
+def equ_norm_backward_fake_outputs(inputs, needs):
+    return tuple(value.new_empty(value.shape) if need and value is not None else None
+                 for value, need in zip(inputs, needs))
 
-        @equ_norm_double_backward_op.register_fake
-        def equ_norm_double_backward_fake(x, gamma, beta, g, rx, rgamma, rbeta, stats, needs):
-            return equ_norm_backward_fake_outputs((x, gamma, beta, g), needs)
 
-        @torch.library.custom_op(f"lunaeq::equ_norm_{suffix}_triple_backward", mutates_args=(),
-                                 schema="(Tensor x, Tensor? gamma, Tensor? beta, Tensor g, Tensor? rx, Tensor? rgamma, Tensor? rbeta, Tensor? sx, Tensor? sgamma, Tensor? sbeta, Tensor? sg, Tensor stats, bool[] needs) -> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)")
-        def equ_norm_triple_backward_op(x: torch.Tensor, gamma: torch.Tensor | None, beta: torch.Tensor | None,
-                                        g: torch.Tensor, rx: torch.Tensor | None, rgamma: torch.Tensor | None,
-                                        rbeta: torch.Tensor | None, sx: torch.Tensor | None, sgamma: torch.Tensor | None,
-                                        sbeta: torch.Tensor | None, sg: torch.Tensor | None,
-                                        stats: torch.Tensor, needs: list[bool]) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-            return op.run_backward(
-                3, (x, gamma, beta, g, rx, rgamma, rbeta, sx, sgamma, sbeta, sg), stats, needs
-            )
+@torch.library.custom_op(
+    "lunaeq::equ_norm_backward", mutates_args=(),
+    schema=(
+        "(Tensor x, Tensor? gamma, Tensor? beta, Tensor g, Tensor stats, bool[] needs, "
+        "str config) -> (Tensor?, Tensor?, Tensor?)"
+    ),
+)
+def equ_norm_backward_op(x, gamma, beta, g, stats, needs, config):
+    op = get_equ_norm_operator(config)
+    return op.run_backward(1, (x, gamma, beta, g), stats, needs)
 
-        @equ_norm_triple_backward_op.register_fake
-        def equ_norm_triple_backward_fake(x, gamma, beta, g, rx, rgamma, rbeta, sx, sgamma, sbeta, sg, stats, needs):
-            return equ_norm_backward_fake_outputs((x, gamma, beta, g, rx, rgamma, rbeta), needs)
 
-        def equ_norm_forward_setup(ctx, inputs, output):
-            x, gamma, beta = inputs
-            _, stats = output
-            ctx.set_materialize_grads(False)
-            ctx.mark_non_differentiable(stats)
-            ctx.save_for_backward(x, gamma, beta, stats)
+@equ_norm_backward_op.register_fake
+def equ_norm_backward_fake(x, gamma, beta, g, stats, needs, config):
+    return equ_norm_backward_fake_outputs((x, gamma, beta), needs)
 
-        def equ_norm_forward_backward(ctx, g, stats_gradient):
-            if g is None:
-                return None, None, None
-            x, gamma, beta, stats = ctx.saved_tensors
-            result = equ_norm_backward_op(x, gamma, beta, g, stats, list(ctx.needs_input_grad[:3]))
-            return result
 
-        def equ_norm_backward_setup(ctx, inputs, output):
-            x, gamma, beta, g, stats, _ = inputs
-            ctx.set_materialize_grads(False)
-            ctx.save_for_backward(x, gamma, beta, g, stats)
+@torch.library.custom_op(
+    "lunaeq::equ_norm_double_backward", mutates_args=(),
+    schema=(
+        "(Tensor x, Tensor? gamma, Tensor? beta, Tensor g, Tensor? rx, Tensor? rgamma, "
+        "Tensor? rbeta, Tensor stats, bool[] needs, str config) -> (Tensor?, Tensor?, "
+        "Tensor?, Tensor?)"
+    ),
+)
+def equ_norm_double_backward_op(x, gamma, beta, g, rx, rgamma, rbeta, stats, needs, config):
+    op = get_equ_norm_operator(config)
+    return op.run_backward(2, (x, gamma, beta, g, rx, rgamma, rbeta), stats, needs)
 
-        def equ_norm_backward_backward(ctx, rx, rgamma, rbeta):
-            x, gamma, beta, g, stats = ctx.saved_tensors
-            result = equ_norm_double_backward_op(x, gamma, beta, g, rx, rgamma, rbeta, stats,
-                                                 list(ctx.needs_input_grad[:4]))
-            return *result, None, None
 
-        def equ_norm_double_backward_setup(ctx, inputs, output):
-            x, gamma, beta, g, rx, rgamma, rbeta, stats, _ = inputs
-            ctx.set_materialize_grads(False)
-            ctx.save_for_backward(x, gamma, beta, g, rx, rgamma, rbeta, stats)
+@equ_norm_double_backward_op.register_fake
+def equ_norm_double_backward_fake(x, gamma, beta, g, rx, rgamma, rbeta, stats, needs, config):
+    return equ_norm_backward_fake_outputs((x, gamma, beta, g), needs)
 
-        def equ_norm_double_backward_backward(ctx, sx, sgamma, sbeta, sg):
-            x, gamma, beta, g, rx, rgamma, rbeta, stats = ctx.saved_tensors
-            result = equ_norm_triple_backward_op(x, gamma, beta, g, rx, rgamma, rbeta, sx, sgamma,
-                                                 sbeta, sg, stats, list(ctx.needs_input_grad[:7]))
-            return *result, None, None
 
-        equ_norm_forward_op.register_autograd(equ_norm_forward_backward, setup_context=equ_norm_forward_setup)
-        equ_norm_backward_op.register_autograd(equ_norm_backward_backward, setup_context=equ_norm_backward_setup)
-        equ_norm_double_backward_op.register_autograd(equ_norm_double_backward_backward,
-                                                     setup_context=equ_norm_double_backward_setup)
-        return name
+@torch.library.custom_op(
+    "lunaeq::equ_norm_triple_backward", mutates_args=(),
+    schema=(
+        "(Tensor x, Tensor? gamma, Tensor? beta, Tensor g, Tensor? rx, Tensor? rgamma, "
+        "Tensor? rbeta, Tensor? sx, Tensor? sgamma, Tensor? sbeta, Tensor? sg, Tensor stats, "
+        "bool[] needs, str config) -> (Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, "
+        "Tensor?)"
+    ),
+)
+def equ_norm_triple_backward_op(
+    x, gamma, beta, g, rx, rgamma, rbeta, sx, sgamma, sbeta, sg, stats, needs, config,
+):
+    op = get_equ_norm_operator(config)
+    return op.run_backward(
+        3, (x, gamma, beta, g, rx, rgamma, rbeta, sx, sgamma, sbeta, sg), stats, needs
+    )
+
+
+@equ_norm_triple_backward_op.register_fake
+def equ_norm_triple_backward_fake(x, gamma, beta, g, rx, rgamma, rbeta, sx, sgamma, sbeta, sg, stats, needs, config):
+    return equ_norm_backward_fake_outputs((x, gamma, beta, g, rx, rgamma, rbeta), needs)
+
+
+def equ_norm_forward_setup(ctx, inputs, output):
+    x, gamma, beta, ctx.config = inputs
+    _, stats = output
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(stats)
+    ctx.save_for_backward(x, gamma, beta, stats)
+
+
+def equ_norm_forward_backward(ctx, g, stats_gradient):
+    if g is None:
+        return None, None, None, None
+    x, gamma, beta, stats = ctx.saved_tensors
+    result = equ_norm_backward_op(x, gamma, beta, g, stats, list(ctx.needs_input_grad[:3]), ctx.config)
+    return *result, None
+
+
+def equ_norm_backward_setup(ctx, inputs, output):
+    ctx.config = inputs[-1]
+    ctx.set_materialize_grads(False)
+    ctx.save_for_backward(*inputs[:-2])
+
+
+def equ_norm_backward_backward(ctx, rx, rgamma, rbeta):
+    x, gamma, beta, g, stats = ctx.saved_tensors
+    result = equ_norm_double_backward_op(x, gamma, beta, g, rx, rgamma, rbeta, stats,
+                                         list(ctx.needs_input_grad[:4]), ctx.config)
+    return *result, None, None, None
+
+
+def equ_norm_double_backward_backward(ctx, sx, sgamma, sbeta, sg):
+    x, gamma, beta, g, rx, rgamma, rbeta, stats = ctx.saved_tensors
+    result = equ_norm_triple_backward_op(x, gamma, beta, g, rx, rgamma, rbeta, sx, sgamma,
+                                         sbeta, sg, stats, list(ctx.needs_input_grad[:7]), ctx.config)
+    return *result, None, None, None
+
+
+equ_norm_forward_op.register_autograd(equ_norm_forward_backward, setup_context=equ_norm_forward_setup)
+equ_norm_backward_op.register_autograd(equ_norm_backward_backward, setup_context=equ_norm_backward_setup)
+equ_norm_double_backward_op.register_autograd(equ_norm_double_backward_backward,
+                                             setup_context=equ_norm_backward_setup)
 
 
 class EquNormOperator:
@@ -263,17 +288,14 @@ class EquNormOperator:
             layout=layout,
             eps=float(eps),
         )
-        self.registered_forward = None
+        self.operator_config = encode_config(asdict(self.plan))
         self.compiled_modules = {}
         self.device_arches = {}
         channels = blocks[0].channels
         self.input_channels = channels if all(b.channels == channels for b in blocks) else None
 
-    register_ops = register_ops
-
     def __getstate__(self):
         state = self.__dict__.copy()
-        state["registered_forward"] = None
         state["compiled_modules"] = {}
         state["device_arches"] = {}
         return state
@@ -283,8 +305,7 @@ class EquNormOperator:
             self.check_inputs(x, gamma, beta)
             return equivariant_norm_torch(x, gamma, beta, self.plan)
         if is_compiling():
-            name = self.registered_forward if self.registered_forward is not None else self.register_ops()
-            return getattr(torch.ops.lunaeq, name).default(x, gamma, beta)[0]
+            return torch.ops.lunaeq.equ_norm_forward.default(x, gamma, beta, self.operator_config)[0]
         return EquNormForward.apply(self, x, gamma, beta)
 
     def check_inputs(self, x, gamma, beta):
@@ -393,6 +414,38 @@ class EquNormOperator:
         return tuple(outputs)
 
 
+@lru_cache(maxsize=128)
+@torch.compiler.assume_constant_result
+def prepare_equivariant_norm(irreps, norm, grouping, weighting, layout, eps, stat_weights):
+    if norm not in ("layer", "rms"):
+        raise ValueError("norm must be layer or rms")
+    if eps is None:
+        eps = 1e-12 if weighting == "inverse_dim_squared" else 1e-5
+    op = EquNormOperator(
+        irreps, grouping=grouping, center_scalars=norm == "layer",
+        weighting=weighting, layout=layout, eps=eps, stat_weights=stat_weights,
+    )
+    return op
+
+
+def equivariant_norm(
+    x, irreps, weight=None, bias=None, *, norm="layer", grouping="merged",
+    weighting="component", layout="mul_ir", eps=None, stat_weights=None, config=None,
+):
+    """Weighted equivariant normalization with explicit affine tensors.
+
+    This function owns no trainable parameters and does not construct a Module.
+    ``config`` may reuse an independently prepared EquNormOperator.
+    """
+    op = config
+    if op is None:
+        op = prepare_equivariant_norm(
+            irreps_key(irreps), norm, grouping, weighting, layout, eps,
+            None if stat_weights is None else tuple(float(w) for w in stat_weights),
+        )
+    return op(x, weight, bias)
+
+
 class EquNormForward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, op, x, gamma, beta):
@@ -457,37 +510,3 @@ class EquNormDoubleBackward(torch.autograd.Function):
             ctx.needs_input_grad[1:8],
         )
         return (None, *result, None)
-
-
-@lru_cache(maxsize=128)
-@torch.compiler.assume_constant_result
-def prepare_equivariant_norm(irreps, norm, grouping, weighting, layout, eps, stat_weights):
-    if norm not in ("layer", "rms"):
-        raise ValueError("norm must be layer or rms")
-    if eps is None:
-        eps = 1e-12 if weighting == "inverse_dim_squared" else 1e-5
-    op = EquNormOperator(
-        irreps, grouping=grouping, center_scalars=norm == "layer",
-        weighting=weighting, layout=layout, eps=eps, stat_weights=stat_weights,
-    )
-    # Dynamo needs a materialized attribute on the constant factory result.
-    op.registered_forward = op.register_ops()
-    return op
-
-
-def equivariant_norm(
-    x, irreps, weight=None, bias=None, *, norm="layer", grouping="merged",
-    weighting="component", layout="mul_ir", eps=None, stat_weights=None, config=None,
-):
-    """Weighted equivariant normalization with explicit affine tensors.
-
-    This function owns no trainable parameters and does not construct a Module.
-    ``config`` may reuse an independently prepared EquNormOperator.
-    """
-    op = config
-    if op is None:
-        op = prepare_equivariant_norm(
-            irreps_key(irreps), norm, grouping, weighting, layout, eps,
-            None if stat_weights is None else tuple(float(w) for w in stat_weights),
-        )
-    return op(x, weight, bias)

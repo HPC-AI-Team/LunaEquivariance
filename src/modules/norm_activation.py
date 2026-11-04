@@ -17,7 +17,7 @@ from ..nn.norm_activation.interface import (
     IRREPS_MISSING,
     build_norm_activation_metadata,
     norm_activation,
-    register_module_ops,
+    norm_activation_config,
 )
 from ..o3.norm.interface import SUPPORTED_DTYPES
 from ..nn.norm_activation.kernels.utils import NormActivationKernels
@@ -117,6 +117,10 @@ class LunaEqNormActivation(LunaEqNorm):
             if self.bias:
                 self.biases = state.biases
         self.meta["norm_squared"] = bool(self.norm.squared)
+        self.operator_configs = {
+            dtype: norm_activation_config(self.meta, 32, dtype)
+            for dtype in (torch.float32, torch.float64)
+        }
         self.in_dim = self.meta["in_dim"]
         if dtype is not None:
             self.to(dtype=dtype)
@@ -137,8 +141,6 @@ class LunaEqNormActivation(LunaEqNorm):
             self._specializations[dtype] = result
         return result
 
-    register_module_ops = register_module_ops
-
     def forward(self, features):
         if torch.compiler.is_compiling() and features.is_cuda and features.dtype in NATIVE_DTYPES:
             bias = self.biases if self.bias else None
@@ -150,7 +152,9 @@ class LunaEqNormActivation(LunaEqNorm):
                     raise ValueError("NormActivation feature dimension does not match irreps")
                 if bias is not None and bias.dtype != features.dtype:
                     bias = bias.to(dtype=features.dtype)
-                return getattr(torch.ops.lunaeq, self.register_module_ops(features.dtype)).default(features, bias)[0]
+                return torch.ops.lunaeq.norm_activation_forward.default(
+                    features, bias, self.operator_configs[features.dtype],
+                )[0]
         config = self.active_config
         if config is None or config.compute_dtype != features.dtype:
             config = self.specialize(features.dtype)
