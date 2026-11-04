@@ -104,6 +104,14 @@ if softmax.smooth_out:
     out = out * envelope
 ```
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: neighbor graphs of varying size, 64 channels per edge
+
+![GraphSoftmax FP32 throughput and peak memory](../assets/performance/graph_softmax.png)
+
 ## Limitations
 
 - Rows in each CSR segment are contiguous, with `data` and `env` in the same order. Neither the operator nor the CSR builder sorts input rows.

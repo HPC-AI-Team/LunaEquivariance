@@ -1,598 +1,562 @@
-"""Online CSR attention with FP32 softmax and dtype-specific CUTLASS products."""
-
-from functools import lru_cache
-
-from .utils import dtype_defines
+"""Online CSR attention with CUTLASS SIMT and TensorOp matrix products."""
 
 import torch
 
-from ....utils.extension import get_cuda_arch, get_device_properties, load_cuda_extension
+from .utils import CUDA_SOURCE, GEMM_SOURCE, ATTENTION_SOURCE, dtype_defines
+from ....utils.extension import get_cuda_arch, load_cuda_extension
 
-CUDA_SOURCE = r"""
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cutlass/gemm/thread/mma.h>
-#include <cutlass/arch/mma_sm80.h>
-#include <cutlass/numeric_conversion.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <cutlass/layout/matrix.h>
-#include <cuda_runtime.h>
-
-struct Tensor3 {
-    const Storage *data;
-    int64_t edge_stride, head_stride, channel_stride;
-    template<int Channels, bool Contiguous>
-    __device__ __forceinline__ float load(int64_t edge, int head, int channel) const {
-        if constexpr (Contiguous) return data[(edge*HEADS+head)*Channels+channel];
-        return data[edge * edge_stride + int64_t(head) * head_stride + int64_t(channel) * channel_stride];
-    }
-};
-struct Bias {
-    const Storage *data;
-    bool fp32;
-    int64_t strides[4];
-    __device__ float load(int64_t index) const {
-        return fp32 ? reinterpret_cast<const float*>(data)[index] : float(data[index]);
-    }
-};
-
-template<int Rows, int Threads, int Channels, int Width, bool Contiguous, typename SharedElement, int Pitch>
-__device__ __forceinline__ void load_forward_tile(
-    Tensor3 const& source, SharedElement (*destination)[Pitch],
-    int64_t begin, int64_t end, int head, int tid) {
-    constexpr int Pack = 16 / sizeof(Storage);
-    using Packed = uint4;
-    if constexpr (Contiguous && Channels%Pack==0) {
-        for (int i=tid*Pack;i<Rows*Width;i+=Threads*Pack) {
-            int r=i/Width, d=i%Width;
-            Packed value={0,0,0,0};
-            if (begin+r<end && d<Channels)
-                value=*reinterpret_cast<const Packed*>(source.data+((begin+r)*HEADS+head)*Channels+d);
-            *reinterpret_cast<Packed*>(&destination[r][d])=value;
-        }
-    } else {
-        for (int i=tid;i<Rows*Width;i+=Threads) {
-            int r=i/Width, d=i%Width;
-            destination[r][d]=SharedElement(begin+r<end && d<Channels ? source.template load<Channels, Contiguous>(begin+r, head, d) : 0);
-        }
-    }
-}
-"""
-
+KERNELS = {}
 
 FORWARD_SOURCE = r"""
-template<int Dim, int ValueDim, int Kind, bool Causal, bool Contiguous, typename CsrIndex>
-__global__ __launch_bounds__(THREADS, MIN_BLOCKS_PER_SM) void attention_forward_kernel(
-    const __grid_constant__ Tensor3 query, const __grid_constant__ Tensor3 key, const __grid_constant__ Tensor3 value, const __grid_constant__ Bias bias, const CsrIndex *csr, int64_t csr_stride,
-    Storage *output, float *state, float scale) {
-    constexpr int Tile=FORWARD_TILE;
-    using SharedElement = LowMmaElement;
-    constexpr int D = (Dim+15)/16*16;
-    constexpr int V = (ValueDim+7)/8*8;
-    constexpr int QPitch = D + 8;
-    using Mma = cutlass::arch::Mma<cutlass::gemm::GemmShape<16, 8, 16>, 32,
-        LowMmaElement, cutlass::layout::RowMajor, LowMmaElement,
-        cutlass::layout::ColumnMajor, float, cutlass::layout::RowMajor,
-        cutlass::arch::OpMultiplyAdd>;
-    using Convert = cutlass::NumericConverter<LowMmaElement, float, cutlass::FloatRoundStyle::round_to_nearest>;
-#if SHARED_BYTES > 0
-    extern __shared__ __align__(16) SharedElement storage[];
-    auto queries=reinterpret_cast<SharedElement (*)[QPitch]>(storage);
-    auto keys=reinterpret_cast<SharedElement (*)[QPitch]>(storage+Tile*QPitch);
-    auto values=reinterpret_cast<SharedElement (*)[V+8]>(storage+2*Tile*QPitch);
-    auto probability=reinterpret_cast<SharedElement (*)[Tile+4]>(storage+2*Tile*QPitch+Tile*(V+8));
+constexpr int ForwardRows=32;
+constexpr int ForwardKeys=LOW_PRECISION ? 64:32;
+constexpr int ForwardThreads=128;
+
+
+#if !LOW_PRECISION
+#include <cute/tensor.hpp>
+namespace native_score {
+using namespace cute;
+using Mma=decltype(make_tiled_mma(UniversalFMA<float,float,float>{},
+    Layout<Shape<_4,_8,_1>,Stride<_8,_1,_0>>{},
+    Tile<Layout<Shape<_4,_2>,Stride<_2,_1>>,
+         Layout<Shape<_8,_4>,Stride<_4,_1>>,_1>{}));
+using Copy=decltype(make_tiled_copy(Copy_Atom<UniversalCopy<float>,float>{},
+    Layout<Shape<_32,_4>,Stride<_4,_1>>{},Layout<Shape<_1,_1>>{}));
+using ScoreLayout=Layout<Shape<_1,_2,_4>,Stride<_0,_4,_1>>;
+using OperandLayout=Layout<Shape<_32,_32>,Stride<_1,Int<36>>>;
+struct alignas(16) Storage {
+    float query[2*cosize_v<OperandLayout>],key[2*cosize_v<OperandLayout>];
+};
+using Accumulator=cutlass::Array<float,8>;
+
+__device__ __forceinline__ void prefetch(Storage& shared,AttentionParams const& p,
+    int slot,int64_t qb,int64_t kb,int64_t end,int head,int channel) {
+    auto query=make_tensor(make_smem_ptr(shared.query+slot*cosize_v<OperandLayout>),OperandLayout{});
+    auto key=make_tensor(make_smem_ptr(shared.key+slot*cosize_v<OperandLayout>),OperandLayout{});
+    auto thread=Copy{}.get_slice(threadIdx.x);
+    auto qd=thread.partition_D(query);
+    auto kd=thread.partition_D(key);
+    auto coords=thread.partition_S(make_identity_tensor(Shape<_32,_32>{}));
+    CUTE_UNROLL
+    for(int i=0;i<size(qd);++i) {
+        auto coord=coords(i);
+        const int row=int(get<0>(coord)),column=channel+int(get<1>(coord));
+        const bool valid=qb+row<end && column<DIM;
+        auto const& q=p.inputs[0];
+#if COMPACT
+        const int64_t offset=((qb+row)*HEADS+head)*DIM+column;
 #else
-    __shared__ __align__(16) SharedElement queries[Tile][QPitch], keys[Tile][QPitch], values[Tile][V+8], probability[Tile][Tile+4];
+        const int64_t offset=(qb+row)*q.stride[0]+head*q.stride[1]+column*q.stride[2];
 #endif
-    int tid=threadIdx.x, lane=tid%32, warp=tid/32;
-    int row=warp*16+lane/4, col=(lane%4)*2;
-    int segment=(FORWARD_ADJACENT ? blockIdx.x/FORWARD_WORKERS : blockIdx.x), head=blockIdx.y;
-    int64_t begin=csr[int64_t(segment)*csr_stride], end=csr[(int64_t(segment)+1)*csr_stride];
-    if(end-begin<FORWARD_MIN_LENGTH || (FORWARD_MAX_LENGTH && end-begin>FORWARD_MAX_LENGTH)) return;
-    for (int64_t query_start=begin+(FORWARD_ADJACENT ? blockIdx.x%FORWARD_WORKERS : blockIdx.z)*Tile;query_start<end;query_start+=FORWARD_WORKERS*Tile) {
-        load_forward_tile<Tile, THREADS, Dim, D, Contiguous>(query, queries, query_start, end, head, tid);
-        typename Mma::FragmentC accum[V/8];
-        #pragma unroll
-        for (int n=0;n<V/8;++n) accum[n].clear();
-        float maximum[2]={-INFINITY, -INFINITY}, denominator[2]={0, 0};
-        for (int64_t key_start=begin;key_start<end && (!Causal || key_start<=query_start+Tile-1);key_start+=Tile) {
-            load_forward_tile<Tile, THREADS, Dim, D, Contiguous>(key, keys, key_start, end, head, tid);
-            load_forward_tile<Tile, THREADS, ValueDim, V, Contiguous>(value, values, key_start, end, head, tid);
-            __syncthreads();
-            typename Mma::FragmentC scores[Tile/8];
-            #pragma unroll
-            for (int n=0;n<Tile/8;++n) scores[n].clear();
-            #pragma unroll 1
-            for (int d=0;d<D;d+=16) {
-                typename Mma::FragmentA a;
-                #pragma unroll
-                for (int i=0;i<Mma::FragmentA::kElements;++i)
-                    a[i]=Convert{}(queries[row+((i/2)%2)*8][d+(lane%4)*2+i%2+(i/4)*8]);
-                #pragma unroll
-                for (int n=0;n<Tile/8;++n) {
-                    typename Mma::FragmentB b;
-                    #pragma unroll
-                    for (int i=0;i<Mma::FragmentB::kElements;++i)
-                        b[i]=Convert{}(keys[n*8+lane/4][d+(lane%4)*2+i%2+(i/2)*8]);
-                    Mma{}(scores[n], a, b, scores[n]);
-                }
-            }
-            #pragma unroll
-            for (int m=0;m<2;++m) {
-                int64_t query_index=query_start+row+m*8;
-                float tile_max=-INFINITY;
-                #pragma unroll
-                for (int n=0;n<Tile/8;++n) {
-                    #pragma unroll
-                    for (int j=0;j<2;++j) {
-                        int64_t key_index=key_start+n*8+col+j;
-                        float s=-INFINITY;
-                        if (query_index<end && key_index<end && (!Causal || key_index<=query_index)) {
-                            s=scores[n][m*2+j]*scale;
-                            if constexpr(Kind==1) s+=bias.load(key_index*bias.strides[0]+head*bias.strides[1]);
-                            if constexpr(Kind==2) s+=bias.load(int64_t(segment)*bias.strides[0]+head*bias.strides[1]+(query_index-begin)*bias.strides[2]+(key_index-begin)*bias.strides[3]);
-                        }
-                        scores[n][m*2+j]=s;
-                        tile_max=fmaxf(tile_max, s);
-                    }
-                }
-                tile_max=fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1, 4));
-                tile_max=fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2, 4));
-                float updated=fmaxf(maximum[m], tile_max);
-                float alpha=updated>-INFINITY ? __expf(maximum[m]-updated) : 0;
-                float sum=0;
-                #pragma unroll
-                for (int n=0;n<Tile/8;++n) {
-                    #pragma unroll
-                    for (int j=0;j<2;++j) {
-                        float p=updated>-INFINITY ? __expf(scores[n][m*2+j]-updated) : 0;
-                        probability[row+m*8][n*8+col+j]=SharedElement(p);
-                        sum+=p;
-                    }
-                }
-                sum+=__shfl_xor_sync(0xffffffff, sum, 1, 4);
-                sum+=__shfl_xor_sync(0xffffffff, sum, 2, 4);
-                denominator[m]=denominator[m]*alpha+sum;
-                maximum[m]=updated;
-                #pragma unroll
-                for (int n=0;n<V/8;++n) {
-                    accum[n][m*2]*=alpha;
-                    accum[n][m*2+1]*=alpha;
-                }
-            }
-            __syncwarp();
-            #pragma unroll 1
-            for (int d=0;d<Tile;d+=16) {
-                typename Mma::FragmentA a;
-                #pragma unroll
-                for (int i=0;i<Mma::FragmentA::kElements;++i)
-                    a[i]=Convert{}(probability[row+((i/2)%2)*8][d+(lane%4)*2+i%2+(i/4)*8]);
-                #pragma unroll
-                for (int n=0;n<V/8;++n) {
-                    typename Mma::FragmentB b;
-                    #pragma unroll
-                    for (int i=0;i<Mma::FragmentB::kElements;++i)
-                        b[i]=Convert{}(values[d+(lane%4)*2+i%2+(i/2)*8][n*8+lane/4]);
-                    Mma{}(accum[n], a, b, accum[n]);
-                }
-            }
-            __syncthreads();
-        }
-        #pragma unroll
-        for (int m=0;m<2;++m) if (query_start+row+m*8<end) {
-            int64_t index=(query_start+row+m*8)*HEADS+head;
-            float inverse=denominator[m]>0 ? 1.0f/denominator[m] : 0;
-            if (lane%4==0) {
-                state[index*2]=maximum[m];
-                state[index*2+1]=inverse;
-            }
-            #pragma unroll
-            for (int n=0;n<V/8;++n) {
-                int d=n*8+col;
-                #pragma unroll
-                for(int j=0;j<2;++j) if(d+j<ValueDim)
-                    values[row+m*8][d+j]=SharedElement(accum[n][m*2+j]*inverse);
-            }
-        }
-        __syncthreads();
-        if constexpr (ValueDim%8==0) {
-            for(int i=tid*8;i<Tile*V;i+=THREADS*8) {
-                int r=i/V,d=i%V;
-                if(query_start+r<end && d<ValueDim)
-                    *reinterpret_cast<uint4*>(output+((query_start+r)*HEADS+head)*ValueDim+d)=
-                        *reinterpret_cast<const uint4*>(&values[r][d]);
-            }
-        } else {
-            for(int i=tid;i<Tile*V;i+=THREADS) {
-                int r=i/V,d=i%V;
-                if(query_start+r<end && d<ValueDim)
-                    output[((query_start+r)*HEADS+head)*ValueDim+d]=float(values[r][d]);
-            }
-        }
+        cutlass::arch::cp_async_zfill<4,cutlass::arch::CacheOperation::Always>(
+            &qd(i),q.data+(valid ? offset:0),valid);
+    }
+    CUTE_UNROLL
+    for(int i=0;i<size(kd);++i) {
+        auto coord=coords(i);
+        const int row=int(get<0>(coord)),column=channel+int(get<1>(coord));
+        const bool valid=kb+row<end && column<DIM;
+        auto const& k=p.inputs[1];
+#if COMPACT
+        const int64_t offset=((kb+row)*HEADS+head)*DIM+column;
+#else
+        const int64_t offset=(kb+row)*k.stride[0]+head*k.stride[1]+column*k.stride[2];
+#endif
+        cutlass::arch::cp_async_zfill<4,cutlass::arch::CacheOperation::Always>(
+            &kd(i),k.data+(valid ? offset:0),valid);
+    }
+    cutlass::arch::cp_async_fence();
+}
+
+__device__ __forceinline__ Accumulator gemm(Storage& shared,AttentionParams const& p,
+    int64_t qb,int64_t kb,int64_t end,int head) {
+    Mma mma;
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+    auto thread=mma.get_slice(lane);
+    Accumulator scores;
+    scores.clear();
+    auto c=make_tensor(make_rmem_ptr(scores.data()),ScoreLayout{});
+    const bool active=qb+warp*8<end;
+    prefetch(shared,p,0,qb,kb,end,head,0);
+    cutlass::arch::cp_async_wait<0>();
+    __syncthreads();
+    for(int channel=0;channel<DIM;channel+=32) {
+        const int slot=(channel/32)%2;
+        if(channel+32<DIM) prefetch(shared,p,slot^1,qb,kb,end,head,channel+32);
+        auto query=make_tensor(make_smem_ptr(shared.query+slot*cosize_v<OperandLayout>),OperandLayout{});
+        auto key=make_tensor(make_smem_ptr(shared.key+slot*cosize_v<OperandLayout>),OperandLayout{});
+        auto qa=local_tile(query,Shape<_8,_32>{},make_coord(warp,_0{}));
+        auto a=thread.partition_A(qa);
+        auto b=thread.partition_B(key);
+        if(active) cute::gemm(mma,a,b,c);
+        // Retire this panel before its slot is reused, and publish the next one.
+        cutlass::arch::cp_async_wait<0>();
         __syncthreads();
     }
+    return scores;
 }
-"""
+}
+#endif
 
+#if LOW_PRECISION
+struct ForwardValueTraits {
+    static constexpr int PartitionsK=FORWARD_WIDTH==32 ? 2:1;
+    static constexpr int WarpColumns=FORWARD_WIDTH/(2/PartitionsK);
+    using Shape=cutlass::gemm::GemmShape<ForwardRows,FORWARD_WIDTH,ForwardKeys>;
+    using Core=cutlass::gemm::threadblock::DefaultMmaCore<Shape,
+        cutlass::gemm::GemmShape<16,WarpColumns,ForwardKeys/PartitionsK>,GemmInstruction,
+        GemmElement,cutlass::layout::RowMajor,GemmElement,cutlass::layout::RowMajor,
+        float,cutlass::layout::RowMajor,GemmClass,2,cutlass::arch::OpMultiplyAdd>;
+    using Base=cutlass::gemm::threadblock::MmaBase<Shape,typename Core::MmaPolicy,1>;
+    using Operator=typename Core::MmaPolicy::Operator;
+    using Accumulator=typename Operator::FragmentC;
+};
 
-FORWARD_SIMT_SOURCE = r"""
-template<int Dim, int ValueDim, int Kind, bool Causal, bool Contiguous, typename CsrIndex>
-__global__ __launch_bounds__(THREADS, MIN_BLOCKS_PER_SM) void attention_forward_simt_kernel(
-    const __grid_constant__ Tensor3 query, const __grid_constant__ Tensor3 key, const __grid_constant__ Tensor3 value, const __grid_constant__ Bias bias, const CsrIndex *csr, int64_t csr_stride,
-    Storage *output, float *state, float scale) {
-    constexpr int Tile = FORWARD_TILE;
-    constexpr int Rows = Tile/16;
-    constexpr int Lanes = THREADS/16;
-    constexpr int PairColumns = Tile/Lanes;
-    constexpr int Features = Dim > ValueDim ? Dim : ValueDim;
-    constexpr int FeatureWidth = Features <= FORWARD_FEATURE_LIMIT ? (Features+31)/32*32 : 64;
-    constexpr int Width = FeatureWidth < Tile ? Tile : FeatureWidth;
-    constexpr int ValueTile = ValueDim < Width ? ValueDim : Width;
-    constexpr int Columns = LOW_PRECISION ? ((ValueTile+7)/8<4 ? (ValueTile+7)/8 : 4) : (ValueTile+Lanes-1)/Lanes;
-    constexpr int Chunks = (ValueTile + Lanes * Columns - 1) / (Lanes * Columns);
-    using Mma = cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<Rows, PairColumns, 1>,
-        float, cutlass::layout::RowMajor, float, cutlass::layout::RowMajor,
-        float, cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAdd>;
-    using ValueMma = cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<Rows, Columns, 1>,
-        float, cutlass::layout::RowMajor, float, cutlass::layout::RowMajor,
-        float, cutlass::layout::RowMajor, cutlass::arch::OpMultiplyAdd>;
-    extern __shared__ float storage[];
-    constexpr bool RowMajor = !LOW_PRECISION && Tile>=48;
-    constexpr int LeftSize = RowMajor ? Tile*(Width+4) : Width*(Tile+1);
-    auto qcache = reinterpret_cast<float (*)[Width+4]>(storage);
-    auto kcache = reinterpret_cast<float (*)[Width+4]>(storage+LeftSize);
-    auto left = reinterpret_cast<float (*)[Tile+1]>(storage);
-    auto right = reinterpret_cast<float (*)[Tile+1]>(storage+LeftSize);
-    int tid = threadIdx.x, lane = tid % Lanes;
-    constexpr int KeyStride = LOW_PRECISION ? 1 : Lanes;
-    int row = tid / Lanes * Rows, column = LOW_PRECISION ? lane * PairColumns : lane;
-    int segment = (FORWARD_ADJACENT ? blockIdx.x/FORWARD_WORKERS : blockIdx.x), head = blockIdx.y;
-    int64_t begin = csr[int64_t(segment)*csr_stride], end = csr[(int64_t(segment)+1)*csr_stride];
-    if(end-begin<FORWARD_MIN_LENGTH || (FORWARD_MAX_LENGTH && end-begin>FORWARD_MAX_LENGTH)) return;
-    for (int64_t query_start = begin+(FORWARD_ADJACENT ? blockIdx.x%FORWARD_WORKERS : blockIdx.z)*Tile; query_start < end; query_start += FORWARD_WORKERS*Tile) {
-        for (int vb = 0; vb < ValueDim; vb += ValueTile) {
-            float maximum[Rows];
+struct ForwardValueTile {
+    typename ForwardValueTraits::Base::SharedStorage operands;
+    float result[ForwardRows*FORWARD_WIDTH*ForwardValueTraits::PartitionsK];
+};
+
+// The producer has already populated this native shared operand. CUTLASS still
+// owns shared synchronization and every warp-K step of the complete mainloop.
+struct ForwardReadyOperand {
+    using Fragment=cutlass::Array<GemmElement,1>;
+    __device__ __forceinline__ ForwardReadyOperand() {}
+    template<typename Ref>
+    __device__ __forceinline__ ForwardReadyOperand(Ref const&,int) {}
+    __device__ __forceinline__ void clear_mask(bool) {}
+    __device__ __forceinline__ ForwardReadyOperand& operator++() {return *this;}
+    __device__ __forceinline__ void load(Fragment& fragment) const {fragment.clear();}
+    __device__ __forceinline__ void store(Fragment const&) const {}
+};
+
+__device__ __forceinline__ void forward_value_load(ForwardValueTile& shared,AttentionGemmFeature<> right) {
+    // Score has released K; native P and B occupy disjoint regions.
+#if COMPACT && VALUE_DIM%8==0
+    if(right.aligned) {
+        for(int pos=threadIdx.x*8;pos<ForwardKeys*FORWARD_WIDTH;pos+=ForwardThreads*8) {
+            const int row=pos/FORWARD_WIDTH,column=pos%FORWARD_WIDTH;
+            const bool valid=right.begin+row<right.end && right.channel_base+column<VALUE_DIM;
+            const Storage* source=right.source.data+(valid ?
+                ((right.begin+row)*HEADS+right.head)*VALUE_DIM+right.channel_base+column:0);
+            auto* destination=&shared.operands.operand_B_ref().at({row,column});
+            cutlass::arch::cp_async_zfill<16,cutlass::arch::CacheOperation::Global>(destination,source,valid);
+        }
+        cutlass::arch::cp_async_fence();
+    } else
+#endif
+    {
+        for(int pos=threadIdx.x;pos<ForwardKeys*FORWARD_WIDTH;pos+=ForwardThreads) {
+            const int row=pos/FORWARD_WIDTH,column=pos%FORWARD_WIDTH;
+            shared.operands.operand_B_ref().at({row,column})=GemmElement(right(row,column));
+        }
+    }
+}
+
+__device__ __forceinline__ void forward_value_gemm(ForwardValueTile& shared,
+    typename ForwardValueTraits::Accumulator& output) {
+    cutlass::arch::cp_async_wait<0>();
+    __syncthreads();
+    using Mma=cutlass::gemm::threadblock::MmaSingleStage<typename ForwardValueTraits::Shape,
+        ForwardReadyOperand,ForwardReadyOperand,ForwardReadyOperand,ForwardReadyOperand,
+        float,cutlass::layout::RowMajor,typename ForwardValueTraits::Core::MmaPolicy>;
+    Mma mma(shared.operands,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+    mma(1,output,ForwardReadyOperand{},ForwardReadyOperand{},output);
+    __syncthreads();
+}
+
+constexpr int ForwardReduction=((DIM+31)/32*32<256 ? (DIM+31)/32*32:256);
+struct ForwardScoreTraits {
+    using Shape=cutlass::gemm::GemmShape<ForwardRows,ForwardKeys,ForwardReduction>;
+    using SmemA=cutlass::layout::RowMajorTensorOpMultiplicandCrosswise<16,32>;
+    using SmemB=cutlass::layout::ColumnMajorTensorOpMultiplicandCrosswise<16,32>;
+    using Operator=typename cutlass::gemm::warp::DefaultMmaTensorOp<
+        cutlass::gemm::GemmShape<16,ForwardKeys/2,ForwardReduction>,GemmInstruction,
+        GemmElement,SmemA,GemmElement,SmemB,float,cutlass::layout::RowMajor,
+        cutlass::arch::OpMultiplyAdd>::Type;
+    using Policy=cutlass::gemm::threadblock::MmaPolicy<Operator,
+        cutlass::MatrixShape<0,0>,cutlass::MatrixShape<0,0>,1>;
+    using Base=cutlass::gemm::threadblock::MmaBase<Shape,Policy,1>;
+    using SharedStorage=typename Base::SharedStorage;
+    using Mainloop=cutlass::gemm::threadblock::MmaSingleStage<Shape,
+        ForwardReadyOperand,ForwardReadyOperand,ForwardReadyOperand,ForwardReadyOperand,
+        float,cutlass::layout::RowMajor,Policy>;
+};
+using ForwardScoreStorage=typename ForwardScoreTraits::SharedStorage;
+
+template<bool Query>
+__device__ __forceinline__ void forward_score_load(ForwardScoreStorage& shared,
+    AttentionTensor const& source,int64_t begin,int64_t end,int head,int channel_base) {
+    constexpr int Rows=Query ? ForwardRows:ForwardKeys;
+#if COMPACT && DIM%8==0
+    if((reinterpret_cast<uintptr_t>(source.data)&15)==0) {
+        // Match each warp's copy rows to the native 32-element crosswise tile.
+        constexpr int ThreadsPerRow=ForwardScoreTraits::SmemA::Base::kCrosswise/8;
+        for(int row=threadIdx.x/ThreadsPerRow;row<Rows;row+=ForwardThreads/ThreadsPerRow)
+        for(int column=(threadIdx.x%ThreadsPerRow)*8;column<ForwardReduction;column+=ThreadsPerRow*8) {
+            const bool valid=begin+row<end && channel_base+column<DIM;
+            const Storage* pointer=source.data+(valid ? ((begin+row)*HEADS+head)*DIM+channel_base+column:0);
+            GemmElement* destination;
+            if constexpr(Query) destination=&shared.operand_A_ref().at({row,column});
+            else destination=&shared.operand_B_ref().at({column,row});
+            cutlass::arch::cp_async_zfill<16,cutlass::arch::CacheOperation::Global>(destination,pointer,valid);
+        }
+        return;
+    }
+#endif
+    for(int pos=threadIdx.x;pos<Rows*ForwardReduction;pos+=ForwardThreads) {
+        const int row=pos/ForwardReduction,column=pos%ForwardReduction;
+        const GemmElement value=GemmElement(begin+row<end && channel_base+column<DIM ?
+            attention_feature(source,begin+row,head,channel_base+column,DIM):0.f);
+        if constexpr(Query) shared.operand_A_ref().at({row,column})=value;
+        else shared.operand_B_ref().at({column,row})=value;
+    }
+}
+#endif
+
+struct AttentionForwardShared {
+#if LOW_PRECISION
+    // Q remains live while K and the complete PV tile share the following bytes.
+    decltype(ForwardScoreStorage::operand_A) query;
+    union GemmStorage {
+        decltype(ForwardScoreStorage::operand_B) key;
+        ForwardValueTile value;
+    } gemm;
+#else
+    union GemmStorage {
+        native_score::Storage score;
+        AttentionGemmTile<FORWARD_WIDTH,true> value;
+    } gemm;
+    GemmElement probability[ForwardRows*ForwardKeys];
+#endif
+    float maximum[ForwardRows],normalizer[ForwardRows],rescale[ForwardRows];
+#if LOW_PRECISION
+    float partial[2][ForwardRows];
+#endif
+};
+#if LOW_PRECISION
+static_assert(offsetof(AttentionForwardShared,gemm)==offsetof(ForwardScoreStorage,operand_B),
+    "The library score storage must address the persistent Q and reusable K tile");
+#endif
+
+#if LOW_PRECISION
+using ForwardScoreMma=typename ForwardScoreTraits::Operator;
+
+// IteratorC owns two rows per lane. Four lanes share a row, and two N warps
+// share its 64 keys; only the row maximum and sum cross the N warps.
+__device__ __forceinline__ void forward_probabilities(AttentionForwardShared& shared,
+    ForwardScoreMma::FragmentC& scores,AttentionParams const& p,
+    int64_t begin,int64_t end,int64_t qb,int64_t kb,int segment,int head) {
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32,part=warp/2;
+    #pragma unroll
+    for(int r=0;r<2;++r) {
+        const int row=(warp%2)*16+lane/4+r*8;
+        float maximum=-INFINITY;
+        #pragma unroll
+        for(int n=0;n<4;++n) {
             #pragma unroll
-            for (int m=0;m<Rows;++m) maximum[m]=-INFINITY;
-            float denominator[Rows] = {};
-            typename ValueMma::FragmentC accumulator[Chunks];
-            #pragma unroll
-            for (int c=0;c<Chunks;++c) accumulator[c].clear();
-            for (int64_t key_start = begin; key_start < end && (!Causal || key_start <= query_start+Tile-1); key_start += Tile) {
-                typename Mma::FragmentC scores;
-                scores.clear();
-                for (int fb = 0; fb < Dim; fb += Width) {
-                    if constexpr (!LOW_PRECISION && Contiguous && Dim%4==0 && Width%4==0) {
-                        for (int i=tid*4;i<Tile*Width;i+=THREADS*4) {
-                            int r=i/Width, d=i%Width;
-                            float4 q={0, 0, 0, 0}, k={0, 0, 0, 0};
-                            if (query_start+r<end && fb+d<Dim) q=*reinterpret_cast<const float4*>(query.data+((query_start+r)*HEADS+head)*Dim+fb+d);
-                            if (key_start+r<end && fb+d<Dim) k=*reinterpret_cast<const float4*>(key.data+((key_start+r)*HEADS+head)*Dim+fb+d);
-                            if constexpr (RowMajor) {
-                                *reinterpret_cast<float4*>(&qcache[r][d])=q;
-                                *reinterpret_cast<float4*>(&kcache[r][d])=k;
-                            } else {
-                                left[d][r]=q.x;
-                                left[d+1][r]=q.y;
-                                left[d+2][r]=q.z;
-                                left[d+3][r]=q.w;
-                                right[d][r]=k.x;
-                                right[d+1][r]=k.y;
-                                right[d+2][r]=k.z;
-                                right[d+3][r]=k.w;
-                            }
-                        }
-                    } else {
-                        for (int i=tid;i<Tile*Width;i+=THREADS) {
-                            int r=i/Width, d=i%Width;
-                            float q=query_start+r<end && fb+d<Dim ? query.template load<Dim, Contiguous>(query_start+r, head, fb+d) : 0;
-                            if constexpr (RowMajor) qcache[r][d]=q;
-                            else left[d][r]=q;
-                            float k=key_start+r<end && fb+d<Dim ? key.template load<Dim, Contiguous>(key_start+r, head, fb+d) : 0;
-                            if constexpr (RowMajor) kcache[r][d]=k;
-                            else right[d][r]=k;
-                        }
-                    }
-                    __syncthreads();
-                    if (query_start+row<end && key_start+column<end) {
-                        #pragma unroll 2
-                        for (int d=0;d<Width && fb+d<Dim;++d) {
-                            typename Mma::FragmentA a;
-                            typename Mma::FragmentB b;
-                            #pragma unroll
-                            for (int m=0;m<Rows;++m) a[m]=RowMajor ? qcache[row+m][d] : left[d][row+m];
-                            #pragma unroll
-                            for (int n=0;n<PairColumns;++n) b[n]=RowMajor ? kcache[column+n*KeyStride][d] : right[d][column+n*KeyStride];
-                            Mma{}(scores, a, b, scores);
-                        }
-                    }
-                    if constexpr (Dim>Width || RowMajor) __syncthreads();
-                    else __syncwarp();
-                }
-                #pragma unroll
-                for (int m=0;m<Rows;++m) {
-                    int64_t query_index=query_start+row+m;
-                    float tile_max=-INFINITY;
-                    #pragma unroll
-                    for (int n=0;n<PairColumns;++n) {
-                        int64_t key_index=key_start+column+n*KeyStride;
-                        float s=-INFINITY;
-                        if (query_index<end && key_index<end && (!Causal || key_index<=query_index)) {
-                            s=scores[m*PairColumns+n]*scale;
-                            if constexpr (Kind==1) s+=bias.load(key_index*bias.strides[0]+head*bias.strides[1]);
-                            if constexpr (Kind==2) s+=bias.load(int64_t(segment)*bias.strides[0]+head*bias.strides[1]+(query_index-begin)*bias.strides[2]+(key_index-begin)*bias.strides[3]);
-                        }
-                        scores[m*PairColumns+n]=s;
-                        tile_max=fmaxf(tile_max, s);
-                    }
-                    #pragma unroll
-                    for (int shift=1;shift<Lanes;shift*=2) tile_max=fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, shift, Lanes));
-                    float updated=fmaxf(maximum[m], tile_max);
-                    float alpha=key_start!=begin && updated>-INFINITY ? __expf(maximum[m]-updated) : 0;
-                    float sum=0;
-                    #pragma unroll
-                    for (int n=0;n<PairColumns;++n) {
-                        float p=updated>-INFINITY ? __expf(scores[m*PairColumns+n]-updated) : 0;
-                        left[column+n*KeyStride][row+m]=p;
-                        sum+=p;
-                    }
-                    #pragma unroll
-                    for (int shift=1;shift<Lanes;shift*=2) sum+=__shfl_xor_sync(0xffffffff, sum, shift, Lanes);
-                    denominator[m]=denominator[m]*alpha+sum;
-                    maximum[m]=updated;
-                    if (key_start!=begin) {
-                        #pragma unroll
-                        for (int c=0;c<Chunks;++c) {
-                            #pragma unroll
-                            for (int n=0;n<Columns;++n) accumulator[c][m*Columns+n]*=alpha;
-                        }
-                    }
-                }
-                __syncthreads();
-                if constexpr (!LOW_PRECISION && Contiguous && ValueDim%4==0 && Width%4==0) {
-                    for (int i=tid*4;i<Tile*Width;i+=THREADS*4) {
-                        int r=i/Width, d=i%Width;
-                        float4 v={0, 0, 0, 0};
-                        if (key_start+r<end && vb+d<ValueDim) v=*reinterpret_cast<const float4*>(value.data+((key_start+r)*HEADS+head)*ValueDim+vb+d);
-                        if constexpr (RowMajor) *reinterpret_cast<float4*>(&kcache[r][d])=v;
-                        else {
-                            right[d][r]=v.x;
-                            right[d+1][r]=v.y;
-                            right[d+2][r]=v.z;
-                            right[d+3][r]=v.w;
-                        }
-                    }
-                } else {
-                    for (int i=tid;i<Tile*Width;i+=THREADS) {
-                        int r=i/Width, d=i%Width;
-                        float v=key_start+r<end && vb+d<ValueDim ? value.template load<ValueDim, Contiguous>(key_start+r, head, vb+d) : 0;
-                        if constexpr (RowMajor) kcache[r][d]=v;
-                        else right[d][r]=v;
-                    }
-                }
-                __syncthreads();
-                int keys=int(end-key_start<Tile ? end-key_start : Tile);
-                if (query_start+row<end) {
-                    #pragma unroll 2
-                    for (int k=0;k<keys;++k) {
-                        typename ValueMma::FragmentA a;
-                        #pragma unroll
-                        for (int m=0;m<Rows;++m) a[m]=left[k][row+m];
-                        #pragma unroll
-                        for (int c=0;c<Chunks;++c) {
-                            typename ValueMma::FragmentB b;
-                            #pragma unroll
-                            for (int n=0;n<Columns;++n) {
-                                int d=lane*Columns+c*Lanes*Columns+n;
-                                b[n]=d<Width ? (RowMajor ? kcache[k][d] : right[d][k]) : 0;
-                            }
-                            ValueMma{}(accumulator[c], a, b, accumulator[c]);
-                        }
-                    }
-                }
-                if (key_start+Tile<end && (!Causal || key_start+Tile<=query_start+Tile-1) || vb+ValueTile<ValueDim || query_start+FORWARD_WORKERS*Tile<end) __syncthreads();
-            }
-            #pragma unroll
-            for (int m=0;m<Rows;++m) if (query_start+row+m<end) {
-                int64_t index=(query_start+row+m)*HEADS+head;
-                float inverse=denominator[m]>0 ? 1.0f/denominator[m] : 0;
-                if (lane==0) {
-                    state[index*2]=maximum[m];
-                    state[index*2+1]=inverse;
-                }
-                #pragma unroll
-                for (int c=0;c<Chunks;++c) {
-                    int d=vb+lane*Columns+c*Lanes*Columns;
-                    if constexpr (!LOW_PRECISION && Columns%4==0 && ValueDim%4==0) {
-                        #pragma unroll
-                        for (int n=0; n<Columns; n+=4) if (d+n<ValueDim) {
-                            float4 result;
-                            result.x=accumulator[c][m*Columns+n]*inverse;
-                            result.y=accumulator[c][m*Columns+n+1]*inverse;
-                            result.z=accumulator[c][m*Columns+n+2]*inverse;
-                            result.w=accumulator[c][m*Columns+n+3]*inverse;
-                            *reinterpret_cast<float4*>(output+index*ValueDim+d+n)=result;
-                        }
-                    } else if constexpr (!LOW_PRECISION && Columns%2==0 && ValueDim%2==0) {
-                        #pragma unroll
-                        for (int n=0; n<Columns; n+=2) if (d+n<ValueDim)
-                            *reinterpret_cast<float2*>(output+index*ValueDim+d+n)=make_float2(accumulator[c][m*Columns+n]*inverse, accumulator[c][m*Columns+n+1]*inverse);
-                    } else {
-                        #pragma unroll
-                        for (int n=0;n<Columns;++n) if (d+n<ValueDim) output[index*ValueDim+d+n]=accumulator[c][m*Columns+n]*inverse;
-                    }
-                }
+            for(int j=0;j<2;++j) {
+                const int i=4*n+2*r+j,column=part*32+n*8+(lane%4)*2+j;
+                const bool valid=qb+row<end && kb+column<end && (!CAUSAL || kb+column<=qb+row);
+                scores[i]=valid ? scores[i]*p.scale+
+                    attention_bias<3>(p,segment,head,begin,qb+row,kb+column):-INFINITY;
+                maximum=fmaxf(maximum,scores[i]);
             }
         }
+        maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,1));
+        maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,2));
+        if(lane%4==0) shared.partial[part][row]=maximum;
+    }
+    __syncthreads();
+    float next[2],alpha[2];
+    #pragma unroll
+    for(int r=0;r<2;++r) {
+        const int row=(warp%2)*16+lane/4+r*8;
+        next[r]=fmaxf(shared.maximum[row],fmaxf(shared.partial[0][row],shared.partial[1][row]));
+        alpha[r]=shared.maximum[row]>-INFINITY ? __expf(shared.maximum[row]-next[r]):0.f;
+    }
+    // Every N warp must read the maxima before the same summaries hold sums.
+    __syncthreads();
+    #pragma unroll
+    for(int r=0;r<2;++r) {
+        const int row=(warp%2)*16+lane/4+r*8;
+        float sum=0.f;
+        #pragma unroll
+        for(int n=0;n<4;++n) {
+            const int column=part*32+n*8+(lane%4)*2;
+            cutlass::Array<float,2> values;
+            #pragma unroll
+            for(int j=0;j<2;++j) {
+                const int i=4*n+2*r+j;
+                values[j]=scores[i]>-INFINITY && next[r]>-INFINITY ? __expf(scores[i]-next[r]):0.f;
+                sum+=values[j];
+            }
+            auto converted=cutlass::NumericArrayConverter<GemmElement,float,2>{}(values);
+            *reinterpret_cast<uint32_t*>(&shared.gemm.value.operands.operand_A_ref().at({row,column}))=
+                *reinterpret_cast<uint32_t const*>(&converted);
+        }
+        sum+=__shfl_xor_sync(0xffffffff,sum,1);
+        sum+=__shfl_xor_sync(0xffffffff,sum,2);
+        if(lane%4==0) shared.partial[part][row]=sum;
+    }
+    __syncthreads();
+    if(part==0 && lane%4==0) {
+        #pragma unroll
+        for(int r=0;r<2;++r) {
+            const int row=(warp%2)*16+lane/4+r*8;
+            shared.maximum[row]=next[r];
+            shared.normalizer[row]=shared.normalizer[row]*alpha[r]+shared.partial[0][row]+shared.partial[1][row];
+            shared.rescale[row]=alpha[r];
+        }
+    }
+    __syncthreads();
+}
+
+template<int Tiles>
+__device__ __forceinline__ void forward_rescale(
+    typename AttentionGemmTraits<FORWARD_WIDTH,true>::Accumulator (&output)[Tiles],float const* rescale) {
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+    #pragma unroll
+    for(int r=0;r<2;++r) {
+        const int row=(warp%2)*16+lane/4+r*8;
+        const float alpha=rescale[row];
+        #pragma unroll
+        for(int tile=0;tile<Tiles;++tile)
+            #pragma unroll
+            for(int n=0;n<AttentionGemmTraits<FORWARD_WIDTH,true>::WarpColumns/8;++n) {
+                output[tile][4*n+2*r]*=alpha;
+                output[tile][4*n+2*r+1]*=alpha;
+            }
     }
 }
-"""
-
-
-BINDING_SOURCE = r"""
-void attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor v,
-    c10::optional<torch::Tensor> b, torch::Tensor csr, torch::Tensor output,
-    torch::Tensor state, double scale) {
-    c10::cuda::CUDAGuard device_guard(q.device());
-    Tensor3 query{reinterpret_cast<Storage*>(q.data_ptr()), q.stride(0), q.stride(1), q.stride(2)};
-    Tensor3 key{reinterpret_cast<Storage*>(k.data_ptr()), k.stride(0), k.stride(1), k.stride(2)};
-    Tensor3 value{reinterpret_cast<Storage*>(v.data_ptr()), v.stride(0), v.stride(1), v.stride(2)};
-    Bias bias{};
-    if (b.has_value()) {
-        bias.data = reinterpret_cast<Storage*>(b->data_ptr());
-        bias.fp32 = b->scalar_type() == at::kFloat;
-        for (int i = 0; i < b->dim(); ++i) bias.strides[i] = b->stride(i);
-    }
-    dim3 grid((csr.numel() - 1)*(FORWARD_ADJACENT ? FORWARD_WORKERS:1), q.size(1), FORWARD_ADJACENT ? 1:FORWARD_WORKERS);
-    auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
-    bool aligned = ((reinterpret_cast<uintptr_t>(query.data) |
-                     reinterpret_cast<uintptr_t>(key.data) |
-                     reinterpret_cast<uintptr_t>(value.data)) & 15) == 0;
-    if (csr.scalar_type() == at::kInt) {
-        if (aligned) {
-            FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, CONTIGUOUS, int32_t><<<grid, THREADS, SHARED_BYTES, stream>>>(query, key, value, bias,
-                    csr.data_ptr<int32_t>(), csr.stride(0), reinterpret_cast<Storage*>(output.data_ptr()),
-                    state.data_ptr<float>(), float(scale));
-        } else {
-            FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, false, int32_t><<<grid, THREADS, SHARED_BYTES, stream>>>(query, key, value, bias,
-                    csr.data_ptr<int32_t>(), csr.stride(0), reinterpret_cast<Storage*>(output.data_ptr()),
-                    state.data_ptr<float>(), float(scale));
-        }
-    } else {
-        if (aligned) {
-            FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, CONTIGUOUS, int64_t><<<grid, THREADS, SHARED_BYTES, stream>>>(query, key, value, bias,
-                    csr.data_ptr<int64_t>(), csr.stride(0), reinterpret_cast<Storage*>(output.data_ptr()),
-                    state.data_ptr<float>(), float(scale));
-        } else {
-            FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, false, int64_t><<<grid, THREADS, SHARED_BYTES, stream>>>(query, key, value, bias,
-                    csr.data_ptr<int64_t>(), csr.stride(0), reinterpret_cast<Storage*>(output.data_ptr()),
-                    state.data_ptr<float>(), float(scale));
+#else
+template<int Tiles>
+__device__ __forceinline__ void forward_rescale(
+    typename AttentionGemmTraits<FORWARD_WIDTH,true>::Accumulator (&output)[Tiles],float const* rescale) {
+    using Iterator=typename AttentionGemmTraits<FORWARD_WIDTH,true>::Operator::IteratorC;
+    using Policy=typename Iterator::Policy;
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const auto offset=Policy::get_lane_layout().inverse(lane);
+    #pragma unroll
+    for(int m=0;m<Iterator::Iterations::kRow;++m) {
+        #pragma unroll
+        for(int r=0;r<Policy::LaneMmaShape::kM;++r) {
+            const int row=(warp%2)*16+offset.row()*Policy::LaneMmaShape::kM+m*Iterator::Delta::kRow+r;
+            const float alpha=rescale[row];
+            #pragma unroll
+            for(int tile=0;tile<Tiles;++tile)
+                #pragma unroll
+                for(int n=0;n<Iterator::ThreadShape::kColumn;++n)
+                    output[tile][(m*Policy::LaneMmaShape::kM+r)*Iterator::ThreadShape::kColumn+n]*=alpha;
         }
     }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &attention_forward);
-#if SHARED_BYTES > 0
-    m.def("configure", []() {
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, CONTIGUOUS, int32_t>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES));
-#if !LOW_PRECISION && FORWARD_TILE >= 48
-        C10_CUDA_CHECK(cudaFuncSetAttribute(FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, CONTIGUOUS, int32_t>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
 #endif
-        C10_CUDA_CHECK(cudaFuncSetAttribute(
-            FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, CONTIGUOUS, int64_t>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES));
-#if !LOW_PRECISION && FORWARD_TILE >= 48
-        C10_CUDA_CHECK(cudaFuncSetAttribute(FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, CONTIGUOUS, int64_t>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+
+__global__ __launch_bounds__(ForwardThreads) void attention_forward_kernel(
+    const __grid_constant__ AttentionParams p) {
+    const int segment=blockIdx.x,head=blockIdx.y;
+    const int64_t begin=p.offset(segment),end=p.offset(segment+1);
+    extern __shared__ char storage[];
+    auto& shared=*reinterpret_cast<AttentionForwardShared*>(storage);
+    auto& gemm=shared.gemm;
+#if !LOW_PRECISION
+    auto& probability=shared.probability;
 #endif
-        if constexpr (CONTIGUOUS) {
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, false, int32_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES));
-#if !LOW_PRECISION && FORWARD_TILE >= 48
-        C10_CUDA_CHECK(cudaFuncSetAttribute(FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, false, int32_t>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+    constexpr int Values=(VALUE_DIM+FORWARD_WIDTH-1)/FORWARD_WIDTH;
+#if LOW_PRECISION
+    using ValueTraits=ForwardValueTraits;
+#else
+    using ValueTraits=AttentionGemmTraits<FORWARD_WIDTH,true>;
 #endif
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, false, int64_t>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES));
-#if !LOW_PRECISION && FORWARD_TILE >= 48
-        C10_CUDA_CHECK(cudaFuncSetAttribute(FORWARD_KERNEL<DIM, VALUE_DIM, BIAS_KIND, CAUSAL, false, int64_t>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
-#endif
+    using ValueMma=typename ValueTraits::Operator;
+    constexpr int WarpsMN=ForwardThreads/(32*ValueTraits::PartitionsK);
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const int value_offset=(warp/WarpsMN)*ForwardRows*FORWARD_WIDTH+
+        (warp%2)*16*FORWARD_WIDTH+
+        ((warp%WarpsMN)/2)*ValueTraits::WarpColumns;
+    for(int64_t qb=begin+int64_t(blockIdx.z)*ForwardRows;qb<end;qb+=int64_t(gridDim.z)*ForwardRows) {
+        typename ValueMma::FragmentC output[Values];
+        #pragma unroll
+        for(int tile=0;tile<Values;++tile) output[tile].clear();
+#if LOW_PRECISION
+        auto& score_storage=*reinterpret_cast<ForwardScoreStorage*>(&shared);
+        if constexpr(DIM<=ForwardReduction) {
+            forward_score_load<true>(score_storage,p.inputs[0],qb,end,head,0);
+            cutlass::arch::cp_async_fence();
         }
+#endif
+        for(int row=threadIdx.x;row<ForwardRows;row+=ForwardThreads) {
+            shared.maximum[row]=-INFINITY;
+            shared.normalizer[row]=0.f;
+        }
+        __syncthreads();
+        for(int64_t kb=begin;kb<end;kb+=ForwardKeys) {
+#if LOW_PRECISION
+            ForwardScoreMma::FragmentC scores;
+            scores.clear();
+            for(int channel=0;channel<DIM;channel+=ForwardReduction) {
+                if constexpr(DIM>ForwardReduction)
+                    forward_score_load<true>(score_storage,p.inputs[0],qb,end,head,channel);
+                forward_score_load<false>(score_storage,p.inputs[1],kb,end,head,channel);
+                cutlass::arch::cp_async_fence();
+                cutlass::arch::cp_async_wait<0>();
+                typename ForwardScoreTraits::Mainloop mma(score_storage,threadIdx.x,warp,lane);
+                mma(1,scores,ForwardReadyOperand{},ForwardReadyOperand{},scores);
+            }
+            forward_value_load(gemm.value,
+                AttentionGemmFeature<>(p.inputs[2],kb,end,head,VALUE_DIM,0));
+            forward_probabilities(shared,scores,p,begin,end,qb,kb,segment,head);
+            forward_rescale(output,shared.rescale);
+#else
+            auto scores=native_score::gemm(gemm.score,p,qb,kb,end,head);
+            #pragma unroll
+            for(int r=0;r<2;++r) {
+                const int row=warp*8+lane/8*2+r;
+                float maximum=-INFINITY;
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    const int column=lane%8*4+j;
+                    const bool valid=qb+row<end && kb+column<end && (!CAUSAL || kb+column<=qb+row);
+                    scores[r*4+j]=valid ? scores[r*4+j]*p.scale+
+                        attention_bias<3>(p,segment,head,begin,qb+row,kb+column):-INFINITY;
+                    maximum=fmaxf(maximum,scores[r*4+j]);
+                }
+                #pragma unroll
+                for(int shift=4;shift;shift/=2)
+                    maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffff,maximum,shift));
+                const float next=fmaxf(shared.maximum[row],maximum);
+                const float alpha=shared.maximum[row]>-INFINITY ? __expf(shared.maximum[row]-next):0.f;
+                float sum=0.f;
+                #pragma unroll
+                for(int j=0;j<4;++j) {
+                    const float value=scores[r*4+j]>-INFINITY && next>-INFINITY ? __expf(scores[r*4+j]-next):0.f;
+                    probability[row*ForwardKeys+lane%8*4+j]=value;
+                    sum+=value;
+                }
+                #pragma unroll
+                for(int shift=4;shift;shift/=2) sum+=__shfl_xor_sync(0xffffffff,sum,shift);
+                __syncwarp();
+                if(lane%8==0) {
+                    shared.maximum[row]=next;
+                    shared.normalizer[row]=shared.normalizer[row]*alpha+sum;
+                    shared.rescale[row]=alpha;
+                }
+            }
+            __syncthreads();
+            forward_rescale(output,shared.rescale);
+#endif
+            #pragma unroll
+            for(int tile=0;tile<Values;++tile) {
+#if LOW_PRECISION
+                if(tile) forward_value_load(gemm.value,
+                    AttentionGemmFeature<>(p.inputs[2],kb,end,head,VALUE_DIM,tile*FORWARD_WIDTH));
+                forward_value_gemm(gemm.value,output[tile]);
+#else
+                attention_gemm(gemm.value,gemm.value.result,int(min(int64_t(ForwardKeys),end-kb)),
+                    [&](int row,int k) {return probability[row*ForwardKeys+k];},
+                    [&](int k,int column) {return kb+k<end && tile*FORWARD_WIDTH+column<VALUE_DIM ?
+                        attention_feature(p.inputs[2],kb+k,head,tile*FORWARD_WIDTH+column,VALUE_DIM):0.f;},
+                    &output[tile]);
+#endif
+            }
+        }
+        for(int row=threadIdx.x;row<ForwardRows;row+=ForwardThreads)
+            shared.normalizer[row]=shared.normalizer[row]>0.f ? 1.f/shared.normalizer[row]:0.f;
+        __syncthreads();
+        #pragma unroll
+        for(int tile=0;tile<Values;++tile) {
+            typename ValueMma::IteratorC iterator({gemm.value.result+value_offset,cutlass::layout::RowMajor(FORWARD_WIDTH)},lane);
+            iterator.store(output[tile]);
+            __syncthreads();
+            if constexpr(ValueTraits::PartitionsK==2) {
+                for(int pos=threadIdx.x;pos<ForwardRows*FORWARD_WIDTH;pos+=ForwardThreads)
+                    gemm.value.result[pos]+=gemm.value.result[ForwardRows*FORWARD_WIDTH+pos];
+                __syncthreads();
+            }
+            constexpr int Pack=16/sizeof(Storage);
+            if constexpr(VALUE_DIM%Pack==0) {
+                for(int pos=threadIdx.x*Pack;pos<ForwardRows*FORWARD_WIDTH;pos+=ForwardThreads*Pack) {
+                    const int row=pos/FORWARD_WIDTH,column=tile*FORWARD_WIDTH+pos%FORWARD_WIDTH;
+                    if(qb+row<end && column+Pack<=VALUE_DIM) {
+                        cutlass::Array<float,Pack> values;
+                        const float inverse=shared.normalizer[row];
+                        #pragma unroll
+                        for(int i=0;i<Pack;++i) values[i]=gemm.value.result[pos+i]*inverse;
+                        auto converted=cutlass::NumericArrayConverter<GemmElement,float,Pack>{}(values);
+                        *reinterpret_cast<uint4*>(p.outputs[0].data+((qb+row)*HEADS+head)*VALUE_DIM+column)=
+                            *reinterpret_cast<uint4 const*>(&converted);
+                    }
+                }
+            } else {
+                for(int pos=threadIdx.x;pos<ForwardRows*FORWARD_WIDTH;pos+=ForwardThreads) {
+                    int row=pos/FORWARD_WIDTH,column=tile*FORWARD_WIDTH+pos%FORWARD_WIDTH;
+                    if(qb+row<end && column<VALUE_DIM)
+                        p.outputs[0].data[((qb+row)*HEADS+head)*VALUE_DIM+column]=Storage(gemm.value.result[pos]*shared.normalizer[row]);
+                }
+            }
+            __syncthreads();
+        }
+        for(int row=threadIdx.x;row<ForwardRows;row+=ForwardThreads) if(qb+row<end) {
+            const int64_t index=((qb+row)*HEADS+head)*2;
+            p.state.data[index]=shared.maximum[row];
+            p.state.data[index+1]=shared.normalizer[row];
+        }
+        __syncthreads();
+    }
+}
+
+std::vector<at::Tensor> attention_forward(std::vector<std::optional<at::Tensor>> inputs,
+    at::Tensor rowptr,double scale) {
+    c10::cuda::CUDAGuard guard(inputs[0]->device());
+    auto output=at::empty(inputs[2]->sizes(),inputs[2]->options());
+    auto state=at::empty({inputs[0]->size(0),int64_t(HEADS),int64_t(2)},inputs[0]->options().dtype(at::kFloat));
+    auto p=make_params(inputs,{output},rowptr,state,scale);
+    if(p.groups) {
+        attention_forward_kernel<<<dim3(p.groups,HEADS,WORKERS),ForwardThreads,
+            sizeof(AttentionForwardShared),at::cuda::getCurrentCUDAStream()>>>(p);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return {output,state};
+}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
+    m.def("run",&attention_forward);
+    m.def("configure",[]() {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(attention_forward_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(AttentionForwardShared)));
     });
-#endif
 }
+
 """
-
-@lru_cache(maxsize=None)
-def get_forward_kernel(dim, value_dim, heads, bias_kind, causal, contiguous, device,
-                       dtype=torch.float32, tile=32, query_workers=1, lower=0, upper=0):
-    arch = get_cuda_arch(device)
-    properties = get_device_properties(device)
-    shared_capacity = properties.shared_memory_per_multiprocessor
-    shared_bytes = 2 * tile * (
-        2 * ((dim + 15) // 16 * 16 + 8) + (value_dim + 7) // 8 * 8 + tile + 12
-    )
-    # Bound tensor-core fragments and fall back to SIMT for wider features.
-    tensor_core = dtype != torch.float32 and max(dim, value_dim) <= 256
-    if tensor_core and shared_bytes > 48 * 1024:
-        tensor_core = shared_bytes <= properties.shared_memory_per_block_optin
-    dynamic_bytes = shared_bytes if tensor_core and shared_bytes > 48 * 1024 else 0
-    feature_limit = 64
-    if dtype == torch.float32:
-        feature_limit = ((shared_capacity // 4 - 1024) // (2 * 33 * 4) // 32) * 32
-    if tensor_core:
-        kernel_name = "attention_forward_kernel"
-        threads = 2 * tile
-        minimum_blocks = min(8, shared_capacity // (shared_bytes + 1024))
-    else:
-        kernel_name = "attention_forward_simt_kernel"
-        threads = 256 if dtype == torch.float32 and tile == 32 else 128
-        features = max(dim, value_dim)
-        width = max(tile, (features + 31) // 32 * 32 if features <= feature_limit else 64)
-        row_major = dtype == torch.float32 and tile >= 48
-        dynamic_bytes = (2 * tile * (width + 4) if row_major else 2 * width * (tile + 1)) * 4
-        minimum_blocks = min(6 if tile == 48 else 4, shared_capacity // (dynamic_bytes + 1024))
-    adjacent_workers = query_workers > 1 and (dtype != torch.float32 or tile >= 48)
-    constants = (
-        dtype_defines(dtype) +
-        f"#define HEADS {heads}\n#define DIM {dim}\n#define VALUE_DIM {value_dim}\n"
-        f"#define BIAS_KIND {bias_kind}\n#define CAUSAL {str(causal).lower()}\n"
-        f"#define CONTIGUOUS {str(contiguous).lower()}\n"
-        f"#define FORWARD_MIN_LENGTH {lower}\n#define FORWARD_MAX_LENGTH {upper}\n"
-        f"#define FORWARD_FEATURE_LIMIT {feature_limit}\n#define FORWARD_TILE {tile}\n"
-        f"#define FORWARD_KERNEL {kernel_name}\n#define THREADS {threads}\n"
-        f"#define FORWARD_WORKERS {query_workers}\n#define FORWARD_ADJACENT {int(adjacent_workers)}\n"
-        f"#define SHARED_BYTES {dynamic_bytes}\n#define MIN_BLOCKS_PER_SM {minimum_blocks}\n"
-    )
-    source = FORWARD_SOURCE if tensor_core else FORWARD_SIMT_SOURCE
-    module = load_cuda_extension(
-        "attention_forward", constants + CUDA_SOURCE + source + BINDING_SOURCE,
-        arch=arch, minimal_headers=True, use_fast_math=False,
-    )
-    if dynamic_bytes:
-        with torch.cuda.device(device):
-            module.configure()
-    return module.forward
-
-
-@lru_cache(maxsize=None)
-def get_forward_kernels(dim, value_dim, heads, bias_kind, causal, contiguous, device,
-                        dtype, large):
-    ranges = ((0, 0, 32),)
-    if large and dtype == torch.float32:
-        ranges = ((0, 48, 48), (49, 0, 64))
-    elif large and max(dim, value_dim) <= 256:
-        shared64 = 128 * (2 * ((dim + 15) // 16 * 16 + 8)
-                          + (value_dim + 7) // 8 * 8 + 76)
-        capacity = get_device_properties(device).shared_memory_per_multiprocessor
-        if 2 * (shared64 + 1024) <= capacity:
-            ranges = ((0, 32, 32), (33, 0, 64))
-    kernels = []
-    for lower, upper, tile in ranges:
-        workers = 1
-        if dtype == torch.float32 and not (upper and upper <= tile):
-            workers = 2 if large else 4
-        kernels.append(get_forward_kernel(
-            dim, value_dim, heads, bias_kind, causal, contiguous, device, dtype,
-            tile, workers, lower, upper,
-        ))
-    return tuple(kernels)
 
 
 def attention_forward(inputs, rowptr, config):
-    q, k, v, bias = inputs[:4]
-    output = torch.empty(v.shape, device=v.device, dtype=v.dtype)
-    state = torch.empty((*v.shape[:2], 2), device=v.device, dtype=torch.float32)
-    if v.shape[0]:
-        kernels = get_forward_kernels(
-            config[0], config[1], config[2], config[6], config[4],
-            q.is_contiguous() and k.is_contiguous() and v.is_contiguous(),
-            v.device, v.dtype, v.shape[0] > 32 * (rowptr.numel() - 1),
+    if not inputs[0].shape[0]:
+        value = inputs[2]
+        return (torch.empty_like(value),
+                torch.empty((*value.shape[:2], 2), device=value.device, dtype=torch.float32))
+    dim, value_dim, heads, scale, causal, bias_kind = config
+    width = min(128, 1 << max(5, (value_dim-1).bit_length()))
+    rows = 32
+    workers = min(4, max(1, (inputs[0].shape[0]+rows*max(1, rowptr.numel()-1)-1)
+                            // (rows*max(1, rowptr.numel()-1))))
+    compact = all(value.is_contiguous() for i, value in enumerate(inputs)
+                  if value is not None and i not in (3, 8, 12))
+    key = compact, dim, value_dim, heads, causal, bias_kind, workers, inputs[0].device, inputs[0].dtype
+    kernel = KERNELS.get(key)
+    if kernel is None:
+        defines = (f"#define FORWARD_WIDTH {width}\n#define DIM {dim}\n#define VALUE_DIM {value_dim}\n"
+                   f"#define COMPACT {int(compact)}\n#define HEADS {heads}\n#define CAUSAL {int(causal)}\n"
+                   f"#define BIAS_KIND {bias_kind}\n#define PRESENT {15 if bias_kind else 7}\n"
+                   f"#define NEEDS 1\n#define WORKERS {workers}\n")
+        module = load_cuda_extension(
+            "attention_forward", dtype_defines(inputs[0].dtype) + defines + CUDA_SOURCE
+            + GEMM_SOURCE + ATTENTION_SOURCE + FORWARD_SOURCE,
+            arch=get_cuda_arch(inputs[0].device), use_fast_math=False, minimal_headers=True,
         )
-        for kernel in kernels:
-            kernel(q, k, v, bias, rowptr, output, state, config[3])
-    return output, state
+        with torch.cuda.device(inputs[0].device):
+            module.configure()
+        kernel = module.run
+        KERNELS[key] = kernel
+    return tuple(kernel(inputs, rowptr, scale))

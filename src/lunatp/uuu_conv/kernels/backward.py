@@ -1,6 +1,7 @@
 """UUU convolution backward CUDA."""
 
 from __future__ import annotations
+import textwrap
 from collections import defaultdict
 from copy import deepcopy
 import torch
@@ -181,7 +182,7 @@ def emit_path_contractions(
             )
             if resident_values is not None:
                 value = resident_values.get(name, value)
-            lines.append(f"const {scalar} {name} = {value};")
+            lines.append(f"    const {scalar} {name} = {value};")
     if order == 0:
         return emit_forward_contraction(op, spec, targets, lines, with_env=with_env)
     if (
@@ -197,10 +198,10 @@ def emit_path_contractions(
             # Contract the shorter source axis before weight scaling. The
             # same source projection supplies both source and scalar grads.
             scale = "w * e" if with_env else "w"
-            lines.append(f"const {scalar} scale = {scale};")
+            lines.append(f"    const {scalar} scale = {scale};")
             for i in range(dims["x"]):
                 lines.append(
-                    f"{scalar} source_base{i} = 0.0;\nconst {scalar} scaled_source{i} = scale * x{i};"
+                    f"    {scalar} source_base{i} = 0.0;\n    const {scalar} scaled_source{i} = scale * x{i};"
                 )
             for pairs in build_signed_ij_classes(
                 spec["terms"], spec_y_offset=0, y_name_base=0
@@ -209,24 +210,24 @@ def emit_path_contractions(
                     f"{float_literal(coefficient, dtype)} * g{k}"
                     for _i, _j, k, coefficient in pairs.members[0].terms
                 )
-                lines += ["{", f"const {scalar} projection = {projection};"]
+                lines += ["    {", f"        const {scalar} projection = {projection};"]
                 for member in pairs.members:
                     operation = "+=" if member.relative_sign > 0 else "-="
                     i, j = member.i_idx, member.j_name
                     lines.append(
-                        f"""source_base{i} {operation} y{j} * projection;\n{targets["gy"][j]} {operation} scaled_source{i} * projection;"""
+                        f"""        source_base{i} {operation} y{j} * projection;\n{targets["gy"][j]} {operation} scaled_source{i} * projection;"""
                     )
-                lines.append("}")
-            lines.append(f"{scalar} scalar_grad = 0.0;")
+                lines.append("    }")
+            lines.append(f"    {scalar} scalar_grad = 0.0;")
             for i in range(dims["x"]):
                 lines.append(
-                    f"""{targets["gx"][i]} += scale * source_base{i};\nscalar_grad += x{i} * source_base{i};"""
+                    f"""    {targets["gx"][i]} += scale * source_base{i};\nscalar_grad += x{i} * source_base{i};"""
                 )
             if "gw" in selected:
                 factor = "e * " if with_env else ""
-                lines.append(f"""{targets["gw"]} += {factor}scalar_grad;""")
+                lines.append(f"""    {targets["gw"]} += {factor}scalar_grad;""")
             if "ge" in selected:
-                lines.append(f"""{targets["ge"]} += w * scalar_grad;""")
+                lines.append(f"""    {targets["ge"]} += w * scalar_grad;""")
             lines.append("}")
             return "\n".join(lines)
         # The unweighted edge derivative also contracts with y to give the
@@ -234,7 +235,7 @@ def emit_path_contractions(
         # independently forming CG(x, y) and contracting with grad_out.
         scale = "w * e" if with_env else "w"
         if "gx" in selected:
-            lines.append(f"const {scalar} scale = {scale};")
+            lines.append(f"    const {scalar} scale = {scale};")
         classes = build_signed_ij_classes(spec["terms"], spec_y_offset=0, y_name_base=0)
         shared_basis = (
             "gx" in selected
@@ -246,23 +247,23 @@ def emit_path_contractions(
             and len(classes) > dims["y"]
         )
         for j in range(dims["y"]):
-            lines.append(f"{scalar} edge_grad{j} = 0.0;")
+            lines.append(f"    {scalar} edge_grad{j} = 0.0;")
             if shared_basis:
-                lines.append(f"const {scalar} node_basis{j} = y{j} * scale;")
+                lines.append(f"    const {scalar} node_basis{j} = y{j} * scale;")
         for pairs in classes:
             projection = " + ".join(
                 f"{float_literal(coefficient, dtype)} * g{k}"
                 for _i, _j, k, coefficient in pairs.members[0].terms
             )
-            lines += ["{", f"const {scalar} projection = {projection};"]
+            lines += ["    {", f"        const {scalar} projection = {projection};"]
             if "gx" in selected and not shared_basis:
                 lines.append(
-                    f"const {scalar} weighted_projection = scale * projection;"
+                    f"        const {scalar} weighted_projection = scale * projection;"
                 )
             for member in pairs.members:
                 operation = "+=" if member.relative_sign > 0 else "-="
                 lines.append(
-                    f"edge_grad{member.j_name} {operation} x{member.i_idx} * projection;"
+                    f"        edge_grad{member.j_name} {operation} x{member.i_idx} * projection;"
                 )
                 if "gx" in selected:
                     value = (
@@ -271,20 +272,20 @@ def emit_path_contractions(
                         else f"y{member.j_name} * weighted_projection"
                     )
                     lines.append(
-                        f"""{targets["gx"][member.i_idx]} {operation} {value};"""
+                        f"""        {targets["gx"][member.i_idx]} {operation} {value};"""
                     )
-            lines.append("}")
+            lines.append("    }")
         if "gx" not in selected:
-            lines.append(f"const {scalar} scale = {scale};")
-        lines.append(f"{scalar} scalar_grad = 0.0;")
+            lines.append(f"    const {scalar} scale = {scale};")
+        lines.append(f"    {scalar} scalar_grad = 0.0;")
         for j in range(dims["y"]):
-            lines.append(f"""{targets["gy"][j]} += scale * edge_grad{j};""")
-            lines.append(f"scalar_grad += y{j} * edge_grad{j};")
+            lines.append(f"""    {targets["gy"][j]} += scale * edge_grad{j};""")
+            lines.append(f"    scalar_grad += y{j} * edge_grad{j};")
         if "gw" in selected:
             scale = "e * " if with_env else ""
-            lines.append(f"""{targets["gw"]} += {scale}scalar_grad;""")
+            lines.append(f"""    {targets["gw"]} += {scale}scalar_grad;""")
         if "ge" in selected:
-            lines.append(f"""{targets["ge"]} += w * scalar_grad;""")
+            lines.append(f"""    {targets["ge"]} += w * scalar_grad;""")
         lines.append("}")
         return "\n".join(lines)
     if order == 2:
@@ -318,7 +319,7 @@ def emit_path_contractions(
             for component in range(dims["y"]):
                 expression = sum_product_expressions(products, 0, component, 0)
                 lines.append(
-                    f"const {scalar} forward_{feature}_{component} = {expression};"
+                    f"    const {scalar} forward_{feature}_{component} = {expression};"
                 )
     feature_family_stream = bool(feature_basis) and (
         op.compute_dtype == torch.float64
@@ -338,12 +339,12 @@ def emit_path_contractions(
                     0,
                 )
                 lines.append(
-                    f"const {scalar} basis_{output}_{gradient}_{component} = {expression};"
+                    f"    const {scalar} basis_{output}_{gradient}_{component} = {expression};"
                 )
     for name in sorted(z_names):
         for k in range(dims["g"]):
             expression = sum_product_expressions(program["z"][name], 0, 0, k)
-            lines.append(f"const {scalar} {name}_{k} = {expression};")
+            lines.append(f"    const {scalar} {name}_{k} = {expression};")
     classes = build_signed_ij_classes(spec["terms"], spec_y_offset=0, y_name_base=0)
     if forward_basis is not None:
         for cls, pairs in enumerate(classes):
@@ -357,7 +358,7 @@ def emit_path_contractions(
                     ("+" if member.relative_sign > 0 else "-") + f" ({value})"
                 )
             lines.append(
-                f"""const {scalar} forward_pair{cls} = {" ".join(additions)};"""
+                f"""    const {scalar} forward_pair{cls} = {" ".join(additions)};"""
             )
             for _i, _j, k, coefficient in pairs.members[0].terms:
                 target = (
@@ -366,7 +367,7 @@ def emit_path_contractions(
                     else targets["gg"]
                 )
                 lines.append(
-                    f"{target} += {float_literal(coefficient, dtype)} * forward_pair{cls};"
+                    f"    {target} += {float_literal(coefficient, dtype)} * forward_pair{cls};"
                 )
     stream_q = (
         (order == 3 or consume_q)
@@ -379,9 +380,9 @@ def emit_path_contractions(
     )
     for name in sorted(q_names):
         if stream_q:
-            lines.append("{")
+            lines.append("    {")
         for k in range(dims["g"]):
-            lines.append(f"{scalar} {name}_{k} = 0.0;")
+            lines.append(f"    {scalar} {name}_{k} = 0.0;")
         for cls, pairs in enumerate(classes):
             additions = []
             for member in pairs.members:
@@ -392,10 +393,10 @@ def emit_path_contractions(
                     ("+" if member.relative_sign > 0 else "-") + f" ({value})"
                 )
             expression = " ".join(additions)
-            lines.append(f"const {scalar} {name}_pair{cls} = {expression};")
+            lines.append(f"    const {scalar} {name}_pair{cls} = {expression};")
             for _i, _j, k, coefficient in pairs.members[0].terms:
                 lines.append(
-                    f"{name}_{k} += {float_literal(coefficient, dtype)} * {name}_pair{cls};"
+                    f"    {name}_{k} += {float_literal(coefficient, dtype)} * {name}_pair{cls};"
                 )
         if stream_q:
             for output, products in selected.items():
@@ -422,7 +423,7 @@ def emit_path_contractions(
                             if not isinstance(targets[output], str)
                             else targets[output]
                         )
-                        lines.append(f"""{target} += {" + ".join(parts)};""")
+                        lines.append(f"""    {target} += {" + ".join(parts)};""")
             lines.append("}")
     if feature_basis:
         # Transpose the sparse CG contraction: project each incoming-gradient
@@ -439,7 +440,7 @@ def emit_path_contractions(
         )
         for family in families:
             if feature_family_stream:
-                lines.append("{")
+                lines.append("    {")
                 for output, basis in feature_basis.items():
                     axis = output.removeprefix("g").removeprefix("r")
                     for gradient in family:
@@ -453,17 +454,17 @@ def emit_path_contractions(
                                 0,
                             )
                             lines.append(
-                                f"const {scalar} basis_{output}_{gradient}_{component} = {expression};"
+                                f"        const {scalar} basis_{output}_{gradient}_{component} = {expression};"
                             )
             for pairs in classes:
-                lines.append("{")
+                lines.append("    {")
                 for gradient in family:
                     expression = " + ".join(
                         f"{float_literal(coefficient, dtype)} * {gradient}{k}"
                         for _i, _j, k, coefficient in pairs.members[0].terms
                     )
                     lines.append(
-                        f"const {scalar} projection_{gradient} = {expression};"
+                        f"        const {scalar} projection_{gradient} = {expression};"
                     )
                 for output, basis in feature_basis.items():
                     axis = output.removeprefix("g").removeprefix("r")
@@ -475,9 +476,9 @@ def emit_path_contractions(
                         for gradient in basis:
                             if gradient in family:
                                 lines.append(
-                                    f"{target} {operation} basis_{output}_{gradient}_{other} * projection_{gradient};"
+                                    f"        {target} {operation} basis_{output}_{gradient}_{other} * projection_{gradient};"
                                 )
-                lines.append("}")
+                lines.append("    }")
             if feature_family_stream:
                 lines.append("}")
     for output, products in selected.items():
@@ -505,7 +506,7 @@ def emit_path_contractions(
                 if parts:
                     target = targets[output][i if axis == "x" else j]
                     lines.append(
-                        f"""{target} += {float_literal(coefficient, dtype)} * ({" + ".join(parts)});"""
+                        f"""    {target} += {float_literal(coefficient, dtype)} * ({" + ".join(parts)});"""
                     )
         elif not stream_q:
             for k in range(dims["g"]):
@@ -529,7 +530,7 @@ def emit_path_contractions(
                         if not isinstance(targets[output], str)
                         else targets[output]
                     )
-                    lines.append(f"""{target} += {" + ".join(parts)};""")
+                    lines.append(f"""    {target} += {" + ".join(parts)};""")
     lines.append("}")
     return "\n".join(lines)
 
@@ -549,8 +550,8 @@ def make_scalar_source_kernel(op, parameters, paths, scalar, kernel_suffix, sour
         }
         lines.append(
             r"""{{
-const {scalar} w = u < {channels} ? __ldg(weight + Index(edge) * {weight_numel} + {weight_offset} + u) : 0.0;
-{scalar} weight_grad = 0.0;""".format(
+    const {scalar} w = u < {channels} ? __ldg(weight + Index(edge) * {weight_numel} + {weight_offset} + u) : 0.0;
+    {scalar} weight_grad = 0.0;""".format(
                 scalar=scalar,
                 channels=channels,
                 weight_numel=op.weight_numel,
@@ -566,17 +567,17 @@ const {scalar} w = u < {channels} ? __ldg(weight + Index(edge) * {weight_numel} 
                 min(start + angular - 1, dimension - 1)
             ]
             lines += [
-                r"""{{
-const int component = j + {start};
-const bool active = u < {channels} && component < {dimension};
-const {scalar} gradient = active ? __ldg(grad_out + Index(d) * {out_dim} + {out_offset} + u * {dimension} + component) : 0.0;
-const {scalar} attribute = active ? __ldg(y + Index(edge) * {in2_dim} + {y_offset} + u * {dimension} + component) : 0.0;
-const {scalar} projection = ({coefficient}) * gradient;
-const {scalar} edge_grad = source * projection;
-node_grad += attribute * (w * projection);
-weight_grad += attribute * edge_grad;
-if (active) out_y[Index(edge) * {in2_dim} + {y_offset} + u * {dimension} + component] = w * edge_grad;
-}}""".format(
+                r"""    {{
+        const int component = j + {start};
+        const bool active = u < {channels} && component < {dimension};
+        const {scalar} gradient = active ? __ldg(grad_out + Index(d) * {out_dim} + {out_offset} + u * {dimension} + component) : 0.0;
+        const {scalar} attribute = active ? __ldg(y + Index(edge) * {in2_dim} + {y_offset} + u * {dimension} + component) : 0.0;
+        const {scalar} projection = ({coefficient}) * gradient;
+        const {scalar} edge_grad = source * projection;
+        node_grad += attribute * (w * projection);
+        weight_grad += attribute * edge_grad;
+        if (active) out_y[Index(edge) * {in2_dim} + {y_offset} + u * {dimension} + component] = w * edge_grad;
+    }}""".format(
                     start=start,
                     channels=channels,
                     dimension=dimension,
@@ -590,10 +591,11 @@ if (active) out_y[Index(edge) * {in2_dim} + {y_offset} + u * {dimension} + compo
             ]
         lines += [
             r"""#pragma unroll
-for (int delta = {first_delta}; delta; delta >>= 1) {{
-weight_grad += __shfl_down_sync(0xffffffffu, weight_grad, delta, {angular});
-}}
-if (!j && u < {channels}) out_w[Index(edge) * {weight_numel} + {weight_offset} + u] = weight_grad;
+    for (int delta = {first_delta}; delta; delta >>= 1) {{
+        weight_grad += __shfl_down_sync(0xffffffffu, weight_grad, delta, {angular});
+    }}
+    if (!j && u < {channels})
+    out_w[Index(edge) * {weight_numel} + {weight_offset} + u] = weight_grad;
 }}""".format(
                 first_delta=angular // 2,
                 angular=angular,
@@ -607,34 +609,34 @@ if (!j && u < {channels}) out_w[Index(edge) * {weight_numel} + {weight_offset} +
         r"""__global__ __launch_bounds__(128, 4)
 void {name}({parameters}) {{
 {null_declarations}
-const Index task = Index(blockIdx.x) * 4 + (threadIdx.x >> 5);
-if (task >= Index(num_nodes) * {tiles}) return;
-const int lane = threadIdx.x & 31;
-const int j = lane % {angular};
-const int u = int(task % {tiles}) * {channels_per_warp} + lane / {angular};
-const int rank = int(task / {tiles});
-const int s = source_node_order ? __ldg(source_node_order + rank) : rank;
-const {scalar} source = u < {channels} ? __ldg(x + Index(s) * {in1_dim} + {offset} + u) : 0.0;
-{scalar} node_grad = 0.0;
-for (Index p = src_rowptr[s]; p < src_rowptr[s + 1]; ++p) {{
-const Index edge = __ldg(edge_ids + p);
-const int d = __ldg(dst + edge);
+    const Index task = Index(blockIdx.x) * 4 + (threadIdx.x >> 5);
+    if (task >= Index(num_nodes) * {tiles}) return;
+    const int lane = threadIdx.x & 31;
+    const int j = lane % {angular};
+    const int u = int(task % {tiles}) * {channels_per_warp} + lane / {angular};
+    const int rank = int(task / {tiles});
+    const int s = source_node_order ? __ldg(source_node_order + rank) : rank;
+    const {scalar} source = u < {channels} ? __ldg(x + Index(s) * {in1_dim} + {offset} + u) : 0.0;
+    {scalar} node_grad = 0.0;
+    for (Index p = src_rowptr[s]; p < src_rowptr[s + 1]; ++p) {{
+        const Index edge = __ldg(edge_ids + p);
+        const int d = __ldg(dst + edge);
 
 {edge_contractions}
-}}
+    }}
 #pragma unroll
-for (int delta = {first_delta}; delta; delta >>= 1) {{
-node_grad += __shfl_down_sync(0xffffffffu, node_grad, delta, {angular});
-}}
-if (!j && u < {channels}) out_x[Index(s) * {in1_dim} + {offset} + u] = node_grad;
+    for (int delta = {first_delta}; delta; delta >>= 1) {{
+        node_grad += __shfl_down_sync(0xffffffffu, node_grad, delta, {angular});
+    }}
+    if (!j && u < {channels}) out_x[Index(s) * {in1_dim} + {offset} + u] = node_grad;
 }}
 """.format(
             name=name,
             parameters=parameters,
-            null_declarations="\n".join(
+            null_declarations=textwrap.indent("\n".join(
                 f"const {scalar}* {name} = nullptr;"
                 for name in ("re", "se", "grad_l0", "sl0") if name not in source_names
-            ),
+            ), '    '),
             tiles=tiles,
             angular=angular,
             channels_per_warp=channels_per_warp,
@@ -643,7 +645,7 @@ if (!j && u < {channels}) out_x[Index(s) * {in1_dim} + {offset} + u] = node_grad
             in1_dim=op.in1_dim,
             offset=offset,
             first_delta=angular // 2,
-            edge_contractions="\n".join(lines),
+            edge_contractions=textwrap.indent("\n".join(lines), '        '),
         ),
         name,
         tiles,
@@ -792,7 +794,7 @@ def make_source_edge_kernel(
                     address = f"Index(s) * {op.in1_dim} + {offset} + u * {dimension} + {component}"
                     pointer = CUDA_OPERANDS.get(role, role)
                     lines.append(
-                        f"source_inputs[{slot} * 32 + lane] = u < {channels} ? __ldg({pointer} + {address}) : 0.0;"
+                        f"    source_inputs[{slot} * 32 + lane] = u < {channels} ? __ldg({pointer} + {address}) : 0.0;"
                     )
                     resident_values[(group, role + str(component))] = (
                         f"source_inputs[{slot} * 32 + lane]"
@@ -827,11 +829,11 @@ def make_source_edge_kernel(
             elif role in env_roles:
                 targets[output] = f"acc_{role}"
             elif role in ("w", "rw") and role in outputs and spec["has_weight"]:
-                lines.append(f"{scalar} acc_{role} = 0.0;")
+                lines.append(f"    {scalar} acc_{role} = 0.0;")
                 targets[output] = f"acc_{role}"
         raw = with_l0 and path in op.l0_offsets
         lines.append(
-            emit_path_contractions(
+            textwrap.indent(emit_path_contractions(
                 op,
                 spec,
                 path,
@@ -852,7 +854,7 @@ def make_source_edge_kernel(
                     and order != 3
                     and (order != 2 or scalar == "double" or resident_blocks == 3)
                 ),
-            )
+            ), '    ')
         )
         if raw and with_env:
             raw_targets = {
@@ -861,12 +863,12 @@ def make_source_edge_kernel(
                 if r.removeprefix("g") not in ("e", "re")
             }
             lines.append(
-                emit_path_contractions(op, spec, path, order, raw_targets, raw_l0=True)
+                textwrap.indent(emit_path_contractions(op, spec, path, order, raw_targets, raw_l0=True), '    ')
             )
         for role in ("w", "rw"):
             if role in outputs and spec["has_weight"]:
                 lines.append(
-                    f"""out_{role}[Index(edge) * {op.weight_numel} + {int(spec["weight_offset"])} + u] = acc_{role};"""
+                    f"""    out_{role}[Index(edge) * {op.weight_numel} + {int(spec["weight_offset"])} + u] = acc_{role};"""
                 )
         lines.append("}")
     for role in edge_roles:
@@ -878,15 +880,16 @@ def make_source_edge_kernel(
                 lines.append("{")
                 for component in range(dimension):
                     lines.append(
-                        f"edge_stores[(threadIdx.x >> 5) * {32 * edge_width} + lane * {dimension} + {component}] = acc_{role}_{group}_{component};"
+                        f"    edge_stores[(threadIdx.x >> 5) * {32 * edge_width} + lane * {dimension} + {component}] = acc_{role}_{group}_{component};"
                     )
                 lines += [
-                    r"""__syncwarp();
-const int valid = min(32, {channels} - tile * 32);
-for (int local = lane; local < valid * {dimension}; local += 32) {{
-out_{role}[Index(edge) * {in2_dim} + {offset} + tile * 32 * {dimension} + local] {operation} edge_stores[(threadIdx.x >> 5) * {warp_store_width} + local];
-}}
-__syncwarp();
+                    r"""    __syncwarp();
+    const int valid = min(32, {channels} - tile * 32);
+    for (int local = lane; local < valid * {dimension}; local += 32) {{
+        out_{role}[Index(edge) * {in2_dim} + {offset} + tile * 32 * {dimension} + local] {operation}
+        edge_stores[(threadIdx.x >> 5) * {warp_store_width} + local];
+    }}
+    __syncwarp();
 }}""".format(
                         channels=channels,
                         dimension=dimension,
@@ -906,9 +909,10 @@ __syncwarp();
         lines += [
             r"""#pragma unroll
 for (int delta = 16; delta; delta >>= 1) {{
-acc_{role} += __shfl_down_sync(0xffffffffu, acc_{role}, delta);
+    acc_{role} += __shfl_down_sync(0xffffffffu, acc_{role}, delta);
 }}
-if (!lane) partial_{role}[Index(edge) * {env_parts} + {tile_offset} + tile] = acc_{role};""".format(
+if (!lane)
+partial_{role}[Index(edge) * {env_parts} + {tile_offset} + tile] = acc_{role};""".format(
                 role=role,
                 env_parts=env_parts,
                 tile_offset=tile_offset,
@@ -941,9 +945,10 @@ if (!lane) partial_{role}[Index(edge) * {env_parts} + {tile_offset} + tile] = ac
         if workers > 1:
             lines.append(
                 r"""if (neighbor_worker == 0 && u < {channels}) {{
-{scalar} {value} = 0.0;
+    {scalar} {value} = 0.0;
 #pragma unroll
-for (int worker = 0; worker < {workers}; ++worker) {value} += source_sums[{index} * {threads} + worker * 32 + lane];
+    for (int worker = 0; worker < {workers}; ++worker)
+    {value} += source_sums[{index} * {threads} + worker * 32 + lane];
 {store}
 }}""".format(
                     channels=channels,
@@ -952,13 +957,13 @@ for (int worker = 0; worker < {workers}; ++worker) {value} += source_sums[{index
                     workers=workers,
                     index=index,
                     threads=threads,
-                    store=store,
+                    store=textwrap.indent(store, '    '),
                 )
             )
         else:
             lines.append(r"""if (u < {channels}) {{
 {store}
-}}""".format(channels=channels, store=store))
+}}""".format(channels=channels, store=textwrap.indent(store, '    ')))
     node_reductions = "\n" + "\n".join(lines) if lines else ""
     name = f"""lunatp_uuuconv_{("fwd", "bwd", "double_bwd", "triple_bwd")[order]}_source_edge{kernel_suffix}"""
     # Two requested node-feature families retain both complete angular slices.
@@ -974,36 +979,38 @@ for (int worker = 0; worker < {workers}; ++worker) {value} += source_sums[{index
         r"""__global__ __launch_bounds__({threads}, {resident_blocks})
 void {name}({parameters}) {{
 {null_declarations}
-const Index task = {task};
-if (task >= Index(num_nodes) * {tiles}) return;
-const int lane = threadIdx.x & 31;
-const int tile = int(task % {tiles});
-const int u = tile * 32 + lane;
-const int rank = int(task / {tiles});
-const int s = source_node_order ? __ldg(source_node_order + rank) : rank;
-{node_setup}for (Index p = {begin}; p < src_rowptr[s + 1]; {step}) {{
-const Index edge = __ldg(edge_ids + p);
-const int d = __ldg(dst + edge);
+    const Index task = {task};
+    if (task >= Index(num_nodes) * {tiles}) return;
+    const int lane = threadIdx.x & 31;
+    const int tile = int(task % {tiles});
+    const int u = tile * 32 + lane;
+    const int rank = int(task / {tiles});
+    const int s = source_node_order ? __ldg(source_node_order + rank) : rank;
+{node_setup}
+    for (Index p = {begin}; p < src_rowptr[s + 1]; {step}) {{
+        const Index edge = __ldg(edge_ids + p);
+        const int d = __ldg(dst + edge);
 
 {edge_contractions}
-}}{node_reductions}
+    }}
+{node_reductions}
 }}
 """.format(
             threads=threads,
             resident_blocks=resident_blocks,
             name=name,
             parameters=parameters,
-            null_declarations="\n".join(
+            null_declarations=textwrap.indent("\n".join(
                 f"const {scalar}* {name} = nullptr;"
                 for name in ("re", "se", "grad_l0", "sl0") if name not in source_names
-            ),
+            ), '    '),
             task=task,
             tiles=tiles,
-            node_setup=node_setup,
+            node_setup=textwrap.indent(node_setup, "    "),
             begin=begin,
             step=step,
-            edge_contractions=edge_contractions,
-            node_reductions=node_reductions,
+            edge_contractions=textwrap.indent(edge_contractions, '        '),
+            node_reductions=textwrap.indent(node_reductions, "    "),
         ),
         name,
         tiles,
@@ -1054,16 +1061,18 @@ def make_destination_reduction(op, order, scalar, destination_bundles):
     )
     kernels.append(
         r"""__global__ void {name}({params}) {{
-const Index index = Index(blockIdx.x) * blockDim.x + threadIdx.x;
-if (index >= Index(num_nodes) * {in1_dim}) return;
-const int node = int(index / {in1_dim});
-const int component = int(index % {in1_dim});
-if (!({ranges})) return;
+    const Index index = Index(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= Index(num_nodes) * {in1_dim})
+    return;
+    const int node = int(index / {in1_dim});
+    const int component = int(index % {in1_dim});
+    if (!({ranges}))
+    return;
 {accumulators}
-for (Index p = src_rowptr[node]; p < src_rowptr[node + 1]; ++p) {{
-const Index edge = __ldg(edge_ids + p);
+    for (Index p = src_rowptr[node]; p < src_rowptr[node + 1]; ++p) {{
+        const Index edge = __ldg(edge_ids + p);
 {partial_sums}
-}}
+    }}
 {stores}
 }}
 """.format(
@@ -1071,14 +1080,14 @@ const Index edge = __ldg(edge_ids + p);
             params=params,
             in1_dim=op.in1_dim,
             ranges=ranges,
-            accumulators=accumulators,
-            partial_sums=partial_sums,
-            stores=output_stores,
+            accumulators=textwrap.indent(accumulators, '    '),
+            partial_sums=textwrap.indent(partial_sums, '        '),
+            stores=textwrap.indent(output_stores, '    '),
         )
     )
     calls = [
         "if (num_nodes > 0) {",
-        f"{name}<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>({args});",
+        f"    {name}<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>({args});",
         "}",
     ]
     launches += calls
@@ -1113,17 +1122,17 @@ def make_edge_reductions(op, scalar, partial_outputs, g_parts, g_slices, g_span)
                     for n in names
                 )
                 csr_reductions.append(
-                    r"""{branch} (component >= {offset} && component < {end}) {{
-const int local = component - {offset};
-for (EdgeIndex edge = {rowptr}[node]; edge < {rowptr}[node + 1]; ++edge) {{
+                    r"""{branch}(component >= {offset} && component < {end}) {{
+    const int local = component - {offset};
+    for (EdgeIndex edge = {rowptr}[node]; edge < {rowptr}[node + 1]; ++edge) {{
 {partial_sums}
-}}
+    }}
 }}""".format(
                         branch="if" if group_id == 0 else "else if",
                         offset=offset,
                         end=offset + dim * channels,
                         rowptr=rowptr,
-                        partial_sums=partial_sums,
+                        partial_sums=textwrap.indent(partial_sums, '        '),
                     )
                 )
         else:
@@ -1133,22 +1142,23 @@ for (EdgeIndex edge = {rowptr}[node]; edge < {rowptr}[node + 1]; ++edge) {{
             )
             csr_reductions.append(
                 r"""for (EdgeIndex p = {rowptr}[node]; p < {rowptr}[node + 1]; ++p) {{
-const EdgeIndex edge = {edge};
+    const EdgeIndex edge = {edge};
 {partial_sums}
 }}""".format(
                     rowptr=rowptr,
                     edge="edge_ids[p]" if traversal == "x" else "p",
-                    partial_sums=partial_sums,
+                    partial_sums=textwrap.indent(partial_sums, '    '),
                 )
             )
         output_stores = "\n".join(f"tensor_{n}[index] = value_{n};" for n in names)
         name = f"lunatp_uuuconv_reduce_edge_{traversal}"
         kernels.append(
-            r"""__global__ void {name}({params}, const EdgeIndex* {rowptr}, const EdgeIndex* edge_ids, int num_nodes) {{
-const Index index = Index(blockIdx.x) * blockDim.x + threadIdx.x;
-if (index >= Index(num_nodes) * {dimension}) return;
-const int node = int(index / {dimension});
-const int component = int(index % {dimension});
+            r"""__global__ void {name}({params}, const EdgeIndex *{rowptr}, const EdgeIndex *edge_ids, int num_nodes) {{
+    const Index index = Index(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= Index(num_nodes) * {dimension})
+    return;
+    const int node = int(index / {dimension});
+    const int component = int(index % {dimension});
 {accumulators}
 {csr_reductions}
 {stores}
@@ -1157,9 +1167,9 @@ const int component = int(index % {dimension});
                 params=params,
                 rowptr=rowptr,
                 dimension=dimension,
-                accumulators=accumulators,
-                csr_reductions="\n".join(csr_reductions),
-                stores=output_stores,
+                accumulators=textwrap.indent(accumulators, '    '),
+                csr_reductions=textwrap.indent("\n".join(csr_reductions), '    '),
+                stores=textwrap.indent(output_stores, '    '),
             )
         )
         reduce_args = ", ".join(
@@ -1168,8 +1178,8 @@ const int component = int(index % {dimension});
         graph_args = "srp, ep" if traversal == "x" else "drp, ep"
         calls = [
             r"""if (num_nodes > 0) {{
-dim3 grid((Index(num_nodes) * {dimension} + 255) / 256);
-{name}<<<grid, 256, 0, stream>>>({reduce_args}, {graph_args}, num_nodes);
+    dim3 grid((Index(num_nodes) * {dimension} + 255) / 256);
+    {name}<<<grid, 256, 0, stream>>>({reduce_args}, {graph_args}, num_nodes);
 }}""".format(
                 dimension=dimension,
                 name=name,
@@ -1188,24 +1198,26 @@ def make_envelope_reduction(scalar, env_names, env_parts):
     )
     partial_reductions = "\n".join(
         r"""{scalar} value_{role} = 0.0;
-for (int p = 0; p < {env_parts}; ++p) value_{role} += partial_{role}[edge * {env_parts} + p];
+for (int p = 0; p < {env_parts}; ++p)
+    value_{role} += partial_{role}[edge * {env_parts} + p];
 out_{role}[edge] = value_{role};""".format(scalar=scalar, role=n, env_parts=env_parts)
         for n in env_names
     )
     kernels.append(
         r"""__global__ void lunatp_uuuconv_reduce_env({env_parameters}, Index num_edges) {{
-const Index edge = Index(blockIdx.x) * blockDim.x + threadIdx.x;
-if (edge >= num_edges) return;
+    const Index edge = Index(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (edge >= num_edges)
+    return;
 {partial_reductions}
 }}""".format(
             env_parameters=env_parameters,
-            partial_reductions=partial_reductions,
+            partial_reductions=textwrap.indent(partial_reductions, '    '),
         )
     )
     env_args = ", ".join(f"partial_{n}, out_{n}" for n in env_names)
     calls = [r"""if (num_edges > 0) {{
-dim3 grid((num_edges + 255) / 256);
-lunatp_uuuconv_reduce_env<<<grid, 256, 0, stream>>>({env_args}, num_edges);
+    dim3 grid((num_edges + 255) / 256);
+    lunatp_uuuconv_reduce_env<<<grid, 256, 0, stream>>>({env_args}, num_edges);
 }}""".format(env_args=env_args)]
     launches += calls
     return kernels, launches
@@ -1224,24 +1236,26 @@ def make_source_node_reduction(op, scalar, source_node_parts, source_node_span):
         group_reductions.append(
             f"""if (feature >= {offset} && feature < {offset + dimension * channels}) {{\n{(partial_sums + chr(10) if partial_sums else "")}}}"""
         )
-    kernel = r"""__global__ void uuuconv_reduce_node_source_parts(const {scalar}* partial_x, const {scalar}* partial_rx, {scalar}* out_x, {scalar}* out_rx, int num_nodes) {{
-const Index index = Index(blockIdx.x) * blockDim.x + threadIdx.x;
-if (index >= Index(num_nodes) * {in1_dim}) return;
-const Index node = index / {in1_dim};
-const int feature = index % {in1_dim};
-{scalar} vx = 0.0, vrx = 0.0;
+    kernel = r"""__global__ void uuuconv_reduce_node_source_parts(const {scalar} *partial_x, const {scalar} *partial_rx,
+                                                 {scalar} *out_x, {scalar} *out_rx, int num_nodes) {{
+    const Index index = Index(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= Index(num_nodes) * {in1_dim})
+        return;
+    const Index node = index / {in1_dim};
+    const int feature = index % {in1_dim};
+    {scalar} vx = 0.0, vrx = 0.0;
 {group_reductions}
-out_x[index] = vx;
-out_rx[index] = vrx;
+    out_x[index] = vx;
+    out_rx[index] = vrx;
 }}
 """.format(
         scalar=scalar,
         in1_dim=op.in1_dim,
-        group_reductions="\n".join(group_reductions),
+        group_reductions=textwrap.indent("\n".join(group_reductions), '    '),
     )
     calls = [
         "if (num_nodes > 0) {",
-        f"uuuconv_reduce_node_source_parts<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>(out_x, out_rx, tensor_x.data_ptr<{scalar}>(), tensor_rx.data_ptr<{scalar}>(), num_nodes);",
+        f"    uuuconv_reduce_node_source_parts<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>(out_x, out_rx, tensor_x.data_ptr<{scalar}>(), tensor_rx.data_ptr<{scalar}>(), num_nodes);",
         "}",
     ]
     return kernel, calls
@@ -1328,7 +1342,7 @@ def make_destination_backward_kernel(
                 for key, _ in group_paths([spec for _, spec in chunk], stream_axis):
                     group = indices[stream_axis][key]
                     for component in range(key[1]):
-                        lines.append(f"{scalar} acc_{role}_{group}_{component} = 0.0;")
+                        lines.append(f"    {scalar} acc_{role}_{group}_{component} = 0.0;")
         for path, spec in chunk:
             x_key = int(spec["x_offset"]), int(spec["d1"]), int(spec["channels"])
             y_key = int(spec["y_offset"]), int(spec["d2"]), int(spec["channels"])
@@ -1345,10 +1359,10 @@ def make_destination_backward_kernel(
             }
             lines += [
                 f"""if (u < {int(spec["channels"])}) {{""",
-                f"{scalar} acc_w = 0.0;",
+                f"    {scalar} acc_w = 0.0;",
             ]
             if order == 3:
-                lines.append(f"{scalar} acc_rw = 0.0;")
+                lines.append(f"    {scalar} acc_rw = 0.0;")
                 targets.update(
                     grx=[
                         f"""acc_rx_{indices["x"][x_key]}_{i}"""
@@ -1361,29 +1375,29 @@ def make_destination_backward_kernel(
                     grw="acc_rw",
                 )
             lines.append(
-                emit_path_contractions(
+                textwrap.indent(emit_path_contractions(
                     op, spec, path, order, targets, source_axis_first=(order == 3),
-                )
+                ), '    ')
             )
             if spec["has_weight"]:
                 for role in ("w", "rw") if order == 3 else ("w",):
                     lines.append(
-                        f"""out_{role}[Index(edge) * {op.weight_numel} + {int(spec["weight_offset"])} + u] = acc_{role};"""
+                        f"""    out_{role}[Index(edge) * {op.weight_numel} + {int(spec["weight_offset"])} + u] = acc_{role};"""
                     )
             for k in range(int(spec["d3"])):
-                lines.append(f"{scalar} path_value_{k} = 0.0;")
+                lines.append(f"    {scalar} path_value_{k} = 0.0;")
             lines.append(
-                emit_path_contractions(
+                textwrap.indent(emit_path_contractions(
                     op,
                     spec,
                     path,
                     order,
                     {"gg": [f"path_value_{k}" for k in range(int(spec["d3"]))]},
-                )
+                ), '    ')
             )
             for k in range(int(spec["d3"])):
                 lines.append(
-                    f"neighbor_sums[{bases[path] + k} * {threads} + threadIdx.x] += path_value_{k};"
+                    f"    neighbor_sums[{bases[path] + k} * {threads} + threadIdx.x] += path_value_{k};"
                 )
             lines.append("}")
         if stream_axis:
@@ -1413,12 +1427,13 @@ def make_destination_backward_kernel(
         lines.append(f"""if (u < {int(spec["channels"])}) {{""")
         for k in range(int(spec["d3"])):
             lines += [
-                r"""{{
-{scalar} value = 0.0;
+                r"""    {{
+        {scalar} value = 0.0;
 #pragma unroll
-for (int worker = 0; worker < {workers}; ++worker) value += neighbor_sums[{reduction_slot} * {threads} + worker * 32 + lane];
-out_g[Index(d) * {out_dim} + {out_offset} + u * {d3} + {k}] = value;
-}}""".format(
+        for (int worker = 0; worker < {workers}; ++worker)
+        value += neighbor_sums[{reduction_slot} * {threads} + worker * 32 + lane];
+        out_g[Index(d) * {out_dim} + {out_offset} + u * {d3} + {k}] = value;
+    }}""".format(
                     scalar=scalar,
                     workers=workers,
                     reduction_slot=bases[path] + k,
@@ -1436,17 +1451,17 @@ out_g[Index(d) * {out_dim} + {out_offset} + u * {d3} + {k}] = value;
             threads=threads,
             name=name,
             parameters=parameters,
-            null_declarations="\n".join(
+            null_declarations=textwrap.indent("\n".join(
                 f"const {scalar}* {name} = nullptr;"
                 for name in ("re", "se", "grad_l0", "sl0") if name not in source_names
-            ),
+            ), '    '),
             tiles=tiles,
             scalar=scalar,
             shared_width=width * threads,
             workers=workers,
-            initialize_sums=initialize_sums,
-            edge_contractions=edge_contractions,
-            output_reductions="\n".join(lines),
+            initialize_sums=textwrap.indent(initialize_sums, '    '),
+            edge_contractions=textwrap.indent(edge_contractions, '        '),
+            output_reductions=textwrap.indent("\n".join(lines), '        '),
         ),
         name,
         tiles,
@@ -1511,7 +1526,7 @@ def make_bounded_source_leaves(
             raw = with_l0 and path in op.l0_offsets
             path_targets = dict(helper_targets)
             if path in scalar_paths:
-                body += ["{", f"{scalar} scalar_w = 0.0, scalar_rw = 0.0;"]
+                body += ["{", f"    {scalar} scalar_w = 0.0, scalar_rw = 0.0;"]
                 path_targets.update(gw="scalar_w", grw="scalar_rw")
             body.append(
                 emit_path_contractions(
@@ -1553,71 +1568,75 @@ def make_bounded_source_leaves(
             definitions.append(
                 triple_backward_cuda.BOUNDED_EDGE_SOURCE.format(
                     result_type=result_type,
-                    fields=" ".join(fields),
+                    fields=textwrap.indent(" ".join(fields), '    '),
                     helper=helper,
                     input_params=input_params,
-                    nulls=nulls,
-                    body="\n".join(body),
+                    nulls=textwrap.indent(nulls, '    '),
+                    body=textwrap.indent("\n".join(body), '    '),
                 )
             )
         else:
             definitions.append(
                 triple_backward_cuda.BOUNDED_NODE_SOURCE.format(
                     result_type=result_type,
-                    fields=" ".join(fields),
+                    fields=textwrap.indent(" ".join(fields), '    '),
                     helper=helper,
                     input_params=input_params,
-                    nulls=nulls,
+                    nulls=textwrap.indent(nulls, '    '),
                     workers=workers,
-                    body="\n".join(body),
+                    body=textwrap.indent("\n".join(body), '        '),
                 )
             )
         calls.append("{")
         if edge_centered:
-            calls.append(f"const auto result = {helper}({source_args}, edge, s, d, u);")
+            calls.append(f"    const auto result = {helper}({source_args}, edge, s, d, u);")
         else:
             calls.append(
-                f"""const auto result = {helper}({source_args}, src_rowptr, edge_ids, dst, s, u, {("neighbor_worker" if workers > 1 else "0")});"""
+                f"""    const auto result = {helper}({source_args}, src_rowptr, edge_ids, dst, s, u, {("neighbor_worker" if workers > 1 else "0")});"""
             )
         for output, target in targets.items():
             for v in range(dim):
-                calls.append(f"{target[v]} += result.{output}[{v}];")
+                calls.append(f"    {target[v]} += result.{output}[{v}];")
         calls.append("}")
     return definitions, calls
 
 
-SOURCE_GROUP_REDUCTION_KERNEL = r"""__global__ void uuuconv_reduce_source_groups(const {scalar}* __restrict__ partial, {scalar}* __restrict__ out, int num_nodes) {{
-const Index item = Index(blockIdx.x) * blockDim.x + threadIdx.x;
-if (item >= Index(num_nodes) * {in1_dim}) return;
-const Index node = item / {in1_dim};
-const int feature = item % {in1_dim};
-{scalar} value = 0.0;
-{covered_guard}{group_reductions}
-out[item] = value;
+SOURCE_GROUP_REDUCTION_KERNEL = r"""__global__ void uuuconv_reduce_source_groups(const {scalar} *__restrict__ partial, {scalar} *__restrict__ out,
+                                             int num_nodes) {{
+    const Index item = Index(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (item >= Index(num_nodes) * {in1_dim})
+        return;
+    const Index node = item / {in1_dim};
+    const int feature = item % {in1_dim};
+    {scalar} value = 0.0;
+    {covered_guard}{group_reductions}
+    out[item] = value;
 }}
 """
 
 
-CHANNEL_CSR_KERNEL = r"""__global__ __launch_bounds__({threads}, {min_blocks})
-void {kernel_name}({parameters}) {{
+CHANNEL_CSR_KERNEL = r"""__global__ __launch_bounds__({threads}, {min_blocks}) void {kernel_name}({parameters}) {{
 {nulls}
-const Index task = {task};
-const int lane = threadIdx.x & 31;
-const Index task_count = {rows} * {width};
-int group = 0, channel_base = 0;
-Index item; int node = 0, tile;
+    const Index task = {task};
+    const int lane = threadIdx.x & 31;
+    const Index task_count = {rows} * {width};
+    int group = 0, channel_base = 0;
+    Index item;
+    int node = 0, tile;
 {setup}
-switch (group) {{
+    switch (group) {{
 {cases}
-}}
+    }}
 }}
 """
 
-PATH_LEAF = r"""struct {result_type} {{ {fields} }};
+PATH_LEAF = r"""struct {result_type} {{
+{fields}
+}};
 __device__ __noinline__ {result_type} {helper}({input_params}, Index edge, int s, int d, int u) {{
 {helper_nulls}
-{result_type} result{{}};
+    {result_type} result{{}};
 {helper_body}
-return result;
+    return result;
 }}
 """

@@ -16,6 +16,8 @@ _ACCELERATED = {
     'Norm': ('..modules.norm', 'LunaEqNorm'),
     'SphericalHarmonics': ('..modules.spherical_harmonics', 'LunaEqSphericalHarmonics'),
     'spherical_harmonics': ('.spherical_harmonics.interface', 'spherical_harmonics'),
+    'SymmetricContraction': ('..modules.symmetric_contraction', 'LunaEqSymmetricContraction'),
+    'symmetric_contraction': ('.symmetric_contraction.interface', 'symmetric_contraction'),
 }
 
 

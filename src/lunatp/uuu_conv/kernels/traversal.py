@@ -1,6 +1,7 @@
 """UUU convolution traversal CUDA."""
 
 from __future__ import annotations
+import textwrap
 from collections import defaultdict
 import torch
 from ....utils.extension import load_tp_extension
@@ -555,8 +556,8 @@ def make_uuu_conv_source(
             kernels.append(kernel)
             calls = [
                 "if (num_nodes > 0) {",
-                f"dim3 grid(Index(num_nodes) * {tiles});",
-                f"{name}<<<grid, {threads}, 0, stream>>>({destination_arguments});",
+                f"    dim3 grid(Index(num_nodes) * {tiles});",
+                f"    {name}<<<grid, {threads}, 0, stream>>>({destination_arguments});",
                 "}",
             ]
             launches += calls
@@ -910,8 +911,8 @@ def make_uuu_conv_source(
                 )
             calls = [
                 "if (num_nodes > 0) {",
-                f"dim3 grid((Index(num_nodes) * {tiles} + {tasks_per_block - 1}) / {tasks_per_block});",
-                f"{name}<<<grid, {threads}, 0, stream>>>({source_edge_arguments});",
+                f"    dim3 grid((Index(num_nodes) * {tiles} + {tasks_per_block - 1}) / {tasks_per_block});",
+                f"    {name}<<<grid, {threads}, 0, stream>>>({source_edge_arguments});",
                 "}",
             ]
             launches += calls
@@ -963,13 +964,13 @@ def make_uuu_conv_source(
             )
             calls = [
                 "if (num_nodes > 0) {",
-                f"uuuconv_reduce_source_groups<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>(partial_node_x, out_x, num_nodes);",
+                f"    uuuconv_reduce_source_groups<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>(partial_node_x, out_x, num_nodes);",
                 "}",
             ]
             if order == 3:
                 calls += [
                     "if (num_nodes > 0) {",
-                    f"uuuconv_reduce_source_groups<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>(partial_node_rx, out_rx, num_nodes);",
+                    f"    uuuconv_reduce_source_groups<<<(Index(num_nodes) * {op.in1_dim} + 255) / 256, 256, 0, stream>>>(partial_node_rx, out_rx, num_nodes);",
                     "}",
                 ]
             launches += calls
@@ -1092,9 +1093,9 @@ def make_uuu_conv_source(
                         (int(spec["out_offset"]), int(spec["d3"]), k)
                         for k in range(int(spec["d3"]))
                     )
-            case = [f"case {group_id}: {{", "const int u = channel_base + lane;"]
+            case = [f"case {group_id}: {{", "    const int u = channel_base + lane;"]
             if not edge_env and not neighbor_reduction:
-                case.append(f"if (u >= {channels}) break;")
+                case.append(f"    if (u >= {channels}) break;")
             accum_roles = [
                 n
                 for n in wanted
@@ -1111,44 +1112,44 @@ def make_uuu_conv_source(
                 for v in range(dim):
                     if shared_g:
                         case.append(
-                            f"neighbor_sums[{v} * {threads} + threadIdx.x] = 0.0;"
+                            f"    neighbor_sums[{v} * {threads} + threadIdx.x] = 0.0;"
                         )
                     else:
-                        case.append(f"{scalar} acc_{n}_{v} = 0.0;")
+                        case.append(f"    {scalar} acc_{n}_{v} = 0.0;")
             for n in traversal_env_names if edge_env else ():
-                case.append(f"{scalar} acc_{n} = 0.0;")
+                case.append(f"    {scalar} acc_{n} = 0.0;")
             bounded_source = outlined_paths and traversal == "x" and len(paths) >= 8
             if edge_centered or traversal == "y":
-                case.append(r"""const Index edge = item;
-const int s = __ldg(src + edge);
-const int d = __ldg(dst + edge);
+                case.append(r"""    const Index edge = item;
+    const int s = __ldg(src + edge);
+    const int d = __ldg(dst + edge);
 """)
                 if edge_env:
-                    case.append(f"if (u < {channels}) {{")
+                    case.append(f"    if (u < {channels}) {{")
             elif traversal == "x":
                 if neighbor_reduction:
-                    case.append(f"if (u < {channels}) {{")
+                    case.append(f"    if (u < {channels}) {{")
                 begin = "src_rowptr[node]" + (
                     " + neighbor_worker" if workers > 1 else ""
                 )
                 step = f"p += {workers}" if workers > 1 else "++p"
-                case.append("const int s = node;")
+                case.append("    const int s = node;")
                 if not bounded_source:
-                    case.append(r"""for (Index p = {begin}; p < src_rowptr[node + 1]; {step}) {{
-const Index edge = __ldg(edge_ids + p);
-const int d = __ldg(dst + edge);
+                    case.append(r"""    for (Index p = {begin}; p < src_rowptr[node + 1]; {step}) {{
+        const Index edge = __ldg(edge_ids + p);
+        const int d = __ldg(dst + edge);
 """.format(begin=begin, step=step))
             elif traversal == "g":
                 if neighbor_reduction:
-                    case.append(f"if (u < {channels}) {{")
+                    case.append(f"    if (u < {channels}) {{")
                 edge_begin = "dst_rowptr[node]" + (
                     " + neighbor_worker" if workers > 1 else ""
                 )
                 edge_step = f"edge += {workers}" if workers > 1 else "++edge"
                 case.append(
-                    r"""const int d = node;
-for (Index edge = {edge_begin}; edge < dst_rowptr[node + 1]; {edge_step}) {{
-const int s = __ldg(src + edge);
+                    r"""    const int d = node;
+    for (Index edge = {edge_begin}; edge < dst_rowptr[node + 1]; {edge_step}) {{
+        const int s = __ldg(src + edge);
 """.format(
                         edge_begin=edge_begin, edge_step=edge_step,
                     )
@@ -1180,8 +1181,17 @@ const int s = __ldg(src + edge);
                 )
                 kernels.extend(helpers)
                 case.extend(calls)
+            path_indent = "    "
+            if traversal in ("x", "g") and not edge_centered:
+                if not bounded_source:
+                    path_indent += "    "
+                if neighbor_reduction:
+                    path_indent += "    "
+            elif edge_env:
+                path_indent += "    "
             for path, spec in () if bounded_source else paths:
-                case.append("{")
+                path_body = []
+                path_body.append("{")
                 path_targets = {}
                 for role in BACKWARD_OUTPUTS:
                     n = role.removeprefix("g")
@@ -1212,12 +1222,12 @@ const int s = __ldg(src + edge);
                         )
                     ) and (n not in ("w", "rw") or spec["has_weight"]):
                         if n in ("w", "rw"):
-                            case.append(f"{scalar} acc_{n} = 0.0;")
+                            path_body.append(f"    {scalar} acc_{n} = 0.0;")
                         path_targets[role] = f"acc_{n}"
                 if traversal == "g" and not direct_g_owner:
                     # One temporary per path separates node and raw L0 scaling.
                     for k in range(int(spec["d3"])):
-                        case.append(f"{scalar} path_value_{k} = 0.0;")
+                        path_body.append(f"    {scalar} path_value_{k} = 0.0;")
                     path_targets["gg"] = [
                         f"path_value_{k}" for k in range(int(spec["d3"]))
                     ]
@@ -1263,26 +1273,26 @@ const int s = __ldg(src + edge);
                     kernels.append(
                         backward_cuda.PATH_LEAF.format(
                             result_type=result_type,
-                            fields=" ".join(fields),
+                            fields=textwrap.indent(" ".join(fields), '    '),
                             helper=helper,
                             input_params=input_params,
-                            helper_nulls=helper_nulls,
-                            helper_body=helper_body,
+                            helper_nulls=textwrap.indent(helper_nulls, '    '),
+                            helper_body=textwrap.indent(helper_body, '    '),
                         )
                     )
-                    case.append(
-                        f"const auto result = {helper}({source_args}, edge, s, d, u);"
+                    path_body.append(
+                        f"    const auto result = {helper}({source_args}, edge, s, d, u);"
                     )
                     for output, target in path_targets.items():
                         axis = output.removeprefix("g").removeprefix("r")
                         if axis in path_dims:
                             for v in range(path_dims[axis]):
-                                case.append(f"{target[v]} += result.{output}[{v}];")
+                                path_body.append(f"    {target[v]} += result.{output}[{v}];")
                         else:
-                            case.append(f"{target} += result.{output};")
+                            path_body.append(f"    {target} += result.{output};")
                 else:
-                    case.append(
-                        emit_path_contractions(
+                    path_body.append(
+                        textwrap.indent(emit_path_contractions(
                             op,
                             spec,
                             path,
@@ -1294,7 +1304,7 @@ const int s = __ldg(src + edge);
                             and not with_env
                             and (traversal != "g" or paired_group),
                             consume_q=direct_g_owner,
-                        )
+                        ), '    ')
                     )
                 if raw and with_env and (traversal != "g" or paired_group):
                     raw_targets = {
@@ -1302,10 +1312,10 @@ const int s = __ldg(src + edge);
                         for r, t in path_targets.items()
                         if r.removeprefix("g") not in ("e", "re") and r != "gg"
                     }
-                    case.append(
-                        emit_path_contractions(
+                    path_body.append(
+                        textwrap.indent(emit_path_contractions(
                             op, spec, path, order, raw_targets, raw_l0=True,
-                        )
+                        ), '    ')
                     )
                 if (
                     traversal == "y"
@@ -1317,8 +1327,8 @@ const int s = __ldg(src + edge);
                             traversal == "x" and path in source_scalar_paths
                         )
                         if owner and spec["has_weight"]:
-                            case.append(
-                                f"""out_{n}[Index(edge) * {op.weight_numel} + {int(spec["weight_offset"])} + u] = acc_{n};"""
+                            path_body.append(
+                                f"""    out_{n}[Index(edge) * {op.weight_numel} + {int(spec["weight_offset"])} + u] = acc_{n};"""
                             )
                 if traversal == "g":
                     for k in range(int(spec["d3"])):
@@ -1328,27 +1338,28 @@ const int s = __ldg(src + edge);
                                 if shared_g
                                 else f"acc_g_{path_bases.get(path, 0) + k}"
                             )
-                            case.append(f"{target} += path_value_{k};")
+                            path_body.append(f"    {target} += path_value_{k};")
                     if raw and "l0" in wanted:
                         if with_env:
-                            case.append(f"{scalar} raw_value = 0.0;")
-                            case.append(
-                                emit_path_contractions(
+                            path_body.append(f"    {scalar} raw_value = 0.0;")
+                            path_body.append(
+                                textwrap.indent(emit_path_contractions(
                                     op,
                                     spec,
                                     path,
                                     order,
                                     {"gg": "raw_value"},
                                     raw_l0=True,
-                                )
+                                ), '    ')
                             )
                             value = "raw_value"
                         else:
                             value = "path_value_0"
-                        case.append(
-                            f"out_l0[Index(edge) * {op.l0_dim} + {op.l0_offsets[path]} + u] = {value};"
+                        path_body.append(
+                            f"    out_l0[Index(edge) * {op.l0_dim} + {op.l0_offsets[path]} + u] = {value};"
                         )
-                case.append("}")
+                path_body.append("}")
+                case.append(textwrap.indent("\n".join(path_body), path_indent))
             if traversal in ("x", "g") and not edge_centered:
                 if not bounded_source:
                     case.append("}")
@@ -1361,9 +1372,9 @@ const int s = __ldg(src + edge);
                     for v in range(dim):
                         if not shared_g:
                             case.append(
-                                f"neighbor_sums[({role_index * threads} + threadIdx.x) * {shared_stride} + {v}] = acc_{n}_{v};"
+                                f"    neighbor_sums[({role_index * threads} + threadIdx.x) * {shared_stride} + {v}] = acc_{n}_{v};"
                             )
-                case.append("__syncthreads();")
+                case.append("    __syncthreads();")
             for role_index, n in enumerate(accum_roles):
                 row, stride = (
                     ("node", op.in1_dim)
@@ -1376,7 +1387,7 @@ const int s = __ldg(src + edge);
                     row = "item"
                 guard = f"if (u < {channels}) " if edge_env else ""
                 if neighbor_reduction:
-                    case.append(f"if (neighbor_worker == 0 && u < {channels}) {{")
+                    case.append(f"    if (neighbor_worker == 0 && u < {channels}) {{")
                     for v in range(dim):
                         output_offset, output_dim, output_component = (
                             g_components[v]
@@ -1389,10 +1400,10 @@ const int s = __ldg(src + edge);
                             else f"({role_index * threads} + worker * 32 + lane) * {shared_stride} + {v}"
                         )
                         case.append(
-                            r"""{scalar} value_{v} = 0.0;
+                            r"""        {scalar} value_{v} = 0.0;
 #pragma unroll
-for (int worker = 0; worker < {workers}; ++worker) value_{v} += neighbor_sums[{shared_index}];
-out_{n}[Index({row}) * {stride} + {output_offset} + u * {output_dim} + {output_component}] = value_{v};""".format(
+        for (int worker = 0; worker < {workers}; ++worker) value_{v} += neighbor_sums[{shared_index}];
+        out_{n}[Index({row}) * {stride} + {output_offset} + u * {output_dim} + {output_component}] = value_{v};""".format(
                                 scalar=scalar,
                                 v=v,
                                 workers=workers,
@@ -1405,23 +1416,24 @@ out_{n}[Index({row}) * {stride} + {output_offset} + u * {output_dim} + {output_c
                                 output_component=output_component,
                             )
                         )
-                    case.append("}")
+                    case.append("    }")
                     continue
                 if coalesced_edge and dim > 1:
-                    case.append("{")
+                    case.append("    {")
                     for v in range(dim):
                         case.append(
-                            f"edge_stores[threadIdx.x * {dim} + {v}] = acc_{n}_{v};"
+                            f"        edge_stores[threadIdx.x * {dim} + {v}] = acc_{n}_{v};"
                         )
                     case.append(
-                        r"""const unsigned active = __activemask();
-__syncwarp(active);
-const int valid = min(32, {channels} - channel_base);
-for (int local = lane; local < valid * {dim}; local += valid) {{
-out_{n}[Index({edge_row}) * {in2_dim} + {offset} + channel_base * {dim} + local] = edge_stores[(threadIdx.x >> 5) * 32 * {dim} + local];
-}}
-__syncwarp(active);
-}}""".format(
+                        r"""        const unsigned active = __activemask();
+        __syncwarp(active);
+        const int valid = min(32, {channels} - channel_base);
+        for (int local = lane; local < valid * {dim}; local += valid) {{
+            out_{n}[Index({edge_row}) * {in2_dim} + {offset} + channel_base * {dim} + local] =
+            edge_stores[(threadIdx.x >> 5) * 32 * {dim} + local];
+        }}
+        __syncwarp(active);
+    }}""".format(
                             channels=channels,
                             dim=dim,
                             n=n,
@@ -1440,22 +1452,23 @@ __syncwarp(active);
                     address = f"Index({row}) * {stride} + {output_offset} + u * {output_dim} + {output_component}"
                     if n == "g" and g_parts > 1:
                         address = f"Index({row}) * {g_span} + {g_starts[group_id]} + u * {dim} + {v}"
-                    case.append(f"{guard}out_{n}[{address}] = acc_{n}_{v};")
+                    case.append(f"    {guard}out_{n}[{address}] = acc_{n}_{v};")
             if traversal == "y" or paired_group:
                 for n in traversal_env_names:
                     case.append(
                         r"""#pragma unroll
-for (int delta = 16; delta; delta >>= 1) {{
-acc_{n} += __shfl_down_sync(0xffffffffu, acc_{n}, delta);
-}}
-if (!lane) partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_{n};""".format(
+    for (int delta = 16; delta; delta >>= 1) {{
+        acc_{n} += __shfl_down_sync(0xffffffffu, acc_{n}, delta);
+    }}
+    if (!lane)
+    partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_{n};""".format(
                             n=n,
                             env_parts=env_parts,
                             edge_env_slot=edge_env_slot,
                             edge_row="item",
                         )
                     )
-            case += ["break;", "}"]
+            case += ["    break;", "}"]
             branches.append("\n".join(case))
             tile_base += width
         decode, base = [], 0
@@ -1463,7 +1476,7 @@ if (!lane) partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_
             width = (key[2] + 31) // 32
             decode += [
                 f"""{("if" if gid == 0 else "else if")} (tile < {base + width}) {{""",
-                f"group = {gid}; channel_base = (tile - {base}) * 32;",
+                f"    group = {gid}; channel_base = (tile - {base}) * 32;",
                 "}",
             ]
             base += width
@@ -1536,9 +1549,9 @@ if (!lane) partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_
                     min_blocks=min_blocks,
                     kernel_name=kernel_name,
                     parameters=parameters,
-                    nulls=nulls,
-                    setup="\n".join(setup),
-                    cases=body,
+                    nulls=textwrap.indent(nulls, '    '),
+                    setup=textwrap.indent("\n".join(setup), '    '),
+                    cases=textwrap.indent(body, "        "),
                     task=task_position,
                     rows=rows,
                     width=width,
@@ -1547,8 +1560,8 @@ if (!lane) partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_
             count = f"{rows} * {width}"
             calls = [
                 f"if ({rows} > 0) {{",
-                f"dim3 grid(({count} + {tasks_per_block - 1}) / {tasks_per_block});",
-                f"{kernel_name}<<<grid, {threads}, 0, stream>>>({arguments});",
+                f"    dim3 grid(({count} + {tasks_per_block - 1}) / {tasks_per_block});",
+                f"    {kernel_name}<<<grid, {threads}, 0, stream>>>({arguments});",
                 "}",
             ]
             launches += calls
@@ -1591,8 +1604,8 @@ if (!lane) partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_
             kernels.append(kernel)
             calls = [
                 "if (num_nodes > 0) {",
-                f"dim3 grid((Index(num_nodes) * {tiles} + {tasks_per_block - 1}) / {tasks_per_block});",
-                f"{name}<<<grid, {threads}, 0, stream>>>({arguments});",
+                f"    dim3 grid((Index(num_nodes) * {tiles} + {tasks_per_block - 1}) / {tasks_per_block});",
+                f"    {name}<<<grid, {threads}, 0, stream>>>({arguments});",
                 "}",
             ]
             source_launches += calls
@@ -1870,10 +1883,10 @@ if (!lane) partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_
     if buckets:
         stream_state = SOURCE_BUCKET_STREAMS
         state_parameter = "SourceBucketStreams& state, "
-        stream_binding = r"""    pybind11::class_<SourceBucketStreams>(module, "_Streams", pybind11::module_local())
-        .def(pybind11::init<int, const std::vector<int64_t>&>());
-    module.attr("_Streams").attr("stream_count") = 2;
-    module.attr("_Streams").attr("stream_priority") = 0;
+        stream_binding = r"""pybind11::class_<SourceBucketStreams>(module, "_Streams", pybind11::module_local())
+    .def(pybind11::init<int, const std::vector<int64_t> &>());
+module.attr("_Streams").attr("stream_count") = 2;
+module.attr("_Streams").attr("stream_priority") = 0;
 """
         body = ["C10_CUDA_CHECK(cudaEventRecord(state.start, stream));"]
         for bucket in range(2):
@@ -1904,9 +1917,9 @@ if (!lane) partial_{n}[Index({edge_row}) * {env_parts} + {edge_env_slot}] = acc_
         kernels="\n".join(kernels),
         stream_state=stream_state,
         state_parameter=state_parameter,
-        allocation_source=allocation_source,
-        declaration_source=declaration_source,
-        launch_body=launch_body,
+        allocation_source=textwrap.indent(allocation_source, '    '),
+        declaration_source=textwrap.indent(declaration_source, '    '),
+        launch_body=textwrap.indent(launch_body, '    '),
         contractions=", ".join(("tensor_" + name for name in outputs)),
         stream_binding=stream_binding,
     )

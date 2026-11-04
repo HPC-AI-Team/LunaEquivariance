@@ -7,6 +7,8 @@ from .lunatp import TensorProduct, TensorProductConv
 from .lunatp.interface import tensor_product, tensor_product_conv, prepare_tensor_product
 from .modules.linear import LunaEqLinear
 from .modules.spherical_harmonics import LunaEqSphericalHarmonics
+from .modules.symmetric_contraction import LunaEqSymmetricContraction
+from .o3.symmetric_contraction.interface import symmetric_contraction
 from .o3.spherical_harmonics.interface import spherical_harmonics
 from .modules.activation import LunaEqActivation
 from .modules.gate import LunaEqGate
@@ -30,9 +32,11 @@ from . import nn, o3
 
 # Match e3nn's spherical-harmonics function in the o3 namespace.
 o3.spherical_harmonics = spherical_harmonics
+o3.symmetric_contraction = symmetric_contraction
 
 Linear = LunaEqLinear
 SphericalHarmonics = LunaEqSphericalHarmonics
+SymmetricContraction = LunaEqSymmetricContraction
 Activation = LunaEqActivation
 Gate = LunaEqGate
 Norm = LunaEqNorm
@@ -45,6 +49,7 @@ class LunaEq:
 
     Linear = Linear
     SphericalHarmonics = SphericalHarmonics
+    SymmetricContraction = SymmetricContraction
     Activation = Activation
     Gate = Gate
     Norm = Norm
@@ -53,6 +58,7 @@ class LunaEq:
     EquivariantNorm = EquivariantNorm
     linear = staticmethod(linear)
     spherical_harmonics = staticmethod(spherical_harmonics)
+    symmetric_contraction = staticmethod(symmetric_contraction)
     activation = staticmethod(activation)
     gate = staticmethod(gate)
     norm = staticmethod(norm)
@@ -94,6 +100,7 @@ __all__ = [
     "make_graph",
     "LunaEqLinear",
     "LunaEqSphericalHarmonics",
+    "LunaEqSymmetricContraction",
     "LunaEqActivation",
     "LunaEqGate",
     "LunaEqNorm",
@@ -102,6 +109,8 @@ __all__ = [
     "Linear",
     "SphericalHarmonics",
     "spherical_harmonics",
+    "SymmetricContraction",
+    "symmetric_contraction",
     "Activation",
     "Gate",
     "Norm",

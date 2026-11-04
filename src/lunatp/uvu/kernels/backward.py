@@ -2,15 +2,20 @@
 
 from collections import defaultdict
 from collections.abc import Mapping
+from textwrap import indent
 import torch
 from ...utils.cg import weight_channel_offset
 from ....utils.precision import cuda_source_for_dtype, float_literal
 from ...utils.contractions import INPUTS, OUTPUT_SHAPES, PROGRAMS
 from ...utils.runtime import DERIVATIVE_STREAM_SOURCE
-from .utils import SHARED_WEIGHT_ROWS, make_grid_source, get_uvu_launch_config
+from .utils import (
+    SHARED_WEIGHT_ROWS,
+    UVU_FUSED_REGISTER_BUDGET,
+    make_grid_source,
+    get_uvu_launch_config,
+)
 
 
-# Instruction math and traversals used by the kernels above.
 def make_uvu_backward_source(
     meta: Mapping[str, object], *, need_grad_weight: bool = True, needs=None
 ) -> str:
@@ -346,29 +351,29 @@ def make_uvu_backward_source(
 
     yw_grouped_kernel = (
         r"""
-__global__ __launch_bounds__({group_threads})
-void lunatp_uvu_bwd_yw_grouped_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    float* __restrict__ gy_out,
-    float* __restrict__ gw_out,
+__global__ __launch_bounds__({group_threads}) void lunatp_uvu_bwd_yw_grouped_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    float *__restrict__ gy_out,
+    float *__restrict__ gw_out,
     int64_t num_items) {{
     const Index n = blockIdx.x;
     const int group = blockIdx.y;
     const int u = {group_u};
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (group) {{
 {y_group_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 """.format(
             group_threads=group_threads,
             group_u=group_u,
-            y_group_cases=chr(10).join(y_group_cases),
+            y_group_cases=indent("\n".join(y_group_cases), "        "),
         )
         if use_grouped_y
         else ""
@@ -399,7 +404,7 @@ void lunatp_uvu_bwd_yw_grouped_fp32(
             gy.data_ptr<float>(),
             {gw_work_pointer},
             x.size(0));
-{group_weight_reduction}""".format(
+        {group_weight_reduction}""".format(
             gw_work_allocation=gw_work_allocation,
             group_threads=group_threads,
             y_group_items_count=len(y_group_items),
@@ -576,87 +581,86 @@ constexpr bool GEN_SHARED_WEIGHT_REDUCE = {shared_weight_reduction};
 constexpr bool GEN_GROUPED_Y = {grouped_edges};
 constexpr bool GEN_UNIFORM_CHANNELS = {uniform_channels};
 
-{make_reduction_source}__global__ __launch_bounds__(GEN_X_THREADS, GEN_X_MIN_BLOCKS)
-void lunatp_uvu_bwd_x_fp32(
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    float* __restrict__ dx,
+{make_reduction_source}__global__ __launch_bounds__(GEN_X_THREADS, GEN_X_MIN_BLOCKS) void lunatp_uvu_bwd_x_fp32(
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    float *__restrict__ dx,
     int64_t num_items,
     bool shared_weight) {{
     const Index n = blockIdx.x;
     const int group = blockIdx.y;
     const int u = blockIdx.z * GEN_X_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (group) {{
 {grad_x_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_bwd_yw_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    float* __restrict__ gy_out,
-    float* __restrict__ gw_out,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_bwd_yw_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    float *__restrict__ gy_out,
+    float *__restrict__ gw_out,
     int64_t num_items,
     bool shared_weight) {{
     const Index n = blockIdx.x;
     const int spec = blockIdx.y;
     const int u = blockIdx.z * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (spec) {{
 {yw_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
 {yw_grouped_kernel}
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_bwd_y_shared_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ weight,
-    const float* __restrict__ grad_out,
-    float* __restrict__ gy_out,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_bwd_y_shared_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ weight,
+    const float *__restrict__ grad_out,
+    float *__restrict__ gy_out,
     int64_t num_items) {{
     const Index n = blockIdx.x;
     const int spec = blockIdx.y;
     const int u = blockIdx.z * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
-    if (n >= num_items) return;
+    if (n >= num_items)
+        return;
     switch (spec) {{
 {y_shared_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
-__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS)
-void lunatp_uvu_bwd_w_shared_partial_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ y,
-    const float* __restrict__ grad_out,
-    float* __restrict__ partials,
+__global__ __launch_bounds__(GEN_SPEC_THREADS, GEN_SPEC_MIN_BLOCKS) void lunatp_uvu_bwd_w_shared_partial_fp32(
+    const float *__restrict__ x,
+    const float *__restrict__ y,
+    const float *__restrict__ grad_out,
+    float *__restrict__ partials,
     int64_t num_items,
     int items_per_tile) {{
     const int spec = blockIdx.x;
     const int u = blockIdx.y * GEN_SPEC_CHANNEL_TILE + threadIdx.x;
     switch (spec) {{
 {w_shared_reduce_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
-
 
 torch::Tensor run_grad_x(torch::Tensor y, torch::Tensor weight, torch::Tensor grad_out, bool shared_weight) {{
     c10::cuda::CUDAGuard guard(grad_out.device());
     auto dx = torch::{input_allocator}({{grad_out.size(0), GEN_IN1_DIM}}, grad_out.options());
-    if (grad_out.size(0) == 0) return dx;
+    if (grad_out.size(0) == 0)
+        return dx;
     const dim3 block(GEN_X_THREADS);
     const dim3 grid(
         static_cast<unsigned int>(grad_out.size(0)),
@@ -677,7 +681,7 @@ torch::Tensor run_grad_x(torch::Tensor y, torch::Tensor weight, torch::Tensor gr
 std::vector<torch::Tensor> run_uvu_bwd(torch::Tensor x, torch::Tensor y, torch::Tensor weight, torch::Tensor grad_out, bool shared_weight) {{
     c10::cuda::CUDAGuard guard(x.device());
     const bool use_shared_weight_reduce = shared_weight && GEN_SHARED_WEIGHT_REDUCE &&
-        (!GEN_UNIFORM_CHANNELS || x.size(0) >= 2048);
+                                          (!GEN_UNIFORM_CHANNELS || x.size(0) >= 2048);
     auto dx = torch::{input_like_allocator}(x);
     auto gy = {edge_allocation};
     auto gw = {gw_allocation};
@@ -696,7 +700,7 @@ std::vector<torch::Tensor> run_uvu_bwd(torch::Tensor x, torch::Tensor y, torch::
         GEN_NUM_SPECS,
         static_cast<unsigned int>((GEN_MAX_CHANNELS + GEN_SPEC_CHANNEL_TILE - 1) / GEN_SPEC_CHANNEL_TILE));
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
-    auto& lane = derivative_stream(x.get_device(), stream);
+    auto &lane = derivative_stream(x.get_device(), stream);
     DerivativeFork fork(lane, stream);
     lunatp_uvu_bwd_x_fp32<<<x_grid, x_block, 0, lane.stream>>>(
         y.data_ptr<float>(),
@@ -706,7 +710,7 @@ std::vector<torch::Tensor> run_uvu_bwd(torch::Tensor x, torch::Tensor y, torch::
         x.size(0),
         shared_weight);
     if constexpr (GEN_GROUPED_Y) {{
-{group_launch}
+        {group_launch}
     }} else if (use_shared_weight_reduce) {{
         lunatp_uvu_bwd_y_shared_fp32<<<spec_grid, spec_block, 0, stream>>>(
             x.data_ptr<float>(),
@@ -714,7 +718,8 @@ std::vector<torch::Tensor> run_uvu_bwd(torch::Tensor x, torch::Tensor y, torch::
             grad_out.data_ptr<float>(),
             gy.data_ptr<float>(),
             x.size(0));
-{shared_weight_launch}    }} else {{
+        {shared_weight_launch}
+    }} else {{
         lunatp_uvu_bwd_yw_fp32<<<spec_grid, spec_block, 0, stream>>>(
             x.data_ptr<float>(),
             y.data_ptr<float>(),
@@ -730,7 +735,7 @@ std::vector<torch::Tensor> run_uvu_bwd(torch::Tensor x, torch::Tensor y, torch::
     return {{{outputs}}};
 }}
 
-}}  // namespace
+}} // namespace
 
 torch::Tensor lunatp_uvu_bwd_x_external_fp32(torch::Tensor y, torch::Tensor weight, torch::Tensor grad_out) {{
     return run_grad_x(y, weight, grad_out, false);
@@ -777,11 +782,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
         grouped_edges="true" if use_grouped_y else "false",
         uniform_channels="true" if len(channel_set) == 1 else "false",
         make_reduction_source=make_reduction_source(meta),
-        grad_x_cases=chr(10).join(grad_x_cases),
-        yw_cases=chr(10).join(yw_cases),
+        grad_x_cases=indent("\n".join(grad_x_cases), "        "),
+        yw_cases=indent("\n".join(yw_cases), "        "),
         yw_grouped_kernel=yw_grouped_kernel,
-        y_shared_cases=chr(10).join(y_shared_cases),
-        w_shared_reduce_cases=chr(10).join(w_shared_reduce_cases),
+        y_shared_cases=indent("\n".join(y_shared_cases), "        "),
+        w_shared_reduce_cases=indent("\n".join(w_shared_reduce_cases), "        "),
         input_allocator="zeros"
         if (
             sum(
@@ -820,15 +825,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 
 
 def use_uvu_dx_dy_dw_fusion(meta, order):
-    """Bound the live working set; retain tiled schedules for wide/high degrees."""
-    coords = {(s["x_offset"], s["d1"], s["channels"]) for s in meta["generated_specs"]}
-    return (
-        meta.get("dtype", torch.float32) is torch.float32
-        and meta["max_channels"] <= 256
-        # Higher-order direction and accumulator arrays need a smaller budget.
-        and sum(d for _, d, _ in coords) <= (16 if order == 1 else 9)
-        and meta["in2_dim"] <= (16 if order == 1 else 9)
+    """Bound cached scalars and accumulators before choosing the fused kernel."""
+    if meta.get("dtype", torch.float32) is not torch.float32 or meta["max_channels"] > 256:
+        return False
+    specs = meta["generated_specs"]
+    x_columns = sum(
+        d for _, d, _ in {(s["x_offset"], s["d1"], s["channels"]) for s in specs}
     )
+    y_columns = len({s["y_offset"] + j for s in specs for _, j, _, _ in s["terms"]})
+    program = PROGRAMS[order]
+    xouts, youts = program["x"], program["y"]
+    wouts = program["w"] if meta["weight_mode"] != "shared" else {}
+    forward = program["forward"]
+    z_names = {z for pairs in (*xouts.values(), *youts.values()) for _, z in pairs}
+    q_names = {q for pairs in wouts.values() for q, _ in pairs} | {
+        q for q, _ in forward
+    }
+    zforms = {k: v for k, v in program["z"].items() if k in z_names}
+    qforms = {k: v for k, v in program["cg"].items() if k in q_names}
+    xroles = {x for pairs in youts.values() for x, _ in pairs} | {
+        x for pairs in qforms.values() for x, _ in pairs
+    }
+    yroles = {y for pairs in xouts.values() for y, _ in pairs} | {
+        y for pairs in qforms.values() for _, y in pairs
+    }
+    weight_roles = {w for pairs in zforms.values() for w, _ in pairs} | {
+        w for _, w in forward
+    }
+    grad_roles = {g for pairs in zforms.values() for _, g in pairs} | {
+        g for pairs in wouts.values() for _, g in pairs
+    }
+    registers = x_columns * (len(xroles) + len(xouts))
+    registers += y_columns * (len(yroles) + len(youts))
+    registers += len(weight_roles) + len(grad_roles) + len(qforms) + len(zforms) + len(wouts)
+    registers += len(xroles) + len(yroles) + 16
+    return registers <= UVU_FUSED_REGISTER_BUDGET
 
 
 def make_uvu_dx_dy_dw_source(
@@ -911,40 +942,40 @@ def make_uvu_dx_dy_dw_source(
         wi = f"""{s["weight_offset"]} + {weight_channel_offset(s)}"""
         lines += [
             "{",
-            f"const bool active = edge_active && u < {c};",
-            f"const int64_t wi = weight_base + {wi};",
+            f"    const bool active = edge_active && u < {c};",
+            f"    const int64_t wi = weight_base + {wi};",
         ]
         for role in sorted(weight_roles):
-            lines.append(f"const float {role}v = active ? __ldg({role} + wi) : 0.0f;")
+            lines.append(f"    const float {role}v = active ? __ldg({role} + wi) : 0.0f;")
         for out in wouts:
-            lines.append(f"float {out}v = 0.0f;")
+            lines.append(f"    float {out}v = 0.0f;")
         by_k = defaultdict(list)
         for i, j, k, coef in s["terms"]:
             by_k[k].append((i, j, coef))
         for k, terms in sorted(by_k.items()):
             go_index = f"""item_g + {s["out_offset"]} + u * {s["d3"]} + {k}"""
-            lines.append("{")
+            lines.append("    {")
             for role in sorted(grad_roles):
                 lines.append(
-                    f"const float {role}v = active ? __ldg({role} + {go_index}) : 0.0f;"
+                    f"        const float {role}v = active ? __ldg({role} + {go_index}) : 0.0f;"
                 )
             for z, pairs in zforms.items():
                 expression = " + ".join(f"{w}v * {g}v" for w, g in pairs)
-                lines.append(f"const float {z} = {expression};")
+                lines.append(f"        const float {z} = {expression};")
             if order == 1 and not need_grad_weight and xouts and youts:
                 # With no Q consumer, coefficient*Z feeds both gradients without
                 # holding feature contractions live across output components.
                 for i, j, coef in terms:
                     xi = xids[(s["x_offset"], s["d1"], c, i)]
                     yi = yids[s["y_offset"] + j]
-                    lines += r"""{{
-const float cz = {coefficient} * z0;
-gx_{xi} = fmaf(cz, y_{yi}, gx_{xi});
-gy_{yi} = fmaf(cz, x_{xi}, gy_{yi});
-}}""".format(
+                    lines += r"""        {{
+            const float cz = {coefficient} * z0;
+            gx_{xi} = fmaf(cz, y_{yi}, gx_{xi});
+            gy_{yi} = fmaf(cz, x_{xi}, gy_{yi});
+        }}""".format(
                         coefficient=float_literal(coef), xi=xi, yi=yi
                     ).split("\n")
-                lines.append("}")
+                lines.append("    }")
                 continue
             by_i, by_j = defaultdict(list), defaultdict(list)
             for i, j, coef in terms:
@@ -952,47 +983,47 @@ gy_{yi} = fmaf(cz, x_{xi}, gy_{yi});
                 by_j[j].append((i, coef))
             for i, entries in sorted(by_i.items()):
                 idx = xids[(s["x_offset"], s["d1"], c, i)]
-                lines.append("{")
+                lines.append("        {")
                 for role in sorted({y for pairs in xouts.values() for y, _ in pairs}):
                     expr = " + ".join(
                         f"""({float_literal(coef)} * {role}_{yids[s["y_offset"] + j]})"""
                         for j, coef in entries
                     )
-                    lines.append(f"const float a{role}_{i} = {expr};")
+                    lines.append(f"            const float a{role}_{i} = {expr};")
                 for out, pairs in xouts.items():
                     for role, z in pairs:
                         lines.append(
-                            f"{out}_{idx} = fmaf(a{role}_{i}, {z}, {out}_{idx});"
+                            f"            {out}_{idx} = fmaf(a{role}_{i}, {z}, {out}_{idx});"
                         )
-                lines.append("}")
+                lines.append("        }")
             for q in qforms:
-                lines.append(f"float {q} = 0.0f;")
+                lines.append(f"        float {q} = 0.0f;")
             for j, entries in sorted(by_j.items()):
                 idx = yids[s["y_offset"] + j]
-                lines.append("{")
+                lines.append("        {")
                 for role in sorted(xroles):
                     expr = " + ".join(
                         f"""({float_literal(coef)} * {role}_{xids[s["x_offset"], s["d1"], c, i]})"""
                         for i, coef in entries
                     )
-                    lines.append(f"const float a{role} = {expr};")
+                    lines.append(f"            const float a{role} = {expr};")
                 for out, pairs in youts.items():
                     for role, z in pairs:
-                        lines.append(f"{out}_{idx} = fmaf(a{role}, {z}, {out}_{idx});")
+                        lines.append(f"            {out}_{idx} = fmaf(a{role}, {z}, {out}_{idx});")
                 for q, pairs in qforms.items():
                     for x, y in pairs:
-                        lines.append(f"{q} = fmaf(a{x}, {y}_{idx}, {q});")
-                lines.append("}")
+                        lines.append(f"            {q} = fmaf(a{x}, {y}_{idx}, {q});")
+                lines.append("        }")
             for out, pairs in wouts.items():
                 for q, g in pairs:
-                    lines.append(f"{out}v = fmaf({q}, {g}v, {out}v);")
+                    lines.append(f"        {out}v = fmaf({q}, {g}v, {out}v);")
             if forward:
                 expr = " + ".join(f"{q} * {w}v" for q, w in forward)
                 assign = "+=" if meta["zero_output"] else "="
-                lines.append(f"if (active) gg_out[{go_index}] {assign} {expr};")
-            lines.append("}")
+                lines.append(f"        if (active) gg_out[{go_index}] {assign} {expr};")
+            lines.append("    }")
         for out in wouts:
-            lines.append(f"if (active) {out}_out[item_w + {wi}] = {out}v;")
+            lines.append(f"    if (active) {out}_out[item_w + {wi}] = {out}v;")
         lines.append("}")
     for idx, (off, dim, c, i) in enumerate(xcoords):
         for out in xouts:
@@ -1007,10 +1038,10 @@ gy_{yi} = fmaf(cz, x_{xi}, gy_{yi});
     lines.append("__syncthreads();")
     for yi, out in enumerate(youts):
         lines += r"""for (int j=u; j<{edge_components}; j+={threads}) {{
-float total = 0.0f;
+    float total = 0.0f;
 #pragma unroll
-for (int v=0; v<{warps}; ++v) total += dy_sums[{yi}][edge_slot][v][j];
-if (edge_active) {out}_out[item_y + y_coordinates[j]] = total;
+    for (int v=0; v<{warps}; ++v) total += dy_sums[{yi}][edge_slot][v][j];
+    if (edge_active) {out}_out[item_y + y_coordinates[j]] = total;
 }}""".format(
             edge_components=len(ycoords),
             threads=edge_threads,
@@ -1024,7 +1055,7 @@ if (edge_active) {out}_out[item_y + y_coordinates[j]] = total;
     if order == 1 and outputs == ("gx",):
         kernel = f"lunatp_uvu_{phase}_{gradient_outputs}_fused_fp32"
     run_name = f"run_uvu_{phase}_{gradient_outputs}"
-    ptrs = ",\n".join(
+    ptrs = ",\n    ".join(
         [f"const float* __restrict__ {v}" for v in inputs]
         + [f"float* __restrict__ {v}_out" for v in outputs]
     )
@@ -1075,26 +1106,31 @@ if (edge_active) {out}_out[item_y + y_coordinates[j]] = total;
         )
     xonly = ""
     if order == 1 and x_cases is not None:
-        # Preserve the established source-group/channel-tiled x-only schedule.
+        # Group input-only work by source slice and channel tile.
         tile, x_threads, min_blocks = get_uvu_launch_config(meta["max_channels"])
         groups = len({(s["x_offset"], s["d1"], s["channels"]) for s in specs})
         xonly = r"""
-__global__ __launch_bounds__({x_threads},{min_blocks}) void lunatp_uvu_bwd_dx_fp32(const float* y,const float* weight,const float* grad_out,float* dx,bool shared_weight) {{
-const Index n=blockIdx.x;
-const int u=blockIdx.z*{tile}+threadIdx.x;
-switch(blockIdx.y) {{ {x_cases} }}
+__global__ __launch_bounds__({x_threads}, {min_blocks}) void lunatp_uvu_bwd_dx_fp32(const float *y, const float *weight, const float *grad_out, float *dx, bool shared_weight) {{
+    const Index n = blockIdx.x;
+    const int u = blockIdx.z * {tile} + threadIdx.x;
+    switch (blockIdx.y) {{
+{x_cases}
+    }}
 }}
-torch::Tensor run_dx(torch::Tensor y,torch::Tensor w,torch::Tensor g,bool shared_weight) {{
-c10::cuda::CUDAGuard guard(g.device());
-auto gx=torch::{input_allocator}({{g.size(0),GEN_IN1_DIM}},g.options());
-if(g.size(0)) {{ lunatp_uvu_bwd_dx_fp32<<<dim3(static_cast<unsigned int>(g.size(0)),{groups},{channel_tiles}),{x_threads},0,at::cuda::getCurrentCUDAStream(g.get_device())>>>(y.data_ptr<float>(),w.data_ptr<float>(),g.data_ptr<float>(),gx.data_ptr<float>(),shared_weight); C10_CUDA_KERNEL_LAUNCH_CHECK(); }}
-return gx;
+torch::Tensor run_dx(torch::Tensor y, torch::Tensor w, torch::Tensor g, bool shared_weight) {{
+    c10::cuda::CUDAGuard guard(g.device());
+    auto gx = torch::{input_allocator}({{g.size(0), GEN_IN1_DIM}}, g.options());
+    if (g.size(0)) {{
+        lunatp_uvu_bwd_dx_fp32<<<dim3(static_cast<unsigned int>(g.size(0)), {groups}, {channel_tiles}), {x_threads}, 0, at::cuda::getCurrentCUDAStream(g.get_device())>>>(y.data_ptr<float>(), w.data_ptr<float>(), g.data_ptr<float>(), gx.data_ptr<float>(), shared_weight);
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }}
+    return gx;
 }}
 """.format(
             x_threads=x_threads,
             min_blocks=min_blocks,
             tile=tile,
-            x_cases=chr(10).join(x_cases),
+            x_cases=indent("\n".join(x_cases), "        "),
             input_allocator="zeros"
             if (
                 sum(
@@ -1136,40 +1172,42 @@ return gx;
 #include <cuda_runtime.h>
 #include <vector>
 namespace {{
-constexpr int GEN_IN1_DIM={in1_dim};
-constexpr int GEN_IN2_DIM={in2_dim};
-constexpr int GEN_OUT_DIM={out_dim};
-constexpr int GEN_WEIGHT_NUMEL={weight_numel};
+constexpr int GEN_IN1_DIM = {in1_dim};
+constexpr int GEN_IN2_DIM = {in2_dim};
+constexpr int GEN_OUT_DIM = {out_dim};
+constexpr int GEN_WEIGHT_NUMEL = {weight_numel};
 {reduction_source}{weight_partial_source}
-__global__ __launch_bounds__({threads}) void {kernel}({ptrs},bool shared_weight,int64_t num_items) {{
-const int edge_slot=threadIdx.x/{edge_threads};
-const int u=threadIdx.x%{edge_threads},lane=u&31,warp=u>>5;
-const int64_t item=int64_t(blockIdx.x)*{edges_per_block}+edge_slot;
-const bool edge_active=item<num_items;
-const int64_t n=min(item,num_items-1);
-const int64_t item_x=n*GEN_IN1_DIM,item_y=n*GEN_IN2_DIM,item_g=n*GEN_OUT_DIM,item_w=n*GEN_WEIGHT_NUMEL;
-const int64_t weight_base=shared_weight?0:item_w;
-const int y_coordinates[{ycoords_count}]={{{map}}};
-__shared__ float dy_sums[{youts_count}][{edges_per_block}][{warps}][{ycoords_count}];
+__global__ __launch_bounds__({threads}) void {kernel}({ptrs}, bool shared_weight, int64_t num_items) {{
+    const int edge_slot = threadIdx.x / {edge_threads};
+    const int u = threadIdx.x % {edge_threads}, lane = u & 31, warp = u >> 5;
+    const int64_t item = int64_t(blockIdx.x) * {edges_per_block} + edge_slot;
+    const bool edge_active = item < num_items;
+    const int64_t n = min(item, num_items - 1);
+    const int64_t item_x = n * GEN_IN1_DIM, item_y = n * GEN_IN2_DIM, item_g = n * GEN_OUT_DIM, item_w = n * GEN_WEIGHT_NUMEL;
+    const int64_t weight_base = shared_weight ? 0 : item_w;
+    const int y_coordinates[{ycoords_count}] = {{{map}}};
+    __shared__ float dy_sums[{youts_count}][{edges_per_block}][{warps}][{ycoords_count}];
 {lines}
 }}
-std::vector<torch::Tensor> {run_name}({decls},bool shared_weight) {{
-c10::cuda::CUDAGuard guard(x.device());
+std::vector<torch::Tensor> {run_name}({decls}, bool shared_weight) {{
+    c10::cuda::CUDAGuard guard(x.device());
 {alloc}
-if(x.size(0)==0) {{ {contractions} return {{{outputs}}}; }}
-cudaStream_t stream=at::cuda::getCurrentCUDAStream(x.get_device());
-{main_launch}
+    if (x.size(0) == 0) {{
+        {contractions} return {{{outputs}}};
+    }}
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(x.get_device());
+    {main_launch}
 {reduce}
-C10_CUDA_KERNEL_LAUNCH_CHECK();
-return {{{outputs}}};
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {{{outputs}}};
 }}
 {xonly}
 }} // namespace
 {wrappers}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{
-cudaFuncAttributes attributes;
-const auto status=cudaFuncGetAttributes(&attributes,{kernel});
-TORCH_CHECK(status==cudaSuccess,"UVU gradient kernel initialization: ",cudaGetErrorString(status));
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    cudaFuncAttributes attributes;
+    const auto status = cudaFuncGetAttributes(&attributes, {kernel});
+    TORCH_CHECK(status == cudaSuccess, "UVU gradient kernel initialization: ", cudaGetErrorString(status));
 {binds}
 }}
 """.format(
@@ -1189,17 +1227,17 @@ TORCH_CHECK(status==cudaSuccess,"UVU gradient kernel initialization: ",cudaGetEr
         map=", ".join(map(str, ycoords)),
         youts_count=max(1, len(youts)),
         warps=warps,
-        lines=chr(10).join(lines),
+        lines=indent("\n".join(lines), "    "),
         decls=decls,
-        alloc=chr(10).join(alloc),
+        alloc=indent("\n".join(alloc), "    "),
         contractions=" ".join(f"{v}.zero_();" for v in weight_outputs),
         outputs=", ".join(outputs),
         args=args,
         main_launch=main_launch,
-        reduce=reduce,
+        reduce=indent(reduce, "    "),
         xonly=xonly,
         wrappers=chr(10).join(wrappers),
-        binds=binds,
+        binds=indent(binds, "    "),
     )
     return cuda_source_for_dtype(source, meta.get("dtype", torch.float32))
 
@@ -1282,7 +1320,7 @@ __global__ __launch_bounds__(256) void {name}({pointers}, int64_t num_items) {{
     const int64_t end = min(num_items, begin + {SHARED_WEIGHT_ROWS});
     __shared__ float sums[{len(weights)}][8][32];
     switch (blockIdx.y) {{
-{chr(10).join(cases)}
+{indent(chr(10).join(cases), "        ")}
     }}
 }}
 '''
@@ -1308,7 +1346,7 @@ if (weight_tiles > 1) launch_weight_reduction<{len(weights)}>({", ".join(partial
 
 
 def make_reduction_source(meta: Mapping[str, object], *, columns: int = 32) -> str:
-    """Keep whole-warp reductions unchanged and mask partial-warp sources."""
+    """Mask inactive source lanes in partial-warp reductions."""
     source = (r"""__device__ __forceinline__ float block_reduce_sum(float v) {
     static __shared__ float warp_sums[32];
     const int lane = threadIdx.x & 31;
@@ -1342,18 +1380,18 @@ __device__ __forceinline__ float warp_reduce_sum(float v, unsigned mask) {
         + r"""
     }
     return v;
-}
+    }
 
-// Reduce row-major weight contributions; one or two gradients share the launch.
-// The generated operator defines GEN_WEIGHT_NUMEL before this source fragment.
-template<int N_GRADS, int ROW_TILE = 0>
-__global__ __launch_bounds__(256)
-void lunatp_uvu_reduce_weight_fp32(
-    const float* __restrict__ partial0,
-    const float* __restrict__ partial1,
-    float* __restrict__ output0,
-    float* __restrict__ output1,
-    int64_t rows) {
+    // Reduce row-major weight contributions; one or two gradients share the launch.
+    // The generated operator defines GEN_WEIGHT_NUMEL before this source fragment.
+    template<int N_GRADS, int ROW_TILE = 0>
+    __global__ __launch_bounds__(256)
+    void lunatp_uvu_reduce_weight_fp32(
+        const float* __restrict__ partial0,
+        const float* __restrict__ partial1,
+        float* __restrict__ output0,
+        float* __restrict__ output1,
+        int64_t rows) {
     const int lane = threadIdx.x & %(lane_mask)d;
     const int %(row_name)s = threadIdx.x >> %(column_shift)d;
     constexpr int64_t column_blocks = (int64_t(GEN_WEIGHT_NUMEL) + %(columns)d - 1) / %(columns)d;
@@ -1364,17 +1402,17 @@ void lunatp_uvu_reduce_weight_fp32(
     float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     if (column < GEN_WEIGHT_NUMEL) {
-        for (int64_t row = begin + %(row_name)s; row < end; row += %(row_step)d) {
+    for (int64_t row = begin + %(row_name)s; row < end; row += %(row_step)d) {
             #pragma unroll
-            for (int part = 0; part < 4; ++part) {
-                const int64_t r = row + part * %(row_lanes)d;
-                if (r < end) {
-                    const int64_t offset = r * GEN_WEIGHT_NUMEL + column;
-                    acc0[part] += __ldg(partial0 + offset);
-                    if constexpr (N_GRADS == 2) acc1[part] += __ldg(partial1 + offset);
-                }
+        for (int part = 0; part < 4; ++part) {
+            const int64_t r = row + part * %(row_lanes)d;
+            if (r < end) {
+                const int64_t offset = r * GEN_WEIGHT_NUMEL + column;
+                acc0[part] += __ldg(partial0 + offset);
+                if constexpr (N_GRADS == 2) acc1[part] += __ldg(partial1 + offset);
             }
         }
+    }
     }
     __shared__ float sums[N_GRADS][256];
     sums[0][threadIdx.x] = (acc0[0] + acc0[1]) + (acc0[2] + acc0[3]);
@@ -1382,31 +1420,31 @@ void lunatp_uvu_reduce_weight_fp32(
         sums[1][threadIdx.x] = (acc1[0] + acc1[1]) + (acc1[2] + acc1[3]);
     __syncthreads();
     if (%(row_name)s == 0 && column < GEN_WEIGHT_NUMEL) {
-        float value0 = 0.0f;
-        float value1 = 0.0f;
+    float value0 = 0.0f;
+    float value1 = 0.0f;
         #pragma unroll
-        for (int w = 0; w < %(row_lanes)d; ++w) {
-            value0 += sums[0][w * %(columns)d + lane];
-            if constexpr (N_GRADS == 2) value1 += sums[1][w * %(columns)d + lane];
-        }
-        output0[tile * GEN_WEIGHT_NUMEL + column] = value0;
-        if constexpr (N_GRADS == 2) output1[tile * GEN_WEIGHT_NUMEL + column] = value1;
+    for (int w = 0; w < %(row_lanes)d; ++w) {
+        value0 += sums[0][w * %(columns)d + lane];
+        if constexpr (N_GRADS == 2) value1 += sums[1][w * %(columns)d + lane];
     }
-}
+    output0[tile * GEN_WEIGHT_NUMEL + column] = value0;
+    if constexpr (N_GRADS == 2) output1[tile * GEN_WEIGHT_NUMEL + column] = value1;
+    }
+    }
 
-template<int N_GRADS>
-void launch_weight_reduction(
-    const float* partial0, const float* partial1,
-    float* output0, float* output1,
-    int64_t rows, const torch::TensorOptions& options, cudaStream_t stream) {
+    template<int N_GRADS>
+    void launch_weight_reduction(
+        const float* partial0, const float* partial1,
+        float* output0, float* output1,
+        int64_t rows, const torch::TensorOptions& options, cudaStream_t stream) {
     constexpr int64_t column_blocks = (int64_t(GEN_WEIGHT_NUMEL) + %(columns)d - 1) / %(columns)d;
     // Narrow weights need independent row tiles before the final column sum.
     constexpr int ROW_TILE = 256;
     const int64_t tiles = (rows + ROW_TILE - 1) / ROW_TILE;
     if (tiles == 1) {
-        lunatp_uvu_reduce_weight_fp32<N_GRADS, ROW_TILE><<<column_blocks, 256, 0, stream>>>(
-            partial0, partial1, output0, output1, rows);
-        return;
+    lunatp_uvu_reduce_weight_fp32<N_GRADS, ROW_TILE><<<column_blocks, 256, 0, stream>>>(
+        partial0, partial1, output0, output1, rows);
+    return;
     }
     auto intermediate = torch::empty({int64_t(N_GRADS), tiles, int64_t(GEN_WEIGHT_NUMEL)}, options);
     float* work0 = intermediate.data_ptr<float>();
@@ -1415,7 +1453,7 @@ void launch_weight_reduction(
         partial0, partial1, work0, work1, rows);
     lunatp_uvu_reduce_weight_fp32<N_GRADS><<<column_blocks, 256, 0, stream>>>(
         work0, work1, output0, output1, tiles);
-}
+    }
 
 """) % dict(
         columns=columns,

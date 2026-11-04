@@ -64,8 +64,8 @@ def load_extension(
 ):
     """Build once per configuration; failed or interrupted builds remain retryable.
 
-    Reuse Torch's Ninja recipe, without its process-local version counter or
-    lock-file polling. Only completed libraries become visible to other ranks.
+    Reuse Torch's JIT naming and Ninja recipe with recoverable file locks.
+    Only completed libraries become visible to other ranks.
     """
     cuda_flags = list(extra_cuda_cflags)
     if cuda_sources:
@@ -102,12 +102,11 @@ def load_extension(
         if version_header.is_file():
             build += ((str(version_header), version_header.read_text()),)
     digest = hashlib.sha256(json.dumps(build).encode()).hexdigest()[:24]
-    name = f"{name}_{digest}"
     cache_dir = os.environ.get("LUNAEQ_CACHE_DIR")
     if not cache_dir:
         torch_cache = os.environ.get("TORCH_EXTENSIONS_DIR") or cpp_extension.get_default_build_root()
         cache_dir = str(Path(torch_cache) / "lunaeq")
-    root = Path(cache_dir).expanduser().resolve()
+    root = Path(cache_dir).expanduser().resolve() / digest
     key = str(root), name
     cached = MODULES.get(key)
     if cached is not None:
@@ -123,6 +122,15 @@ def load_extension(
         cached = MODULES.get(key)
         if cached is not None:
             return cached
+        # Follow torch's JIT naming so pybind11 can distinguish configurations.
+        with CACHE_LOCK:
+            version = cpp_extension.JIT_EXTENSION_VERSIONER.bump_version_if_changed(
+                name, source_files=(), build_arguments=((digest,),),
+                build_directory=str(root), with_cuda=bool(cuda_sources),
+                with_sycl=False, is_python_module=True, is_standalone=False,
+            )
+        if version > 0:
+            name = f"{name}_v{version}"
         root.mkdir(parents=True, exist_ok=True)
         library = root / f"{name}{cpp_extension.LIB_EXT}"
         lock_path = root / f"{name}.lock"

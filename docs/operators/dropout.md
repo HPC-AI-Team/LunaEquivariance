@@ -65,6 +65,15 @@ dropout.eval()
 assert dropout(x) is x
 ```
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: 2,083 atoms, 64 channels per degree, `Lmax=2–6`
+- Dropout: `p=0.35`, training mode
+
+![Dropout FP32 throughput and peak memory](../assets/performance/dropout.png)
+
 ## Limitations
 
 - GPU acceleration requires compute capability 8.0 or later. On older GPUs, eager execution falls back to PyTorch.

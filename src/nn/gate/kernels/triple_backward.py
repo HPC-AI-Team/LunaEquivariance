@@ -1,12 +1,22 @@
 """Gate CUDA third gradients, with independent input/output gradients."""
 
+from math import gcd
+
+import torch
+
 from ...activation.kernels.backward import BACKWARD_FUNCTIONS, BACKWARD_MATH
 from ...activation.kernels.double_backward import DOUBLE_BACKWARD_MATH, DOUBLE_BACKWARD_RESULT
 from ...activation.kernels.triple_backward import (
-    BINDING, MODULE_BINDING, TRIPLE_BACKWARD_MATH, TRIPLE_BACKWARD_RESULT,
+    TRIPLE_BACKWARD_MATH, TRIPLE_BACKWARD_RESULT,
     required_inputs as activation_required_inputs,
 )
-from .utils import make_binding, make_path_types, make_schedule
+from ...activation.kernels.utils import BINDING, MODULE_BINDING
+from .utils import (
+    DIRECT_STORE_BYTES, GATE_STORES, MIN_COPY_TILE, SHARED_MEMORY_LIMIT,
+    TRIPLE_BACKWARD_THREADS, WARP_SIZE,
+    get_kernel_config, launch_kernel, make_binding,
+    make_path_types, make_schedule,
+)
 
 TRIPLE_BACKWARD_MATH_SOURCE = r'''struct GateTripleValues {
     Element tx;
@@ -337,11 +347,12 @@ __device__ __forceinline__ void gate_triple_backward_scalar(
     if constexpr (WriteTG) out_tg[output] = result.tg;
     if constexpr (WriteTRX) out_trx[input] = result.trx;
 }
-template<class Path>
+template<class Path, bool SharedOutput = false>
 __device__ __forceinline__ void gate_triple_backward_product(
     const Element* x, const Element* grad_out, const Element* rx,
     const Element* bx, const Element* bg, Element* out_tx,
-    Element* out_tg, Element* out_trx, Index row, Index copy) {
+    Element* out_tg, Element* out_trx, Index row, Index copy,
+    Element* shared_tx = nullptr, Element* shared_tg = nullptr, Element* shared_trx = nullptr) {
     const Index gate_input = row * InWidth + Path::gate_offset + copy;
     const Index input = row * InWidth + Path::input_offset + copy * Path::components;
     const Index output = row * OutWidth + Path::output_offset + copy * Path::components;
@@ -393,29 +404,46 @@ __device__ __forceinline__ void gate_triple_backward_product(
     #pragma unroll
     for (int component = 0; component < Path::components; ++component) {
         if constexpr (WriteTX) {
+            Element tx;
             if constexpr (HasBg) {
-                out_tx[input + component] = gate_add(
+                tx = gate_add(
                     gate_multiply(output_seeds[component], result.direction_slope),
                     gate_multiply(result.curvature, grads[component]));
             } else {
-                out_tx[input + component] = gate_add(
+                tx = gate_add(
                     Element(0), gate_multiply(result.curvature, grads[component]));
+            }
+            if constexpr (SharedOutput) {
+                shared_tx[(threadIdx.x % 32) * Path::components + component] = tx;
+            } else {
+                out_tx[input + component] = tx;
             }
         }
         if constexpr (WriteTG) {
-            out_tg[output + component] = gate_add(
+            const Element tg = gate_add(
                 gate_add(gate_multiply(result.input_slope, directions[component]),
                          gate_multiply(input_seeds[component], result.direction_slope)),
                 gate_multiply(result.curvature, vectors[component]));
+            if constexpr (SharedOutput) {
+                shared_tg[(threadIdx.x % 32) * Path::components + component] = tg;
+            } else {
+                out_tg[output + component] = tg;
+            }
         }
         if constexpr (WriteTRX) {
+            Element trx;
             if constexpr (HasBg) {
-                out_trx[input + component] = gate_add(
+                trx = gate_add(
                     gate_multiply(output_seeds[component], gate),
                     gate_multiply(result.input_slope, grads[component]));
             } else {
-                out_trx[input + component] = gate_add(
+                trx = gate_add(
                     Element(0), gate_multiply(result.input_slope, grads[component]));
+            }
+            if constexpr (SharedOutput) {
+                shared_trx[(threadIdx.x % 32) * Path::components + component] = trx;
+            } else {
+                out_trx[input + component] = trx;
             }
         }
     }
@@ -431,7 +459,25 @@ TRIPLE_BACKWARD_KERNEL = r'''__global__ __launch_bounds__(128, 1) void gate_trip
          item < num_items * {count}; item += Index(gridDim.x) * 128) {{
         const Index row = item / {count};
         const Index group = item % {count};
-        {schedule}
+{schedule}
+    }}
+}}'''
+
+
+COALESCED_TRIPLE_BACKWARD_KERNEL = r'''__global__ __launch_bounds__({threads}, 1) void gate_triple_backward(
+    const Element* __restrict__ x, const Element* __restrict__ grad_out,
+    const Element* __restrict__ rx, const Element* __restrict__ bx,
+    const Element* __restrict__ bg, Element* __restrict__ out_tx,
+    Element* __restrict__ out_tg, Element* __restrict__ out_trx, int64_t num_items) {{
+    __shared__ __align__(16) Element shared_values[{threads} * {max_components} * {buffers}];
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const Index tasks = ((num_items + {rows_per_warp} - 1) / {rows_per_warp}) * {tiles};
+    for (Index task = Index(blockIdx.x) * {warps} + warp;
+         task < tasks; task += Index(gridDim.x) * {warps}) {{
+        const Index row = (task / {tiles}) * {rows_per_warp} + lane / {copy_tile};
+        const Index group = task % {tiles};
+{schedule}
     }}
 }}'''
 
@@ -489,17 +535,73 @@ def make_source(meta, config, *, tensor_only=False, fragments=False):
         "gate_triple_backward_scalar<{path}>(x, grad_out, rx, bx, bg, out_tx, out_tg, out_trx, row, copy);",
         "gate_triple_backward_product<{path}>(x, grad_out, rx, bx, bg, out_tx, out_tg, out_trx, row, copy);",
     )
+    max_components = max((path["components"] for path in meta["gated_paths"]), default=1)
+    copy_tile = gcd(WARP_SIZE, *(copies for _, _, copies in paths))
+    rows_per_warp = WARP_SIZE // copy_tile
+    buffers = len(config["active_outputs"])
+    coalesced = (
+        bool(meta["gated_paths"])
+        and max_components * TRIPLE_BACKWARD_THREADS * buffers * (8 if config["dtype"] == torch.float64 else 4) <= SHARED_MEMORY_LIMIT
+        and copy_tile >= MIN_COPY_TILE
+    )
+    if coalesced:
+        declarations.append(GATE_STORES)
+        pointers = []
+        stores = []
+        for name, width in (("tx", "InWidth"), ("tg", "OutWidth"), ("trx", "InWidth")):
+            if name in config["active_outputs"]:
+                offset = len(stores) * TRIPLE_BACKWARD_THREADS * max_components
+                pointers.append(f"shared_values + {offset} + warp * 32 * {max_components}")
+                field = "output_offset" if name == "tg" else "input_offset"
+                stores.append(
+                    f"    gate_store_components<{width}, {{path}}::{field}, {{path}}::components, {{copies}}, {copy_tile}>"
+                    f"({pointers[-1]}, out_{name}, row, copy_base, num_items);\n"
+                )
+            else:
+                pointers.append("nullptr")
+        product_call = (
+            "if constexpr ({path}::components * sizeof(Element) <= " + str(DIRECT_STORE_BYTES) + ") {{\n"
+            "    if (row < num_items && copy < {copies}) gate_triple_backward_product<{path}>(x, grad_out, rx, bx, bg, out_tx, out_tg, out_trx, row, copy);\n"
+            "}} else {{\n"
+            "    if (row < num_items && copy < {copies}) gate_triple_backward_product<{path}, true>(x, grad_out, rx, bx, bg, out_tx, out_tg, out_trx, row, copy, "
+            + ", ".join(pointers) + ");\n    __syncwarp();\n"
+            + "".join(stores) + "    __syncwarp();\n}}"
+        )
+        tiles, schedule = make_schedule(
+            paths,
+            "if (row < num_items && copy < {copies}) gate_triple_backward_scalar<{path}>(x, grad_out, rx, bx, bg, out_tx, out_tg, out_trx, row, copy);",
+            product_call, warp_groups=True, copy_tile=copy_tile,
+        )
+        warps = TRIPLE_BACKWARD_THREADS // WARP_SIZE
+        kernel = COALESCED_TRIPLE_BACKWARD_KERNEL.format(
+            threads=TRIPLE_BACKWARD_THREADS, max_components=max_components, buffers=buffers,
+            warps=warps, tiles=tiles, schedule=schedule,
+            rows_per_warp=rows_per_warp, copy_tile=copy_tile,
+        )
+        geometry = f"<<<std::min<int64_t>(65535,(((num_items+{rows_per_warp-1})/{rows_per_warp})*{tiles}+{warps-1})/{warps}),{TRIPLE_BACKWARD_THREADS},0,stream>>>"
+    else:
+        kernel = TRIPLE_BACKWARD_KERNEL.format(count=count, schedule=schedule)
+        geometry = f"<<<std::min<int64_t>(65535,(num_items*{count}+127)/128),128,0,stream>>>"
     arguments = [f"{name}.data_ptr<Element>()" if name in config["inputs"] else "nullptr"
                  for name in ("x", "grad_out", "rx", "bx", "bg")]
     arguments += [f"result_{name}.data_ptr<Element>()" if name in config["active_outputs"] else "nullptr"
                   for name in ("tx", "tg", "trx")]
     launch = (
-        f"if(num_items>0) gate_triple_backward<<<std::min<int64_t>(65535,(num_items*{count}+127)/128),128,0,stream>>>"
+        f"if(num_items>0) gate_triple_backward{geometry}"
         f"({','.join(arguments)},num_items);"
     )
     return make_binding(
         meta, config, declarations=declarations,
-        kernel_body=TRIPLE_BACKWARD_KERNEL.format(count=count, schedule=schedule),
+        kernel_body=kernel,
         binding=BINDING, module_binding=MODULE_BINDING, launch=launch,
         tensor_only=tensor_only, fragments=fragments,
     )
+
+
+def gate_triple_backward(features, grad_output, grad_grad_input, grad_input, grad_grad_output, meta, index_bits, kernel_cache, dtype, *, needs=None):
+    inputs = features, grad_output, grad_grad_input, grad_input, grad_grad_output
+    available = tuple(name for name, value in zip(("x", "grad_out", "rx", "bx", "bg"), inputs) if value is not None)
+    config = get_kernel_config(
+        meta, kernel_cache, 3, needs=needs, available=available, dtype=dtype
+    )
+    return launch_kernel(inputs, config, meta, index_bits, kernel_cache, make_source)

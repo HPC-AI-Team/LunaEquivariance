@@ -120,5 +120,5 @@ def bind_stream_pool_source(source):
         return source
     return re.sub(
         r"(PYBIND11_MODULE\(TORCH_EXTENSION_NAME,\s*(\w+)\)\s*\{)",
-        lambda match: match[1] + f'{match[2]}.def("set_stream_pool", &set_stream_pool);', source,
+        lambda match: match[1] + f'\n    {match[2]}.def("set_stream_pool", &set_stream_pool);\n', source,
     )

@@ -7,6 +7,7 @@ import re
 import sys
 from functools import lru_cache
 from pathlib import Path
+from textwrap import indent
 
 import torch
 
@@ -143,7 +144,7 @@ def combine_cuda_sources(sources: dict[str, str]) -> str:
 
     return ("\n".join(dict.fromkeys(includes)) + "\n" + "\n".join(bodies)
             + "\nPYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {\n"
-            + "\n".join(bindings) + "\n}\n")
+            + indent("\n".join(bindings), "    ") + "\n}\n")
 
 
 def load_cuda_extension(

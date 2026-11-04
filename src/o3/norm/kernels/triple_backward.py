@@ -5,7 +5,7 @@ template<int Components>
 __device__ __forceinline__ void norm_triple_backward(
     const Element* x, Element grad_out, const Element* rx,
     const Element* bx, Element bg, Element* tx, Element* tg, Element* trx,
-    Index feature_offset, Index norm_offset
+    Index feature_offset, Index norm_offset, Index output_offset
 ) {
     if constexpr (SQUARED) {
         if constexpr (WRITE_G)
@@ -13,7 +13,7 @@ __device__ __forceinline__ void norm_triple_backward(
         #pragma unroll
         for (int c = 0; c < Components; ++c) {
             if constexpr (WRITE_X)
-                tx[feature_offset + c] = add_rn(product<Components>(bg, rx[feature_offset + c]), product<Components>(rx[feature_offset + c], bg));
+                tx[output_offset + c] = add_rn(product<Components>(bg, rx[feature_offset + c]), product<Components>(rx[feature_offset + c], bg));
             if constexpr (WRITE_RX) {
                 Element left = HAS_BG ? product<Components>(bg, x[feature_offset + c]) : Element(0);
                 Element right = HAS_BG ? product<Components>(x[feature_offset + c], bg) : Element(0);
@@ -23,7 +23,7 @@ __device__ __forceinline__ void norm_triple_backward(
                     left = HAS_BG ? add_rn(left, from_left) : from_left;
                     right = HAS_BG ? add_rn(from_right, right) : from_right;
                 }
-                trx[feature_offset + c] = add_rn(left, right);
+                trx[output_offset + c] = add_rn(left, right);
             }
         }
     } else {
@@ -74,7 +74,7 @@ __device__ __forceinline__ void norm_triple_backward(
                 }
                 left = add_rn(left, product<Components>(radial_second, x[feature_offset + c]));
                 right = add_rn(right, product<Components>(x[feature_offset + c], radial_second));
-                tx[feature_offset + c] = add_rn(left, right);
+                tx[output_offset + c] = add_rn(left, right);
             }
         }
         if constexpr (WRITE_G) tg[norm_offset] = grad_g;
@@ -87,11 +87,53 @@ __device__ __forceinline__ void norm_triple_backward(
                     left = add_rn(left, product<Components>(scale, bx[feature_offset + c]));
                     right = add_rn(product<Components>(bx[feature_offset + c], scale), right);
                 }
-                trx[feature_offset + c] = add_rn(left, right);
+                trx[output_offset + c] = add_rn(left, right);
             }
         }
     }
 }
+
+#if COALESCED
+template<int Components, int Copies, int InputOffset, int NormOffset, int TileOffset>
+__device__ __forceinline__ void norm_triple_backward_tile(
+    const Element* x, const Element* grad_out, const Element* rx,
+    const Element* bx, const Element* bg,
+    Element* tx, Element* tg, Element* trx, Index task, int64_t rows,
+    Element* shared_x, Element* shared_rx
+) {
+    constexpr int Tiles = Copies / COPY_TILE;
+    const Index tile = task % PATH_TILES;
+    if (tile < TileOffset || tile >= TileOffset + Tiles) return;
+    const int lane = threadIdx.x % COPY_TILE;
+    const int group = threadIdx.x / COPY_TILE;
+    const Index row = (task / PATH_TILES) * ROWS_PER_WARP + (threadIdx.x & 31) / COPY_TILE;
+    const Index copy_base = (tile - TileOffset) * COPY_TILE;
+    const Index copy = copy_base + lane;
+    const Index feature = (row < rows ? row : 0) * INPUT_DIM + InputOffset + copy * Components;
+    const Index norm = (row < rows ? row : 0) * OUTPUT_DIM + NormOffset + copy;
+    if constexpr (Components * sizeof(Element) <= 16) {
+        if (row < rows)
+            norm_triple_backward<Components>(
+                x, grad_out[row * OUTPUT_DIM + NormOffset + copy], rx, bx,
+                HAS_BG ? bg[row * OUTPUT_DIM + NormOffset + copy] : Element(0),
+                tx, tg, trx, feature, norm, feature);
+    } else {
+        Element* values_x = WRITE_X ? shared_x + group * COPY_TILE * MAX_COMPONENTS : nullptr;
+        Element* values_rx = WRITE_RX ? shared_rx + group * COPY_TILE * MAX_COMPONENTS : nullptr;
+        if (row < rows)
+            norm_triple_backward<Components>(
+                x, grad_out[row * OUTPUT_DIM + NormOffset + copy], rx, bx,
+                HAS_BG ? bg[row * OUTPUT_DIM + NormOffset + copy] : Element(0),
+                values_x, tg, values_rx, feature, norm, lane * Components);
+        __syncwarp();
+        if constexpr (WRITE_X)
+            if (row < rows) norm_store_tile<Components, InputOffset>(values_x, tx, row, copy_base);
+        if constexpr (WRITE_RX)
+            if (row < rows) norm_store_tile<Components, InputOffset>(values_rx, trx, row, copy_base);
+        __syncwarp();
+    }
+}
+#endif
 
 __global__ __launch_bounds__(BLOCK_SIZE, TRIPLE_MIN_BLOCKS) void norm_triple_backward_kernel(
     const Element* __restrict__ x, const Element* __restrict__ grad_out,
@@ -99,28 +141,24 @@ __global__ __launch_bounds__(BLOCK_SIZE, TRIPLE_MIN_BLOCKS) void norm_triple_bac
     const Element* __restrict__ bg, Element* __restrict__ tx,
     Element* __restrict__ tg, Element* __restrict__ trx, int64_t rows
 ) {
+    #if COALESCED
+    __shared__ __align__(16) Element shared_x[WRITE_X ? BLOCK_SIZE * MAX_COMPONENTS : 1];
+    __shared__ __align__(16) Element shared_rx[WRITE_RX ? BLOCK_SIZE * MAX_COMPONENTS : 1];
+    const int warp = threadIdx.x >> 5;
+    for (Index task = Index(blockIdx.x) * (BLOCK_SIZE / 32) + warp;
+         task < ((rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP) * PATH_TILES;
+         task += Index(gridDim.x) * (BLOCK_SIZE / 32)) {
+        /* tiles */
+    }
+    #else
     for (Index item = Index(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
          item < rows * OUTPUT_DIM; item += Index(gridDim.x) * BLOCK_SIZE) {
         const Index row = item / OUTPUT_DIM;
         const Index group = item % OUTPUT_DIM;
         /* paths */
     }
+    #endif
 }
-
-#if PATH_MAJOR
-__global__ __launch_bounds__(BLOCK_SIZE, TRIPLE_MIN_BLOCKS) void norm_triple_backward_path_kernel(
-    const Element* __restrict__ x, const Element* __restrict__ grad_out,
-    const Element* __restrict__ rx, const Element* __restrict__ bx,
-    const Element* __restrict__ bg, Element* __restrict__ tx,
-    Element* __restrict__ tg, Element* __restrict__ trx, int64_t rows
-) {
-    for (Index item = Index(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
-         item < rows * OUTPUT_DIM; item += Index(gridDim.x) * BLOCK_SIZE) {
-        /* path_major */
-    }
-}
-
-#endif
 
 pybind11::tuple launch(at::Tensor x, at::Tensor grad_out, at::Tensor rx,
                       std::optional<at::Tensor> bx, std::optional<at::Tensor> bg, int64_t rows) {
@@ -131,16 +169,11 @@ pybind11::tuple launch(at::Tensor x, at::Tensor grad_out, at::Tensor rx,
     if constexpr (WRITE_RX) trx = at::empty({rows, int64_t(INPUT_DIM)}, x.options());
     auto stream = at::cuda::getCurrentCUDAStream();
     if (rows > 0 && OUTPUT_DIM > 0) {
-        #if PATH_MAJOR
-        if (rows >= PATH_MAJOR_MIN_ROWS) {
-        norm_triple_backward_path_kernel<<<std::min<int64_t>(MAX_BLOCKS, (rows * OUTPUT_DIM + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
-            x.data_ptr<Element>(), grad_out.data_ptr<Element>(), rx.data_ptr<Element>(),
-            HAS_BX ? bx->data_ptr<Element>() : nullptr, HAS_BG ? bg->data_ptr<Element>() : nullptr,
-            WRITE_X ? tx.data_ptr<Element>() : nullptr, WRITE_G ? tg.data_ptr<Element>() : nullptr,
-            WRITE_RX ? trx.data_ptr<Element>() : nullptr, rows);
-        } else
-        #endif
-        norm_triple_backward_kernel<<<std::min<int64_t>(MAX_BLOCKS, (rows * OUTPUT_DIM + BLOCK_SIZE - 1) / BLOCK_SIZE), BLOCK_SIZE, 0, stream>>>(
+        const int64_t work = COALESCED
+            ? ((rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP) * PATH_TILES * 32
+            : rows * OUTPUT_DIM;
+        const int blocks = std::min<int64_t>(MAX_BLOCKS, (work + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        norm_triple_backward_kernel<<<blocks, BLOCK_SIZE, 0, stream>>>(
             x.data_ptr<Element>(), grad_out.data_ptr<Element>(), rx.data_ptr<Element>(),
             HAS_BX ? bx->data_ptr<Element>() : nullptr, HAS_BG ? bg->data_ptr<Element>() : nullptr,
             WRITE_X ? tx.data_ptr<Element>() : nullptr, WRITE_G ? tg.data_ptr<Element>() : nullptr,

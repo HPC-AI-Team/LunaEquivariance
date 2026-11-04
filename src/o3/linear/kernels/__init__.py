@@ -1,1 +1,1 @@
-"""Linear contraction programs, CUDA generators and strided layouts."""
+"""Linear CUDA kernels and bindings."""

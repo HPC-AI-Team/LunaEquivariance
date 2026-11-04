@@ -48,23 +48,25 @@ NEIGHBOR_EDGES_PER_NODE = 8
 
 SOURCE_BUCKET_STREAMS = r"""
 struct SourceBucketStreams {
-    explicit SourceBucketStreams(int device, const std::vector<int64_t>& handles)
+    explicit SourceBucketStreams(int device, const std::vector<int64_t> &handles)
         : streams{at::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(handles.at(0)), device),
                   at::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(handles.at(1)), device)} {
         c10::cuda::CUDAGuard guard(device);
         C10_CUDA_CHECK(cudaEventCreateWithFlags(&start, cudaEventDisableTiming));
-        for (auto& event : done)
+        for (auto &event : done)
             C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     }
     ~SourceBucketStreams() {
         try {
             c10::cuda::CUDAGuard guard(streams[0].device_index());
             cudaEventDestroy(start);
-            for (auto event : done) cudaEventDestroy(event);
-        } catch (...) { /* CUDA may already be shutting down. */ }
+            for (auto event : done)
+                cudaEventDestroy(event);
+        } catch (...) { /* CUDA may already be shutting down. */
+        }
     }
-    SourceBucketStreams(const SourceBucketStreams&) = delete;
-    SourceBucketStreams& operator=(const SourceBucketStreams&) = delete;
+    SourceBucketStreams(const SourceBucketStreams &) = delete;
+    SourceBucketStreams &operator=(const SourceBucketStreams &) = delete;
     at::cuda::CUDAStream streams[2];
     cudaEvent_t start = nullptr;
     cudaEvent_t done[2] = {nullptr, nullptr};
@@ -82,30 +84,31 @@ TENSOR_BINDING = r"""#include <torch/extension.h>
 namespace {{
 {kernels}{stream_state}
 }}
-std::vector<torch::Tensor> run_uuu_conv({state_parameter}std::vector<std::optional<torch::Tensor>> inputs, torch::Tensor src,
-    torch::Tensor dst, torch::Tensor dst_rowptr, torch::Tensor src_rowptr,
-    torch::Tensor edge_ids, torch::Tensor node_order, torch::Tensor source_node_order) {{
-    const auto& features = *inputs[0];
+std::vector<torch::Tensor> run_uuu_conv({state_parameter}std::vector<std::optional<torch::Tensor>> inputs,
+                                                          torch::Tensor src, torch::Tensor dst, torch::Tensor dst_rowptr,
+                                                          torch::Tensor src_rowptr, torch::Tensor edge_ids, torch::Tensor node_order,
+                                                          torch::Tensor source_node_order) {{
+    const auto &features = *inputs[0];
     const c10::cuda::CUDAGuard device_guard(features.device());
     auto stream = at::cuda::getCurrentCUDAStream(features.get_device());
     const int num_nodes = int(features.size(0));
     const Index num_edges = src.numel();
-    const int32_t* srcp = src.data_ptr<int32_t>();
-    const int32_t* dstp = dst.data_ptr<int32_t>();
-    const EdgeIndex* drp = dst_rowptr.data_ptr<EdgeIndex>();
-    const EdgeIndex* srp = src_rowptr.data_ptr<EdgeIndex>();
-    const EdgeIndex* ep = edge_ids.data_ptr<EdgeIndex>();
-    const int32_t* nop = node_order.numel() ? node_order.data_ptr<int32_t>() : nullptr;
-    const int32_t* sop = source_node_order.numel() ? source_node_order.data_ptr<int32_t>() : nullptr;
+    const int32_t *srcp = src.data_ptr<int32_t>();
+    const int32_t *dstp = dst.data_ptr<int32_t>();
+    const EdgeIndex *drp = dst_rowptr.data_ptr<EdgeIndex>();
+    const EdgeIndex *srp = src_rowptr.data_ptr<EdgeIndex>();
+    const EdgeIndex *ep = edge_ids.data_ptr<EdgeIndex>();
+    const int32_t *nop = node_order.numel() ? node_order.data_ptr<int32_t>() : nullptr;
+    const int32_t *sop = source_node_order.numel() ? source_node_order.data_ptr<int32_t>() : nullptr;
 
-    {allocation_source}
-    {declaration_source}
-    {launch_body}
+{allocation_source}
+{declaration_source}
+{launch_body}
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {{{contractions}}};
 }}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {{
-{stream_binding}    module.def("run_uuu_conv", &run_uuu_conv);
+    {stream_binding} module.def("run_uuu_conv", &run_uuu_conv);
 }}
 """
 

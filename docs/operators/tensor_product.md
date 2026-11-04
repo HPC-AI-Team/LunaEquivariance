@@ -260,6 +260,34 @@ Direct functional calls infer dtype from the input and cache their configuration
 For FP64 preparation, pass `dtype=torch.float64`. Convolution functions also
 take an explicit graph.
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: 85,876 edge samples from a graph of 2,083 atoms
+- Features: 64 channels per degree, `Lmax=2–6`
+
+### UUU performance
+
+- Inputs: 64 channels per degree in both inputs
+- Weights: per-edge
+
+![UUU tensor product FP32 throughput and peak memory](../assets/performance/uuu.png)
+
+### UVU performance
+
+- Edge features: one spherical-harmonic channel per degree
+- Weights: per-edge
+
+![UVU tensor product FP32 throughput and peak memory](../assets/performance/uvu.png)
+
+### UVW performance
+
+- Edge features: one spherical-harmonic channel per degree
+- Weights: shared
+
+![UVW tensor product FP32 throughput and peak memory](../assets/performance/uvw.png)
+
 ## Limitations
 
 - `internal_weights` and `shared_weights` have mode-specific restrictions; see [Weight configuration](#weight-configuration).

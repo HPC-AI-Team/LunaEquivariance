@@ -63,6 +63,15 @@ y = activation(x)  # (num_atoms, activation.irreps_out.dim)
 y.square().mean().backward()
 ```
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: 2,083 atoms, 64 channels per degree, `Lmax=2–6`
+- Activation: sigmoid, with normalization and learnable biases
+
+![NormActivation FP32 throughput and peak memory](../assets/performance/norm_activation.png)
+
 ## Limitations
 
 - GPU acceleration requires compute capability 8.0 or later.

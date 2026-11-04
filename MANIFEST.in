@@ -1,4 +1,4 @@
-include README.md LICENSE pyproject.toml MANIFEST.in
+include README.md CHANGELOG.md LICENSE pyproject.toml MANIFEST.in
 recursive-include src *.py
 recursive-include src/third_party/cutlass *.h *.hpp *.inl *.txt
 recursive-include examples *.py

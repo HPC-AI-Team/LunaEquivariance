@@ -1,13 +1,9 @@
-"""Shared spherical harmonics scalar graph and registered Torch lowering."""
+"""Ordered scalar arithmetic shared by Cartesian harmonics and their gradients."""
 
 from __future__ import annotations
 import ast
 from functools import lru_cache
 import math
-import torch
-
-from ....utils.torch_scalar import ScalarValue, Scalarizer
-from .utils import INPUT_ROLES
 
 
 @lru_cache(maxsize=None)
@@ -77,15 +73,7 @@ def lower_expression(graph, expression, variables):
             return lower_expression(graph, expression.args[0], variables)
         if name == 'pow':
             value = lower_expression(graph, expression.args[0], variables)
-            exponent = expression.args[1]
-            if isinstance(exponent, ast.Constant):
-                count = int(exponent.value)
-            else:
-                # The reverse rule uses the compile-time integer exponent - 1.
-                # It is not a tensor operation or a node in the scalar graph.
-                assert isinstance(exponent, ast.BinOp) and isinstance(exponent.op, ast.Sub)
-                count = int(float.fromhex(variables[exponent.left.id].value)) - int(exponent.right.value)
-            return graph.power(value, count)
+            return graph.power(value, int(expression.args[1].value))
         if name in ('vector_norm', 'clamp_min'):
             return graph.node(
                 'norm' if name == 'vector_norm' else 'clamp',
@@ -109,8 +97,8 @@ class ScalarGraph:
         self.one = self.constant(1.0)
 
     def node(self, op, *args, value=None):
-        # Raw nodes retain tensor-operation rounding and order. The analytic
-        # polynomial helpers below may instead fold Python-number constants.
+        # Share identical scalar operations; binary/power fold constants and
+        # algebraic identities before CUDA emission.
         key = (op, tuple(n.index for n in args), value)
         if key not in self.cache:
             n = ScalarNode(len(self.nodes), op, args, value)
@@ -125,6 +113,18 @@ class ScalarGraph:
         return self.node('input', value=(role, column))
 
     def binary(self, op, a, b):
+        if op == 'add':
+            if a is self.zero:
+                return b
+            if b is self.zero:
+                return a
+        elif op == 'mul':
+            if a is self.zero or b is self.zero:
+                return self.zero
+            if a is self.one:
+                return b
+            if b is self.one:
+                return a
         if a.op == b.op == 'constant':
             x, y = float.fromhex(a.value), float.fromhex(b.value)
             if op == 'add':
@@ -163,64 +163,48 @@ class ScalarGraph:
                 pending.extend(reversed(node.args))
         return visited
 
-    def accumulate_gradient(self, node_gradients, node, value):
-        if node.op == 'constant':
-            return
-        node_gradients[node.index] = (
-            self.binary('add', node_gradients[node.index], value)
-            if node.index in node_gradients else value
-        )
 
 
-class HarmonicsScalarizer(Scalarizer):
-    unsupported_operator = 'spherical-harmonic'
-
-    def slice_fields(self, shape, value, dimension, start, end, step):
-        dimension %= len(value.shape)
-        start, end, step = slice(start, end, step).indices(value.shape[dimension])
-        if dimension not in value.axes:
-            if (start, end, step) != (0, value.shape[dimension], 1):
-                raise ValueError('Slicing batch coordinates cannot be represented by a scalar row')
-            return ScalarValue(shape, value.axes, value.fields)
-        return ScalarValue(
-            shape,
-            value.axes,
-            [
-                value.at({**item, dimension: start + item[dimension] * step})
-                for item in self.indices(shape, value.axes)
-            ],
-        )
-
-    def backward_view(self, shape, value, dimension, *, index=None, start=None, end=None, step=1):
-        dimension %= len(shape)
-        if index is not None:
-            axes = tuple(sorted((*[axis + (axis >= dimension) for axis in value.axes], dimension)))
+@lru_cache(maxsize=None)
+def harmonic_derivative(degree, component, powers):
+    """Cartesian derivative as a sparse row of lower solid harmonics."""
+    if sum(powers) == 0:
+        return ((degree, component, 1.0),)
+    if degree < sum(powers):
+        return ()
+    axis = next(i for i, count in enumerate(powers) if count)
+    remaining = tuple(count - int(i == axis) for i, count in enumerate(powers))
+    m = component - degree
+    q = (2 * degree + 1) / (2 * degree - 1)
+    terms = []
+    if axis == 1:
+        if abs(m) < degree:
+            terms.append((m, math.sqrt(q * (degree * degree - m * m))))
+    elif m == 0:
+        value = -math.sqrt(q * degree * (degree - 1) / 2)
+        terms.append((-1 if axis == 0 else 1, value))
+    else:
+        k = abs(m)
+        lower = math.sqrt(q * (degree + k) * (degree + k - 1)) / 2
+        upper = math.sqrt(q * (degree - k) * (degree - k - 1)) / 2
+        if axis == 2:
+            if k > 1:
+                terms.append(((k - 1) if m > 0 else -(k - 1), lower))
+            elif m > 0:
+                terms.append((0, lower * math.sqrt(2)))
+            terms.append(((k + 1) if m > 0 else -(k + 1), -upper))
+        elif m > 0:
+            if k > 1:
+                terms.append((-(k - 1), -lower))
+            terms.append((-(k + 1), -upper))
         else:
-            axes = value.axes
-            start, end, step = slice(start, end, step).indices(shape[dimension])
-            if dimension not in axes:
-                if (start, end, step) != (0, shape[dimension], 1):
-                    raise ValueError('A batch slice backward needs cross-row materialization')
-                return ScalarValue(shape, axes, value.fields)
-        fields = []
-        for item in self.indices(shape, axes):
-            column = item[dimension]
-            if index is not None:
-                active = column == index
-                coordinates = {
-                    axis - (axis > dimension): i for axis, i in item.items() if axis != dimension
-                }
-            else:
-                active = start <= column < end and (column - start) % step == 0
-                coordinates = {**item, dimension: (column - start) // step}
-            fields.append(value.at(coordinates) if active else self.graph.zero)
-        return ScalarValue(shape, axes, fields)
-
-    def lower(self, traced, names):
-        result = super().lower(traced, names, INPUT_ROLES)
-        for name, fields in result.items():
-            if fields is None:
-                raise ValueError(f'Active spherical-harmonic target {name} has no Torch gradient')
-            if name in ('dx', 'sx', 'tx', 'trx') and len(fields) != 3:
-                raise ValueError(f'Invalid scalarized output {name}: {len(fields)} components')
-        return result
+            terms.append(((k - 1), lower * (math.sqrt(2) if k == 1 else 1)))
+            terms.append(((k + 1), upper))
+    result = {}
+    for target, coefficient in terms:
+        if coefficient == 0 or abs(target) >= degree:
+            continue
+        for l, column, value in harmonic_derivative(degree - 1, target + degree - 1, remaining):
+            key = (l, column)
+            result[key] = result.get(key, 0.0) + coefficient * value
+    return tuple((l, column, value) for (l, column), value in sorted(result.items()) if value != 0)

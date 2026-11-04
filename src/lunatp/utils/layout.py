@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
+from functools import lru_cache
 from math import prod, sqrt
-from typing import Any, Literal, NamedTuple, TypedDict
+from typing import Any, Literal, NamedTuple, TypedDict, cast
 
 import torch
 from typing_extensions import NotRequired
 
 from ...o3.irreps import Irreps
+from ...utils.operator_config import decode_config
 
 # Two index variants reserve half of the 64 KiB CUDA constant budget.
 CUDA_TASK_TABLE_WARP_LIMIT = 2048
@@ -513,3 +515,16 @@ def select_indexing(op: Any, nodes: int, edges: int) -> Any:
         return op
     op.prepare_indexing()
     return op.index64_operator
+
+
+@lru_cache(maxsize=128)
+def compiled_config(config: str) -> dict[str, Any]:
+    """Read static layout values without constructing or compiling a CUDA operator."""
+    return cast(dict[str, Any], decode_config(config))
+
+
+@lru_cache(maxsize=128)
+def compiled_operator(config: str) -> Any:
+    from ..interface import restore_compiled_operator
+
+    return restore_compiled_operator(config)

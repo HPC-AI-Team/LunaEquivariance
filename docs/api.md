@@ -7,7 +7,7 @@ input and output shapes, and examples.
 from LunaEquivariance import o3, nn, TensorProduct, TensorProductConv
 ```
 
-- `o3`: Linear, Norm and SphericalHarmonics.
+- `o3`: Linear, Norm, SphericalHarmonics and SymmetricContraction.
 - `nn`: Activation, Gate, NormActivation, Dropout, EquivariantNorm, GraphSoftmax, VarlenAttention and VarlenAttentionConv.
 - `TensorProduct` and `TensorProductConv`: tensor products and graph convolutions with `uuu`, `uvu` or `uvw` connections.
 

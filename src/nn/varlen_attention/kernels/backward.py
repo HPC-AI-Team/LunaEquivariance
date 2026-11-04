@@ -1,793 +1,658 @@
-"""Fused CSR attention backward with FP32 accumulation."""
+"""Fused first backward from recomputed probability tiles."""
 
 import torch
 
-from .utils import CUDA_SOURCE, dtype_defines
-from ....utils.extension import get_cuda_arch, get_device_properties, load_cuda_extension
+from .utils import CUDA_SOURCE, GEMM_SOURCE, ATTENTION_SOURCE, BIAS_SOURCE, dtype_defines
+from ....utils.extension import get_cuda_arch, load_cuda_extension
 
-COMPILED = {}
+KERNELS = {}
 
-BACKWARD_SOURCE = r'''#if LOW_PRECISION
-using BackwardMma = cutlass::arch::Mma<cutlass::gemm::GemmShape<16,8,16>,32,
-    LowMmaElement,cutlass::layout::RowMajor,LowMmaElement,cutlass::layout::ColumnMajor,
-    float,cutlass::layout::RowMajor,cutlass::arch::OpMultiplyAdd>;
-
-template<int Pitch, bool Transpose>
-__device__ __forceinline__ BackwardMma::FragmentA backward_load_a(
-    LowMmaElement const* pointer, int row, int base, int lane) {
-    int offset = Transpose ? (base+lane%8+(lane/16)*8)*Pitch+row+(lane/8%2)*8
-                           : (row+lane%16)*Pitch+base+(lane/16)*8;
-    unsigned address = unsigned(__cvta_generic_to_shared(pointer+offset));
-    BackwardMma::FragmentA result;
-    auto* words = reinterpret_cast<unsigned*>(&result);
-    if constexpr (Transpose)
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
-            : "=r"(words[0]),"=r"(words[1]),"=r"(words[2]),"=r"(words[3]) : "r"(address));
-    else
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
-            : "=r"(words[0]),"=r"(words[1]),"=r"(words[2]),"=r"(words[3]) : "r"(address));
-    return result;
-}
-
-template<int Pitch, bool Transpose>
-__device__ __forceinline__ BackwardMma::FragmentB backward_load_b(
-    LowMmaElement const* pointer, int column, int base, int lane) {
-    int offset = Transpose ? (base+lane%8+(lane/8%2)*8)*Pitch+column
-                           : (column+lane%8)*Pitch+base+(lane/8%2)*8;
-    unsigned address = unsigned(__cvta_generic_to_shared(pointer+offset));
-    BackwardMma::FragmentB result;
-    auto* words = reinterpret_cast<unsigned*>(&result);
-    if constexpr (Transpose)
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
-            : "=r"(words[0]),"=r"(words[1]) : "r"(address));
-    else
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
-            : "=r"(words[0]),"=r"(words[1]) : "r"(address));
-    return result;
-}
-
-template<int Tile,int Pitch,int Channels,int Heads,int Source,int Target,bool Transpose,int Threads>
-__device__ void backward_lowp_output(AttentionParams const& p, LowMmaElement* cache,
-    LowMmaElement const* weight, int64_t begin,int64_t end,int head) {
-    constexpr int Tiles=(Channels+7)/8;
-    int lane=threadIdx.x%32;
-    auto* output=cache+(Target==0 ? 0:Tile*Pitch);
-    for(int tile=threadIdx.x/32;tile<(Tile/16)*Tiles;tile+=Threads/32) {
-        int row=(tile/Tiles)*16,column=(tile%Tiles)*8;
-        BackwardMma::FragmentC result;result.clear();
-        #pragma unroll
-        for(int base=0;base<Tile;base+=16) {
-            auto a=backward_load_a<Tile+8,Transpose>(weight,row,base,lane);
-            auto b=backward_load_b<Pitch,true>(cache+Source*Tile*Pitch,column,base,lane);
-            BackwardMma{}(result,a,b,result);
-        }
-        #pragma unroll
-        for(int i=0;i<4;++i) {
-            int r=row+lane/4+(i/2)*8,c=column+(lane%4)*2+i%2;
-            output[r*Pitch+c]=LowMmaElement(result[i]*(Target<2?p.scale:1.f));
-        }
-    }
-    __syncthreads();
-    if constexpr (Channels%8==0) {
-        for(int x=threadIdx.x*8;x<Tile*Channels;x+=Threads*8) {
-            int r=x/Channels,c=x%Channels;
-            if(begin+r<end)
-                *reinterpret_cast<uint4*>(p.outputs[Target].data+((begin+r)*Heads+head)*Channels+c)=
-                    *reinterpret_cast<const uint4*>(output+r*Pitch+c);
-        }
+BACKWARD_SOURCE = r"""
+#if !LOW_PRECISION
+template<int Left,int Right>
+__device__ __forceinline__ void attention_pair(AttentionParams const& p,AttentionGemmStorage& shared,
+    float* output,int64_t qb,int64_t kb,int64_t end,int head,int channels) {
+    if constexpr ((PRESENT&(1<<Left)) && (PRESENT&(1<<Right))) {
+        attention_gemm(shared,output,channels,
+            [&](int row,int k) {return qb+row<end ? attention_feature(p.inputs[Left],qb+row,head,k,channels):0.f;},
+            [&](int k,int column) {return kb+column<end ? attention_feature(p.inputs[Right],kb+column,head,k,channels):0.f;});
     } else {
-        for(int x=threadIdx.x;x<Tile*Channels;x+=Threads) {
-            int r=x/Channels,c=x%Channels;
-            if(begin+r<end) p.outputs[Target].store(begin+r,head,c,float(output[r*Pitch+c]));
-        }
-    }
-    __syncthreads();
-}
-
-template<int Tile,int Pitch,int Threads>
-__device__ void backward_lowp_cache(AttentionTensor const& tensor,LowMmaElement* cache,
-    int64_t begin,int64_t end,int head,int width) {
-    if(width%8==0 && tensor.stride[2]==1 && tensor.stride[0]%8==0 && tensor.stride[1]%8==0 && (reinterpret_cast<uintptr_t>(tensor.data)&15)==0) {
-        for(int x=threadIdx.x*8;x<Tile*Pitch;x+=Threads*8) {
-            int r=x/Pitch,c=x%Pitch;
-            uint4 packed={0,0,0,0};
-            if(begin+r<end && c<width)
-                packed=*reinterpret_cast<const uint4*>(tensor.data+(begin+r)*tensor.stride[0]+head*tensor.stride[1]+c);
-            *reinterpret_cast<uint4*>(cache+r*Pitch+c)=packed;
-        }
-    } else {
-        for(int x=threadIdx.x;x<Tile*Pitch;x+=Threads) {
-            int r=x/Pitch,c=x%Pitch;
-            cache[x]=LowMmaElement(begin+r<end&&c<width?tensor.load(begin+r,head,c):0.f);
-        }
-    }
-}
-
-template<int Tile,int D,int V,int H,bool COMPACT,int BIAS,bool CAUSAL,int NEEDS,int Threads>
-__device__ void backward_lowp_segment(AttentionParams const& p,int64_t begin,int64_t end,
-    int64_t segment,int head,float* smem) {
-    constexpr int W=D>V?D:V, Pitch=(W+15)/16*16+8;
-    auto* cache=reinterpret_cast<LowMmaElement*>(smem);
-    auto* probability=cache+3*Tile*Pitch;
-    auto* adjoint=probability+Tile*(Tile+8);
-    auto* bias_partial=reinterpret_cast<float*>(adjoint+Tile*(Tile+8));
-    int tid=threadIdx.x,lane=tid%32,warp=tid/32;
-    backward_lowp_cache<Tile,Pitch,Threads>(p.inputs[0],cache,begin,end,head,D);
-    backward_lowp_cache<Tile,Pitch,Threads>(p.inputs[1],cache+Tile*Pitch,begin,end,head,D);
-    backward_lowp_cache<Tile,Pitch,Threads>(p.inputs[4],cache+2*Tile*Pitch,begin,end,head,V);
-    __syncthreads();
-    for(int row=warp*16;row<Tile;row+=(Threads/32)*16) {
-        BackwardMma::FragmentC scores[Tile/8];
-        #pragma unroll
-        for(int n=0;n<Tile/8;++n) scores[n].clear();
-        #pragma unroll
-        for(int base=0;base<D;base+=16) {
-            auto a=backward_load_a<Pitch,false>(cache,row,base,lane);
-            #pragma unroll
-            for(int n=0;n<Tile/8;++n) {
-                auto b=backward_load_b<Pitch,false>(cache+Tile*Pitch,n*8,base,lane);
-                BackwardMma{}(scores[n],a,b,scores[n]);
-            }
-        }
-        #pragma unroll
-        for(int r=0;r<2;++r) {
-            int qr=row+lane/4+r*8;
-            int64_t q=begin+qr;
-            float maximum=q<end?p.state.data[(q*H+head)*2]:0.f;
-            float inverse=q<end?p.state.data[(q*H+head)*2+1]:0.f;
-            float norm=0.f;
-            #pragma unroll
-            for(int n=0;n<Tile/8;++n) {
-                #pragma unroll
-                for(int j=0;j<2;++j) {
-                    int c=n*8+(lane%4)*2+j;
-                    int64_t k=begin+c;
-                    float value=0.f;
-                    if(q<end&&k<end&&(!CAUSAL||k<=q)&&inverse>0.f) {
-                        float score=scores[n][r*2+j]*p.scale;
-                        if constexpr (BIAS==1) score+=p.inputs[3].at(k,head);
-                        if constexpr (BIAS==2) score+=p.inputs[3].at(segment,head,qr,c);
-                        value=__expf(score-maximum)*inverse;
-                    }
-                    scores[n][r*2+j]=value;
-                    norm+=value;
-                }
-            }
-            #pragma unroll
-            for(int shift=1;shift<4;shift*=2) norm+=__shfl_xor_sync(0xffffffff,norm,shift);
-            float inv=norm>0.f?1.f/norm:0.f;
-            #pragma unroll
-            for(int n=0;n<Tile/8;++n) {
-                #pragma unroll
-                for(int j=0;j<2;++j) {
-                    int c=n*8+(lane%4)*2+j;
-                    probability[qr*(Tile+8)+c]=LowMmaElement(scores[n][r*2+j]*inv);
-                }
-            }
-        }
-    }
-    __syncthreads();
-    backward_lowp_cache<Tile,Pitch,Threads>(p.inputs[2],cache,begin,end,head,V);
-    __syncthreads();
-    for(int row=warp*16;row<Tile;row+=(Threads/32)*16) {
-        BackwardMma::FragmentC values[Tile/8];
-        #pragma unroll
-        for(int n=0;n<Tile/8;++n) values[n].clear();
-        #pragma unroll
-        for(int base=0;base<V;base+=16) {
-            auto a=backward_load_a<Pitch,false>(cache+2*Tile*Pitch,row,base,lane);
-            #pragma unroll
-            for(int n=0;n<Tile/8;++n) {
-                auto b=backward_load_b<Pitch,false>(cache,n*8,base,lane);
-                BackwardMma{}(values[n],a,b,values[n]);
-            }
-        }
-        #pragma unroll
-        for(int r=0;r<2;++r) {
-            int qr=row+lane/4+r*8;
-            float total=0.f;
-            #pragma unroll
-            for(int n=0;n<Tile/8;++n) {
-                #pragma unroll
-                for(int j=0;j<2;++j) {
-                    int c=n*8+(lane%4)*2+j;
-                    total=fmaf(float(probability[qr*(Tile+8)+c]),values[n][r*2+j],total);
-                }
-            }
-            #pragma unroll
-            for(int shift=1;shift<4;shift*=2) total+=__shfl_xor_sync(0xffffffff,total,shift);
-            #pragma unroll
-            for(int n=0;n<Tile/8;++n) {
-                #pragma unroll
-                for(int j=0;j<2;++j) {
-                    int c=n*8+(lane%4)*2+j;
-                    float ds=float(probability[qr*(Tile+8)+c])*(values[n][r*2+j]-total);
-                    adjoint[qr*(Tile+8)+c]=LowMmaElement(ds);
-                    values[n][r*2+j]=ds;
-                    if constexpr (BIAS==2 && (NEEDS&8))
-                        if(begin+qr<end&&begin+c<end) p.outputs[3].at(segment,head,qr,c)=ds;
-                }
-            }
-        }
-        if constexpr (BIAS==1 && (NEEDS&8)) {
-            #pragma unroll
-            for(int n=0;n<Tile/8;++n) {
-                #pragma unroll
-                for(int j=0;j<2;++j) {
-                    float value=values[n][j]+values[n][2+j];
-                    #pragma unroll
-                    for(int shift=4;shift<32;shift*=2) value+=__shfl_xor_sync(0xffffffff,value,shift);
-                    if(lane<4) bias_partial[(row/16)*Tile+n*8+lane*2+j]=value;
-                }
-            }
-        }
-    }
-    __syncthreads();
-    if constexpr (BIAS==1 && (NEEDS&8))
-        if(tid<Tile&&begin+tid<end) {
-            float sum=0.f;
-            #pragma unroll
-            for(int r=0;r<Tile/16;++r) sum+=bias_partial[r*Tile+tid];
-            p.outputs[3].at(begin+tid,head)=sum;
-        }
-    if constexpr (NEEDS&1) backward_lowp_output<Tile,Pitch,D,H,1,0,false,Threads>(p,cache,adjoint,begin,end,head);
-    if constexpr (NEEDS&2) {
-        backward_lowp_cache<Tile,Pitch,Threads>(p.inputs[0],cache,begin,end,head,D);
+        for(int i=threadIdx.x;i<1024;i+=AttentionThreads) output[(i/32)*AttentionScoreStride+i%32]=0.f;
         __syncthreads();
-        backward_lowp_output<Tile,Pitch,D,H,0,1,true,Threads>(p,cache,adjoint,begin,end,head);
     }
-    if constexpr (NEEDS&4) backward_lowp_output<Tile,Pitch,V,H,2,2,true,Threads>(p,cache,probability,begin,end,head);
 }
 
+template<int Target,int Source,bool Transpose=false,int Columns,bool RowMajorB>
+__device__ __forceinline__ void attention_output(AttentionParams const& p,AttentionGemmTile<Columns,RowMajorB>& shared,
+    float const* coefficient,float* product,int64_t qb,int64_t kb,int64_t end,
+    int head,int channels,float scale=1.f,bool first=false) {
+    if constexpr ((NEEDS&(1<<Target)) && (PRESENT&(1<<Source))) {
+        const int64_t target_base = Transpose ? kb:qb;
+        const int64_t source_base = Transpose ? qb:kb;
+        for(int channel=0;channel<channels;channel+=Columns) {
+            attention_gemm(shared,product,int(min(int64_t(32),end-source_base)),
+                [&](int row,int k) {return coefficient[Transpose ? k*AttentionScoreStride+row:row*AttentionScoreStride+k];},
+                [&](int k,int column) {return source_base+k<end && channel+column<channels ?
+                    attention_feature(p.inputs[Source],source_base+k,head,channel+column,channels):0.f;});
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+            if constexpr(Transpose && (Target==2 ? VALUE_DIM:DIM)%4==0) {
+                for(int i=threadIdx.x*4;i<32*Columns;i+=AttentionThreads*4) {
+                    int row=i/Columns,c=channel+i%Columns;
+                    if(target_base+row<end && c<channels) {
+                        float4 value=make_float4(product[i]*scale,product[i+1]*scale,
+                            product[i+2]*scale,product[i+3]*scale);
+                        atomicAdd(reinterpret_cast<float4*>(reinterpret_cast<float*>(p.outputs[Target].data)
+                            +((target_base+row)*HEADS+head)*channels+c),value);
+                    }
+                }
+            } else
+#endif
+            {
+                for(int i=threadIdx.x;i<32*Columns;i+=AttentionThreads) {
+                    int row=i/Columns,c=channel+i%Columns;
+                    if(target_base+row<end && c<channels) {
+                        float* destination=reinterpret_cast<float*>(p.outputs[Target].data)
+                            +((target_base+row)*HEADS+head)*channels+c;
+                        if constexpr(Transpose) atomicAdd(destination,product[i]*scale);
+                        else if(first) *destination=product[i]*scale;
+                        else *destination+=product[i]*scale;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
 #endif
 
-template <int H, bool COMPACT>
-__device__ __forceinline__ decltype(auto) backward_feature(AttentionTensor const& tensor,
-    int64_t row, int head, int channel, int width) {
-    if constexpr (COMPACT && !LOW_PRECISION) return (tensor.data[(row*H+head)*width+channel]);
-    return tensor.feature(row, head, channel);
+#if LOW_PRECISION
+#include <cute/tensor.hpp>
+namespace backward_ready {
+using namespace cute;
+constexpr int Threads=128;
+constexpr int KeyCapacity=((DIM<256 ? DIM:256)+63)/64*64;
+constexpr int ValueCapacity=((VALUE_DIM<256 ? VALUE_DIM:256)+63)/64*64;
+using Atom=std::conditional_t<std::is_same_v<GemmElement,cutlass::half_t>,
+    MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>>;
+using Mma=TiledMMA<Atom,Layout<Shape<_2,_2,_1>>,Tile<_32,_32,_16>>;
+using CopyN=Copy_Atom<SM75_U32x4_LDSM_N,GemmElement>;
+using CopyT=Copy_Atom<SM75_U16x8_LDSM_T,GemmElement>;
+using FeatureAtom=decltype(composition(Swizzle<3,3,3>{},Layout<Shape<_8,_64>,Stride<_64,_1>>{}));
+template<int Rows,int Columns>
+using FeatureLayout=decltype(tile_to_shape(FeatureAtom{},Shape<Int<Rows>,Int<Columns>>{}));
+using CoefficientAtom=decltype(composition(Swizzle<2,3,3>{},Layout<Shape<_8,_32>,Stride<_32,_1>>{}));
+using CoefficientLayout=decltype(tile_to_shape(CoefficientAtom{},Shape<_32,_32>{}));
+
+template<typename Tensor>
+__device__ __forceinline__ auto transpose(Tensor const& tensor) {
+    return make_tensor(tensor.data(),composition(tensor.layout(),
+        make_layout(make_shape(size<1>(tensor),size<0>(tensor)),GenRowMajor{})));
 }
 
-// Cache Q/K/V/G in channel-major tiles shared by all products and outputs.
-template <int Source, int Channels, int Width, int H, bool COMPACT, int Threads>
-__device__ __forceinline__ void backward_cache(AttentionParams const& p, float* cache,
-    int64_t begin, int64_t end, int head, int channel_base) {
-    const int tid = threadIdx.x;
-    if constexpr (!LOW_PRECISION && COMPACT && Channels%4==0) {
-        if ((reinterpret_cast<uintptr_t>(p.inputs[Source].data)&15)==0) {
-            for (int x=tid*4; x<32*Width; x+=Threads*4) {
-                int r=x/Width, c=x%Width;
-                float4 value={0,0,0,0};
-                if (begin+r<end && channel_base+c<Channels)
-                    value=*reinterpret_cast<const float4*>(&backward_feature<H, true>(p.inputs[Source], begin+r, head, channel_base+c, Channels));
-                cache[c*33+r]=value.x;
-                cache[(c+1)*33+r]=value.y;
-                cache[(c+2)*33+r]=value.z;
-                cache[(c+3)*33+r]=value.w;
-            }
-            return;
-        }
-    }
-    for (int x=tid; x<32*Width; x+=Threads) {
-        int r=x/Width, c=x%Width;
-        cache[c*33+r]=begin+r<end && channel_base+c<Channels ?
-            backward_feature<H, COMPACT>(p.inputs[Source], begin+r, head, channel_base+c, Channels):0.f;
-    }
-}
-
-template <int D, int V, int H, bool COMPACT, int BIAS, bool CAUSAL, int Threads>
-__device__ void backward_pairs(AttentionParams const& p, int64_t qb, int64_t kb,
-    int64_t begin, int64_t end, int64_t segment, int head, float* cache, float* prob, float* adj) {
-    constexpr int Width=BACKWARD_WIDTH, Plane=33*Width, Rows=1024/Threads;
-    constexpr int Features=D>V ? D:V;
-    int tid=threadIdx.x, lane=tid%32, row=(tid/32)*Rows;
-    const int query_rows=int(min(int64_t(32),end-qb));
-    const int key_rows=int(min(int64_t(32),end-kb));
-    const bool transpose=query_rows<key_rows;
-    const int primary=1 << (32-__clz(unsigned(min(query_rows,key_rows)-1)));
-    const int group=32/primary, reduction_lane=lane/primary, small=lane%primary;
-    const int score_large=transpose ? Plane:0, score_small=transpose ? 0:Plane;
-    const int value_large=transpose ? 2*Plane:3*Plane, value_small=transpose ? 3*Plane:2*Plane;
-    float score[Rows]={}, value[Rows]={};
-    if (primary<32) {
-        for (int i=tid; i<1024; i+=Threads) if ((transpose ? i/32:i%32)>=primary) {
-            prob[i]=0.f;
-            adj[i]=0.f;
-        }
-    }
-    for (int base=0; base<Features; base+=Width) {
-        if constexpr (Features>Width) {
-            backward_cache<0,D,Width,H,COMPACT,Threads>(p,cache,qb,end,head,base);
-            backward_cache<4,V,Width,H,COMPACT,Threads>(p,cache+3*Plane,qb,end,head,base);
-        }
-        backward_cache<1,D,Width,H,COMPACT,Threads>(p,cache+Plane,kb,end,head,base);
-        backward_cache<2,V,Width,H,COMPACT,Threads>(p,cache+2*Plane,kb,end,head,base);
-        __syncthreads();
-        if ((transpose ? kb:qb)+row<end) {
-            #pragma unroll 4
-            for (int c=reduction_lane; c<Width && base+c<Features; c+=group) {
-                float k=cache[score_small+c*33+small], v=cache[value_small+c*33+small];
-                #pragma unroll
-                for (int m=0; m<Rows; ++m) {
-                    if (base+c<D) score[m]=multiply_add(cache[score_large+c*33+row+m],k,score[m]);
-                    if (base+c<V) value[m]=multiply_add(cache[value_large+c*33+row+m],v,value[m]);
-                }
-            }
-        }
-        if constexpr (Features>Width) __syncthreads();
-    }
-    for (int offset=primary; offset<32; offset*=2) {
-        #pragma unroll
-        for (int m=0; m<Rows; ++m) {
-            score[m]+=__shfl_xor_sync(0xffffffff,score[m],offset);
-            value[m]+=__shfl_xor_sync(0xffffffff,value[m],offset);
-        }
-    }
+template<typename Acc,typename SA,typename SB,typename Mma,typename CA,typename CB>
+__device__ __forceinline__ void gemm(Acc& acc,SA const& a,SB const& b,Mma mma,CA ca,CB cb) {
+    auto thr=mma.get_thread_slice(threadIdx.x);
+    auto ra=thr.partition_fragment_A(make_tensor(a.data(),get_nonswizzle_portion(a.layout())));
+    auto rb=thr.partition_fragment_B(make_tensor(b.data(),get_nonswizzle_portion(b.layout())));
+    auto copya=make_tiled_copy_A(ca,mma);
+    auto copyb=make_tiled_copy_B(cb,mma);
+    auto ta=copya.get_thread_slice(threadIdx.x);
+    auto tb=copyb.get_thread_slice(threadIdx.x);
+    auto sa=ta.partition_S(a);
+    auto sb=tb.partition_S(b);
+    auto va=ta.retile_D(ra);
+    auto vb=tb.retile_D(rb);
+    cute::copy(copya,sa(_,_,_0{}),va(_,_,_0{}));
+    cute::copy(copyb,sb(_,_,_0{}),vb(_,_,_0{}));
     #pragma unroll
-    for (int m=0; m<Rows; ++m) if (reduction_lane==0) {
-        int qr=transpose ? small:row+m, kr=transpose ? row+m:small;
-        int64_t q=qb+qr, k=kb+kr;
-        float probability=0.f;
-        if (q<end && k<end && (!CAUSAL || k<=q)) {
-            float s=score[m]*p.scale;
-            if constexpr (BIAS==1) s+=p.inputs[3].at(k,head);
-            if constexpr (BIAS==2) s+=p.inputs[3].at(segment,head,q-begin,k-begin);
-            float inverse=p.state.data[(q*H+head)*2+1];
-            if (inverse>0.f) probability=__expf(s-p.state.data[(q*H+head)*2])*inverse;
+    for(int k=0;k<size<2>(ra);++k) {
+        if(k+1<size<2>(ra)) {
+            cute::copy(copya,sa(_,_,k+1),va(_,_,k+1));
+            cute::copy(copyb,sb(_,_,k+1),vb(_,_,k+1));
         }
-        prob[qr*32+kr]=probability;
-        adj[qr*32+kr]=value[m];
+        cute::gemm(mma,ra(_,_,k),rb(_,_,k),acc);
     }
+}
+
+template<int Channels,int Rows,int Columns>
+__device__ __forceinline__ void load_feature(GemmElement* output,AttentionTensor const& source,
+    int64_t begin,int64_t end,int head,int base) {
+    using Layout=FeatureLayout<Rows,Columns>;
+#if COMPACT
+    if constexpr(Channels%8==0) if((reinterpret_cast<uintptr_t>(source.data)&15)==0) {
+        for(int pos=threadIdx.x*8;pos<Rows*Columns;pos+=Threads*8) {
+            int row=pos/Columns,column=pos%Columns;
+            bool valid=begin+row<end && base+column<Channels;
+            auto pointer=source.data+(valid ? ((begin+row)*HEADS+head)*Channels+base+column:0);
+            cutlass::arch::cp_async_zfill<16,cutlass::arch::CacheOperation::Global>(
+                output+Layout{}(row,column),pointer,valid);
+        }
+        return;
+    }
+#endif
+    for(int pos=threadIdx.x;pos<Rows*Columns;pos+=Threads) {
+        int row=pos/Columns,column=pos%Columns;
+        output[Layout{}(row,column)]=GemmElement(begin+row<end && base+column<Channels ?
+            attention_feature(source,begin+row,head,base+column,Channels):0.f);
+    }
+}
+__device__ __forceinline__ void wait_feature() {
+    cutlass::arch::cp_async_fence();
+    cutlass::arch::cp_async_wait<0>();
     __syncthreads();
 }
 
-template <int Rows, int D, int V, int H, bool COMPACT, int Threads>
-__device__ __forceinline__ void backward_contract(AttentionParams const& p,
-    float const* prob, float const* adj, float* cache, int64_t begin, int64_t end,
-    int64_t qb, int64_t kb, int head, int output, int workers) {
-    constexpr int Width=BACKWARD_WIDTH, Plane=33*Width;
-    constexpr bool Cached=D<=Width && V<=Width;
-    const int lane=threadIdx.x%32, warp=threadIdx.x/32;
-    const int width=output<2 ? D:V, source=output==0 ? 1:output==1 ? 0:4;
-    const int slot=output==0 ? 1:output==1 ? 0:3;
-    const int64_t source_base=output==0 ? kb:qb, target_base=output==0 ? qb:kb;
-    const int target_rows=int(min(int64_t(32),end-target_base));
-    const int reduction=int(min(int64_t(32),end-source_base));
-    for (int base=0; base<width; base+=Width) {
-        const int count=min(Width,width-base), channel_tiles=(count+31)/32;
-        if constexpr (!Cached) {
-            for (int x=threadIdx.x; x<32*count; x+=Threads) {
-                int r=x/count, c=x%count;
-                cache[c*33+r]=source_base+r<end ? backward_feature<H,COMPACT>(p.inputs[source],source_base+r,head,base+c,width):0.f;
-            }
+template<int Channels,int Capacity,typename Acc>
+__device__ __forceinline__ void score(Acc& acc,GemmElement* left_resident,GemmElement* right_resident,
+    GemmElement* stream_left,GemmElement* stream_right,AttentionTensor const& left,AttentionTensor const& right,
+    int64_t qb,int64_t kb,int64_t end,int head,int channel_base) {
+    auto a=make_tensor(make_smem_ptr(left_resident),FeatureLayout<32,Capacity>{});
+    auto b=make_tensor(make_smem_ptr(right_resident),FeatureLayout<32,Capacity>{});
+    for(int c=0;c<Channels;c+=64) {
+        if(c>=channel_base && c<channel_base+Capacity) {
+            auto at=local_tile(a,Shape<_32,_64>{},make_coord(_0{},(c-channel_base)/64));
+            auto bt=local_tile(b,Shape<_32,_64>{},make_coord(_0{},(c-channel_base)/64));
+            gemm(acc,at,bt,Mma{},CopyN{},CopyN{});
+        } else {
+            load_feature<Channels,32,64>(stream_left,left,qb,end,head,c);
+            load_feature<Channels,32,64>(stream_right,right,kb,end,head,c);
+            wait_feature();
+            auto at=make_tensor(make_smem_ptr(stream_left),FeatureLayout<32,64>{});
+            auto bt=make_tensor(make_smem_ptr(stream_right),FeatureLayout<32,64>{});
+            gemm(acc,at,bt,Mma{},CopyN{},CopyN{});
             __syncthreads();
         }
-        for (int tile=warp; tile<(target_rows+Rows-1)/Rows*channel_tiles; tile+=Threads/32) {
-            const int row=tile/channel_tiles*Rows, channel=tile%channel_tiles*32+lane;
-            if (channel<count) {
-                float sum[Rows]={};
-                #pragma unroll 4
-                for (int k=0; k<reduction; ++k) {
-                    float feature=cache[(Cached ? slot*Plane:0)+channel*33+k];
-                    #pragma unroll
-                    for (int m=0; m<Rows; ++m) {
-                        float weight=output==2 ? prob[k*32+row+m]:output==0 ? adj[(row+m)*32+k]:adj[k*32+row+m];
-                        sum[m]=multiply_add(weight,feature,sum[m]);
-                    }
-                }
-                #pragma unroll
-                for (int m=0; m<Rows; ++m) if (target_base+row+m<end) {
-                    auto&& out=backward_feature<H,true>(p.outputs[output],target_base+row+m,head,base+channel,width);
-                    bool accumulate=output==0 ? kb+32<end:qb>begin;
-                    if constexpr (!LOW_PRECISION) {
-                        if (output!=0 && end-begin>64 && workers>1)
-                            atomicAdd(&out,sum[m]*(output<2 ? p.scale:1.f));
-                        else out=sum[m]*(output<2 ? p.scale:1.f)+(accumulate ? out:0.f);
-                    } else out=sum[m]*(output<2 ? p.scale:1.f)+(accumulate ? float(out):0.f);
-                }
-            }
-        }
-        if constexpr (!Cached) __syncthreads();
     }
 }
+} // namespace backward_ready
 
-template <int D, int V, int H, bool COMPACT, int BIAS, bool CAUSAL, int NEEDS, int Threads>
-__device__ void backward_tiled(AttentionParams const& p, int64_t begin, int64_t end,
-    int64_t segment, int head, float* smem, int worker, int workers) {
-    constexpr int Width=BACKWARD_WIDTH, Plane=33*Width, Rows=1024/Threads;
-    constexpr bool Cached=D<=Width && V<=Width;
-    int tid=threadIdx.x, lane=tid%32, row=(tid/32)*Rows;
-    float* pairs=smem+4*Plane;
-    float* delta=pairs+BACKWARD_CACHE_TILES*2048;
-    float* norm=delta+32;
-    const int64_t last_key=begin+(end-begin-1)/32*32;
-    const int64_t first_saved=max(begin,last_key-(BACKWARD_CACHE_TILES-1)*32);
-    for (int64_t qb=begin+(BIAS!=2 && end-begin>64 ? worker*32:0); qb<end; qb+=(BIAS!=2 && end-begin>64 ? workers:1)*32) {
-        if (tid<32) {
-            delta[tid]=0.f;
-            norm[tid]=0.f;
-        }
-        if constexpr (Cached) {
-            backward_cache<0,D,Width,H,COMPACT,Threads>(p,smem,qb,end,head,0);
-            backward_cache<4,V,Width,H,COMPACT,Threads>(p,smem+3*Plane,qb,end,head,0);
-        }
-        __syncthreads();
-        for (int64_t kb=begin; kb<end; kb+=32) {
-            float* prob=pairs+((kb-begin)/32%BACKWARD_CACHE_TILES)*2048;
-            float* adj=prob+1024;
-            backward_pairs<D,V,H,COMPACT,BIAS,CAUSAL,Threads>(p,qb,kb,begin,end,segment,head,smem,prob,adj);
-            #pragma unroll
-            for (int m=0; m<Rows; ++m) {
-                float probability=prob[(row+m)*32+lane];
-                float sum=probability*adj[(row+m)*32+lane];
-                #pragma unroll
-                for (int shift=16; shift>0; shift/=2) {
-                    sum+=__shfl_xor_sync(0xffffffff,sum,shift);
-                    probability+=__shfl_xor_sync(0xffffffff,probability,shift);
-                }
-                if (lane==0) {
-                    delta[row+m]+=sum;
-                    norm[row+m]+=probability;
-                }
-            }
-            __syncthreads();
-        }
-        for (int64_t kb=last_key; kb>=begin; kb-=32) {
-            float* prob=pairs+((kb-begin)/32%BACKWARD_CACHE_TILES)*2048;
-            float* adj=prob+1024;
-            if (kb<first_saved)
-                backward_pairs<D,V,H,COMPACT,BIAS,CAUSAL,Threads>(p,qb,kb,begin,end,segment,head,smem,prob,adj);
-            else if constexpr (Cached && (NEEDS&1)) {
-                if (kb!=last_key)
-                    backward_cache<1,D,Width,H,COMPACT,Threads>(p,smem+Plane,kb,end,head,0);
-            }
-            #pragma unroll
-            for (int m=0; m<Rows; ++m) {
-                float inverse=norm[row+m]>0.f ? 1.f/norm[row+m]:0.f;
-                prob[(row+m)*32+lane]*=inverse;
-                adj[(row+m)*32+lane]=prob[(row+m)*32+lane]*(adj[(row+m)*32+lane]-delta[row+m]*inverse);
-            }
-            __syncthreads();
-            #pragma unroll
-            for (int output=0; output<3; ++output) if (NEEDS&(1<<output)) {
-                int64_t target_base=output==0 ? qb:kb;
-                if (end-target_base<Rows)
-                    backward_contract<1,D,V,H,COMPACT,Threads>(p,prob,adj,smem,begin,end,qb,kb,head,output,workers);
-                else
-                    backward_contract<Rows,D,V,H,COMPACT,Threads>(p,prob,adj,smem,begin,end,qb,kb,head,output,workers);
-            }
-            if constexpr (BIAS==1 && (NEEDS&8)) {
-                #pragma unroll
-                for (int m=0; m<Rows; ++m) {
-                    float sum=adj[lane*32+row+m];
-                    #pragma unroll
-                    for (int shift=16; shift>0; shift/=2) sum+=__shfl_xor_sync(0xffffffff,sum,shift);
-                    if (lane==0 && kb+row+m<end) {
-                        auto&& out=p.outputs[3].at(kb+row+m,head);
+#endif
 #if !LOW_PRECISION
-                        if (end-begin>64 && workers>1) atomicAdd(&out,sum);
-                        else out=sum+(qb>begin ? out:0.f);
+namespace score_value {
+
+// Two independent dot products. There are no cross-component products.
+struct alignas(8) Element {
+    float score, value;
+
+    __host__ __device__ __forceinline__ Element(float x = 0.f) : score(x), value(0.f) {}
+    __host__ __device__ __forceinline__ Element(float score_, float value_)
+        : score(score_), value(value_) {}
+};
+
+struct Product {
+    Element left, right;
+
+    __host__ __device__ __forceinline__ Element operator+(Element const& accumulator) const {
+        return {fmaf(left.score, right.score, accumulator.score),
+                fmaf(left.value, right.value, accumulator.value)};
+    }
+};
+
+__host__ __device__ __forceinline__ Product operator*(Element const& left, Element const& right) {
+    return {left, right};
+}
+
+static_assert(sizeof(Element) == 8 && alignof(Element) == 8);
+using Shape = cutlass::gemm::GemmShape<32, 32, 8>;
+using Core = cutlass::gemm::threadblock::DefaultMmaCore<
+    Shape, cutlass::gemm::GemmShape<16, 16, 8>, cutlass::gemm::GemmShape<1, 1, 1>,
+    Element, cutlass::layout::RowMajor, Element, cutlass::layout::ColumnMajor,
+    Element, cutlass::layout::RowMajor, cutlass::arch::OpClassSimt, 2, cutlass::arch::OpMultiplyAdd>;
+using Base = cutlass::gemm::threadblock::MmaBase<Shape, typename Core::MmaPolicy, 1>;
+using Operator = typename Core::MmaPolicy::Operator;
+
+struct alignas(16) Shared {
+    typename Base::SharedStorage operands;
+};
+
+template<typename ThreadMap, typename Producer, bool Left>
+struct ProducerIterator {
+    using Element = score_value::Element;
+    using Fragment = cutlass::Array<Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
+    Producer producer;
+    cutlass::PitchLinearCoord origin;
+    int base = 0, reduction;
+    bool enabled = true;
+
+    __device__ __forceinline__ ProducerIterator(Producer producer_, int reduction_)
+        : producer(producer_), origin(ThreadMap::initial_offset(threadIdx.x)), reduction(reduction_) {}
+    __device__ __forceinline__ void clear_mask(bool clear) { enabled = enabled && !clear; }
+    __device__ __forceinline__ ProducerIterator& operator++() { base += 8; return *this; }
+    __device__ __forceinline__ void load(Fragment& fragment) const {
+        #pragma unroll
+        for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s)
+            #pragma unroll
+            for (int c = 0; c < ThreadMap::Iterations::kContiguous; ++c)
+                #pragma unroll
+                for (int e = 0; e < ThreadMap::kElementsPerAccess; ++e) {
+                    int k = base + origin.contiguous() + c * ThreadMap::Delta::kContiguous + e;
+                    int outer = origin.strided() + s * ThreadMap::Delta::kStrided;
+                    int index = (s * ThreadMap::Iterations::kContiguous + c) * ThreadMap::kElementsPerAccess + e;
+                    Element element;
+                    if (enabled && k < reduction) {
+                        if constexpr (Left) element = producer(outer, k);
+                        else element = producer(k, outer);
+                    }
+                    fragment[index] = element;
+                }
+    }
+};
+
+template<typename Fragment, typename Project>
+__device__ __forceinline__ void store_plane(Fragment const& accumulator, float* output, Project project) {
+    using IteratorC = typename Operator::IteratorC;
+    using FloatIterator = cutlass::gemm::warp::MmaSimtTileIterator<
+        typename IteratorC::Shape, cutlass::gemm::Operand::kC, float,
+        cutlass::layout::RowMajor, typename IteratorC::Policy>;
+    static_assert(FloatIterator::Fragment::kElements == Fragment::kElements);
+    typename FloatIterator::Fragment field;
+    #pragma unroll
+    for (int i = 0; i < Fragment::kElements; ++i) field[i] = project(accumulator[i]);
+    int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    FloatIterator iterator(
+        {output + (warp % 2) * 16 * AttentionScoreStride + (warp / 2) * 16, cutlass::layout::RowMajor(AttentionScoreStride)}, lane);
+    iterator.store(field);
+}
+
+template<typename Left, typename Right>
+__device__ __forceinline__ void gemm(Shared& shared, float* score, float* value,
+    int reduction, Left left, Right right) {
+    using IteratorA = ProducerIterator<typename Core::IteratorThreadMapA, Left, true>;
+    using IteratorB = ProducerIterator<typename Core::IteratorThreadMapB, Right, false>;
+    using ThreadblockMma = cutlass::gemm::threadblock::MmaSingleStage<
+        Shape, IteratorA, typename Core::SmemIteratorA, IteratorB, typename Core::SmemIteratorB,
+        Element, cutlass::layout::RowMajor, typename Core::MmaPolicy>;
+    typename ThreadblockMma::FragmentC accumulator;
+    accumulator.clear();
+    ThreadblockMma mma(shared.operands, threadIdx.x, threadIdx.x / 32, threadIdx.x % 32);
+    mma((reduction + 7) / 8, accumulator, IteratorA(left, reduction), IteratorB(right, reduction), accumulator);
+    store_plane(accumulator, score, [](Element const& x) { return x.score; });
+    store_plane(accumulator, value, [](Element const& x) { return x.value; });
+    __syncthreads();
+}
+
+} // namespace score_value
+#endif
+
+#if LOW_PRECISION
+struct alignas(16) AttentionBackwardShared {
+    alignas(16) GemmElement query[32*backward_ready::KeyCapacity];
+    alignas(16) GemmElement gradient[32*backward_ready::ValueCapacity];
+    alignas(16) GemmElement key[32*backward_ready::KeyCapacity];
+    alignas(16) GemmElement feature_value[(NEEDS&11) ? 32*backward_ready::ValueCapacity:1];
+    alignas(16) GemmElement stream_left[(DIM>256 || VALUE_DIM>256) ? 32*64:1];
+    alignas(16) GemmElement stream_right[(DIM>256 || VALUE_DIM>256) ? 32*64:1];
+    alignas(16) GemmElement probability[(NEEDS&4) ? 32*32:1];
+    alignas(16) GemmElement value[(NEEDS&3) ? 32*32:1];
+    float bias_gradient[((NEEDS&8) && BIAS_KIND!=0) ? 32*32:1];
+    float delta[32];
+};
+
 #else
-                        out=sum+(qb>begin ? float(out):0.f);
+union AttentionBackwardScore {
+    AttentionGemmStorage scalar;
+    score_value::Shared packed;
+};
+
+__device__ __forceinline__ void backward_pairs(AttentionParams const& p,AttentionBackwardScore& gemm,
+    float* probability,float* value,int64_t begin,int64_t end,int64_t qb,int64_t kb,int segment,int head) {
+    if constexpr ((NEEDS&11) && (PRESENT&7)==7) {
+        score_value::gemm(gemm.packed,probability,value,DIM>VALUE_DIM ? DIM:VALUE_DIM,
+            [&](int row,int k) {
+                score_value::Element x;
+                if(qb+row<end) {
+                    if(k<DIM) x.score=attention_feature(p.inputs[0],qb+row,head,k,DIM);
+                    if constexpr(PRESENT&16)
+                        if(k<VALUE_DIM) x.value=attention_feature(p.inputs[4],qb+row,head,k,VALUE_DIM);
+                }
+                return x;
+            },
+            [&](int k,int column) {
+                score_value::Element x;
+                if(kb+column<end) {
+                    if(k<DIM) x.score=attention_feature(p.inputs[1],kb+column,head,k,DIM);
+                    if(k<VALUE_DIM) x.value=attention_feature(p.inputs[2],kb+column,head,k,VALUE_DIM);
+                }
+                return x;
+            });
+    } else {
+        attention_pair<0,1>(p,gemm.scalar,probability,qb,kb,end,head,DIM);
+        if constexpr(NEEDS&11) attention_pair<4,2>(p,gemm.scalar,value,qb,kb,end,head,VALUE_DIM);
+    }
+    for(int i=threadIdx.x;i<1024;i+=128) {
+        int row=i/32,column=i%32;
+        bool valid=qb+row<end && kb+column<end && (!CAUSAL || kb+column<=qb+row);
+        float prob=0.f;
+        if(valid && p.state.at(qb+row,head,1)>0.f) {
+            float score=probability[(i/32)*AttentionScoreStride+i%32]*p.scale+attention_bias<3>(p,segment,head,begin,qb+row,kb+column);
+            prob=__expf(score-p.state.at(qb+row,head,0))*p.state.at(qb+row,head,1);
+        }
+        probability[(i/32)*AttentionScoreStride+i%32]=prob;
+    }
+    __syncthreads();
+}
+
+union AttentionBackwardGemm {
+    AttentionBackwardScore score;
+    AttentionGemmTile<BACKWARD_WIDTH,true> output;
+};
+struct AttentionBackwardShared {
+    AttentionBackwardGemm gemm;
+    float probability[32*AttentionScoreStride],value[32*AttentionScoreStride],delta[32];
+};
+
 #endif
-                    }
-                }
-            }
-            if constexpr (BIAS==2 && (NEEDS&8)) {
-                #pragma unroll
-                for (int m=0; m<Rows; ++m) if (qb+row+m<end && kb+lane<end)
-                    p.outputs[3].at(segment,head,qb+row+m-begin,kb+lane-begin)=adj[(row+m)*32+lane];
-            }
-            __syncthreads();
-        }
-    }
-}
 
-#if !LOW_PRECISION
-template<int Tile,int Pitch,int H,bool COMPACT,int Threads>
-__device__ void backward_row_cache(AttentionTensor const& tensor,float* cache,
-    int64_t begin,int64_t end,int head,int base,int width,int count) {
-    if constexpr (COMPACT) {
-        if (width%4==0 && count%4==0 && (reinterpret_cast<uintptr_t>(tensor.data)&15)==0) {
-            for (int x=threadIdx.x*4;x<Tile*count;x+=Threads*4) {
-                int r=x/count,c=x%count;
-                float4 value={0.f,0.f,0.f,0.f};
-                if (begin+r<end) value=*reinterpret_cast<const float4*>(&backward_feature<H,true>(tensor,begin+r,head,base+c,width));
-                *reinterpret_cast<float4*>(cache+r*Pitch+c)=value;
-            }
-            return;
-        }
-    }
-    for (int x=threadIdx.x;x<Tile*count;x+=Threads) {
-        int r=x/count,c=x%count;
-        cache[r*Pitch+c]=begin+r<end ? backward_feature<H,COMPACT>(tensor,begin+r,head,base+c,width):0.f;
-    }
-}
-
-// A complete segment up to 64 tokens fits in bounded shared memory.
-template <int Tile,int D, int V, int H, bool COMPACT, int BIAS, bool CAUSAL, int NEEDS,int Threads>
-__device__ void backward_segment(AttentionParams const& p, int64_t begin, int64_t end,
-    int64_t segment, int head, float* smem) {
-    constexpr int Rows=Tile/(Threads/16), KeyTiles=Tile/16;
-    int tid = threadIdx.x, lane = tid%16, row = (tid/16)*Rows, col = lane;
-    constexpr int KeyStride = 16;
-    constexpr int FeatureTile = 32;
-    constexpr int CacheWidth = (D>V ? D:V);
-    constexpr int CachePitch = (CacheWidth+3)/4*4+4;
-    constexpr int Plane = Tile*(CachePitch>72 ? CachePitch:72);
-    float* prob = smem+Plane;
-    float* adj = prob+Tile*Tile;
-    #pragma unroll
-    for (int product = 0; product<2; ++product) {
-        float matrix[Rows][KeyTiles] = {{0.f}};
-        int width = product==0 ? D:V;
-        for (int base = 0; base<width; base+=FeatureTile) {
-            int count = min(FeatureTile, width-base);
-            backward_row_cache<Tile,36,H,COMPACT,Threads>(p.inputs[product==0 ? 0:4],smem,begin,end,head,base,width,count);
-            backward_row_cache<Tile,36,H,COMPACT,Threads>(p.inputs[product==0 ? 1:2],smem+Tile*36,begin,end,head,base,width,count);
-            __syncthreads();
-            if (begin+row<end) {
-                #pragma unroll 4
-                for (int c = 0; c<count; ++c) {
-                    #pragma unroll
-                    for (int m = 0; m<Rows; ++m) {
-                        float a = smem[(row+m)*36+c];
-                        #pragma unroll
-                        for (int n = 0; n<KeyTiles; ++n) matrix[m][n] = multiply_add(a, smem[Tile*36+(col+n*KeyStride)*36+c], matrix[m][n]);
-                    }
-                }
-            }
-            __syncthreads();
+#if LOW_PRECISION && (NEEDS&9)
+// The existing workspace initialization also computes one softmax-centering
+// scalar per query, shared by all key owners without keeping g and O live.
+__global__ void attention_center_initialize_kernel(
+    const __grid_constant__ AttentionParams p) {
+    const int segment=blockIdx.x,head=blockIdx.y;
+    const int64_t begin=p.offset(segment),end=p.offset(segment+1);
+    attention_initialize<4>(p,segment,head,begin,end);
+    const int lane=threadIdx.x%8,row_group=threadIdx.x/8;
+    const unsigned mask=0xffu<<((threadIdx.x%32)/8*8);
+    for(int64_t row=begin+row_group;row<end;row+=16) {
+        float sum=0.f;
+        AttentionGemmFeature<> grad(p.inputs[4],row,row+1,head,VALUE_DIM);
+        AttentionGemmFeature<> output(p.inputs[5],row,row+1,head,VALUE_DIM);
+        for(int c=lane*8;c<VALUE_DIM;c+=8*8) {
+            alignas(16) cutlass::Array<GemmElement,8> g,o;
+            grad.template load8<false>(g,0,0,c);
+            output.template load8<false>(o,0,0,c);
+            auto gf=cutlass::NumericArrayConverter<float,GemmElement,8>{}(g);
+            auto of=cutlass::NumericArrayConverter<float,GemmElement,8>{}(o);
+            #pragma unroll
+            for(int i=0;i<8;++i) sum+=gf[i]*of[i];
         }
         #pragma unroll
-        for (int m = 0; m<Rows; ++m) {
-            int64_t q = begin+row+m;
-            if (product==0) {
-                float maximum = q<end ? p.state.data[(q*H+head)*2]:0.f;
-                float inverse = q<end ? p.state.data[(q*H+head)*2+1]:0.f;
+        for(int delta=4;delta>0;delta/=2) sum+=__shfl_xor_sync(mask,sum,delta,8);
+        if(lane==0) reinterpret_cast<float*>(p.inputs[6].data)[row*HEADS+head]=sum;
+    }
+}
+#endif
+
+__global__ __launch_bounds__(128) void attention_backward_kernel(
+    const __grid_constant__ AttentionParams p) {
+    int segment=blockIdx.x,head=blockIdx.y;
+    int64_t begin=p.offset(segment),end=p.offset(segment+1);
+    extern __shared__ char storage[];
+    auto& shared=*reinterpret_cast<AttentionBackwardShared*>(storage);
+#if !LOW_PRECISION
+    auto& gemm=shared.gemm;
+#endif
+    auto& probability=shared.probability;
+    auto& value=shared.value;
+    auto& delta=shared.delta;
+    const int lane=threadIdx.x%32,warp=threadIdx.x/32;
+#if LOW_PRECISION
+    using namespace backward_ready;
+    constexpr int QueryChannels=(NEEDS&3) ? DIM:0;
+    constexpr int ValueChannels=(NEEDS&4) ? VALUE_DIM:0;
+    constexpr int Channels=QueryChannels>ValueChannels ? QueryChannels:ValueChannels;
+    constexpr int ChannelGroups=(Channels+255)/256;
+    const int worker=blockIdx.z%4;
+    const int channel_base=ChannelGroups<=1 ? 0:(blockIdx.z/4)*256;
+    auto native_query=make_tensor(make_smem_ptr(shared.query),FeatureLayout<32,KeyCapacity>{});
+    auto native_gradient=make_tensor(make_smem_ptr(shared.gradient),FeatureLayout<32,ValueCapacity>{});
+    auto native_key=make_tensor(make_smem_ptr(shared.key),FeatureLayout<32,KeyCapacity>{});
+    auto coefficient=make_tensor(make_smem_ptr(shared.value),CoefficientLayout{});
+    auto prob_coefficient=make_tensor(make_smem_ptr(shared.probability),CoefficientLayout{});
+    auto coords=Mma{}.get_thread_slice(threadIdx.x).partition_C(make_identity_tensor(Shape<_32,_32>{}));
+    auto dq_coords=Mma{}.get_thread_slice(threadIdx.x).partition_C(make_identity_tensor(Shape<_32,_64>{}));
+    auto key_coords=Mma{}.get_thread_slice(threadIdx.x).partition_C(make_identity_tensor(Shape<_32,Int<KeyCapacity>>{}));
+    auto value_coords=Mma{}.get_thread_slice(threadIdx.x).partition_C(make_identity_tensor(Shape<_32,Int<ValueCapacity>>{}));
+    for(int64_t kb=begin+int64_t(worker)*32;kb<end;kb+=4*32) {
+        load_feature<DIM,32,KeyCapacity>(shared.key,p.inputs[1],kb,end,head,channel_base);
+        if constexpr(NEEDS&11)
+            load_feature<VALUE_DIM,32,ValueCapacity>(shared.feature_value,p.inputs[2],kb,end,head,channel_base);
+        wait_feature();
+        auto dk=partition_fragment_C(Mma{},Shape<_32,Int<KeyCapacity>>{});
+        auto dv=partition_fragment_C(Mma{},Shape<_32,Int<ValueCapacity>>{});
+        if constexpr(NEEDS&2) clear(dk);
+        if constexpr(NEEDS&4) clear(dv);
+        for(int64_t qb=begin;qb<end;qb+=32) {
+            load_feature<DIM,32,KeyCapacity>(shared.query,p.inputs[0],qb,end,head,channel_base);
+            load_feature<VALUE_DIM,32,ValueCapacity>(shared.gradient,p.inputs[4],qb,end,head,channel_base);
+            if constexpr(NEEDS&9) {
+                if(threadIdx.x<32) delta[threadIdx.x]=qb+threadIdx.x<end ?
+                    reinterpret_cast<float const*>(p.inputs[6].data)[(qb+threadIdx.x)*HEADS+head]:0.f;
+            } else if constexpr(NEEDS&11) {
+                for(int row=warp;row<32;row+=4) {
+                    float sum=0.f;
+                    if(qb+row<end) for(int c=lane;c<VALUE_DIM;c+=32)
+                        sum+=attention_feature(p.inputs[4],qb+row,head,c,VALUE_DIM)*
+                             attention_feature(p.inputs[5],qb+row,head,c,VALUE_DIM);
+                    sum=attention_sum(sum);
+                    if(lane==0) delta[row]=sum;
+                }
+            }
+            wait_feature();
+            {
+                auto scores=partition_fragment_C(Mma{},Shape<_32,_32>{});
+                auto products=partition_fragment_C(Mma{},Shape<_32,_32>{});
+                clear(scores);clear(products);
+                score<DIM,KeyCapacity>(scores,shared.query,shared.key,shared.stream_left,shared.stream_right,
+                    p.inputs[0],p.inputs[1],qb,kb,end,head,channel_base);
+                if constexpr(NEEDS&11)
+                    score<VALUE_DIM,ValueCapacity>(products,shared.gradient,shared.feature_value,shared.stream_left,shared.stream_right,
+                        p.inputs[4],p.inputs[2],qb,kb,end,head,channel_base);
                 #pragma unroll
-                for (int n = 0; n<KeyTiles; ++n) {
-                    int64_t k = begin+col+n*KeyStride;
-                    float probability = 0.f;
-                    if (q<end && k<end && (!CAUSAL || k<=q) && inverse>0.f) {
-                        float score = matrix[m][n]*p.scale;
-                        if constexpr (BIAS==1) score+=p.inputs[3].at(k, head);
-                        if constexpr (BIAS==2) score+=p.inputs[3].at(segment, head, row+m, col+n*KeyStride);
-                        probability = __expf(score-maximum)*inverse;
+                for(int i=0;i<size(scores);++i) {
+                    const int row=get<0>(coords(i)),column=get<1>(coords(i));
+                    const bool valid=qb+row<end && kb+column<end && (!CAUSAL || kb+column<=qb+row);
+                    float prob=0.f;
+                    if(valid && p.state.at(qb+row,head,1)>0.f) {
+                        const float score=scores(i)*p.scale+attention_bias<3>(p,segment,head,begin,qb+row,kb+column);
+                        prob=__expf(score-p.state.at(qb+row,head,0))*p.state.at(qb+row,head,1);
                     }
-                    prob[(row+m)*Tile+col+n*KeyStride] = probability;
+                    if constexpr(NEEDS&4) prob_coefficient(row,column)=GemmElement(prob);
+                    if constexpr(NEEDS&11) {
+                        const float ds=prob*(products(i)-delta[row]);
+                        if constexpr(NEEDS&3) coefficient(row,column)=GemmElement(ds);
+                        if constexpr((NEEDS&8) && BIAS_KIND!=0) shared.bias_gradient[row*32+column]=ds;
+                    }
+                }
+            }
+            __syncthreads();
+            if constexpr(NEEDS&1) for(int local=0;local<KeyCapacity && channel_base+local<DIM;local+=64) {
+                auto dq=partition_fragment_C(Mma{},Shape<_32,_64>{});
+                clear(dq);
+                auto key_tile=local_tile(native_key,Shape<_32,_64>{},make_coord(_0{},local/64));
+                gemm(dq,coefficient,transpose(key_tile),Mma{},CopyN{},CopyT{});
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+                if constexpr(DIM%4==0) {
+                    #pragma unroll
+                    for(int i=0;i<size(dq);i+=2) {
+                        float x=dq(i)*p.scale,y=dq(i+1)*p.scale;
+                        float z=__shfl_down_sync(0xffffffff,x,1),w=__shfl_down_sync(0xffffffff,y,1);
+                        int row=get<0>(dq_coords(i)),c=channel_base+local+get<1>(dq_coords(i));
+                        if(lane%2==0 && qb+row<end && c<DIM)
+                            atomicAdd(reinterpret_cast<float4*>(reinterpret_cast<float*>(p.outputs[0].data)
+                                +((qb+row)*HEADS+head)*DIM+c),make_float4(x,y,z,w));
+                    }
+                } else
+#endif
+                {
+                    #pragma unroll
+                    for(int i=0;i<size(dq);++i) {
+                        int row=get<0>(dq_coords(i)),c=channel_base+local+get<1>(dq_coords(i));
+                        if(qb+row<end && c<DIM)
+                            atomicAdd(reinterpret_cast<float*>(p.outputs[0].data)+((qb+row)*HEADS+head)*DIM+c,dq(i)*p.scale);
+                    }
+                }
+                __syncthreads();
+            }
+            if constexpr(NEEDS&2)
+                gemm(dk,transpose(coefficient),transpose(native_query),Mma{},CopyT{},CopyT{});
+            if constexpr(NEEDS&4)
+                gemm(dv,transpose(prob_coefficient),transpose(native_gradient),Mma{},CopyT{},CopyT{});
+            __syncthreads();
+            if constexpr((NEEDS&8) && BIAS_KIND!=0) if(channel_base==0) {
+                for(int i=threadIdx.x;i<32*32;i+=128) {
+                    int row=i/32,column=i%32;
+                    if(qb+row<end && kb+column<end) {
+                        if constexpr(BIAS_KIND==2)
+                            p.outputs[3].fp32_at(segment,head,qb+row-begin,kb+column-begin)=shared.bias_gradient[i];
+                    }
+                }
+                if constexpr(BIAS_KIND==1) if(threadIdx.x<32 && kb+threadIdx.x<end) {
+                    float sum=0.f;
+                    for(int row=0;row<32;++row) sum+=shared.bias_gradient[row*32+threadIdx.x];
+                    atomicAdd(&p.outputs[3].fp32_at(kb+threadIdx.x,head),sum);
+                }
+                __syncthreads();
+            }
+        }
+        if constexpr(NEEDS&2) {
+            if constexpr(DIM%2==0) {
+                #pragma unroll
+                for(int i=0;i<size(dk);i+=2) {
+                    int row=get<0>(key_coords(i)),c=channel_base+get<1>(key_coords(i));
+                    if(kb+row<end && c<DIM) {
+                        Storage x=Storage(dk(i)*p.scale),y=Storage(dk(i+1)*p.scale);
+                        uint32_t packed=uint32_t(x.x)|(uint32_t(y.x)<<16);
+                        *reinterpret_cast<uint32_t*>(p.outputs[1].data+((kb+row)*HEADS+head)*DIM+c)=packed;
+                    }
                 }
             } else {
-                float delta = 0.f, norm = 0.f;
                 #pragma unroll
-                for (int n = 0; n<KeyTiles; ++n) {
-                    delta = multiply_add(prob[(row+m)*Tile+col+n*KeyStride], matrix[m][n], delta);
-                    norm+=prob[(row+m)*Tile+col+n*KeyStride];
+                for(int i=0;i<size(dk);++i) {
+                    int row=get<0>(key_coords(i)),c=channel_base+get<1>(key_coords(i));
+                    if(kb+row<end && c<DIM)
+                        p.outputs[1].data[((kb+row)*HEADS+head)*DIM+c]=Storage(dk(i)*p.scale);
                 }
+            }
+        }
+        if constexpr(NEEDS&4) {
+            if constexpr(VALUE_DIM%2==0) {
                 #pragma unroll
-                for (int shift = 1; shift<16; shift*=2) {
-                    delta+=__shfl_xor_sync(0xffffffff, delta, shift);
-                    norm+=__shfl_xor_sync(0xffffffff, norm, shift);
+                for(int i=0;i<size(dv);i+=2) {
+                    int row=get<0>(value_coords(i)),c=channel_base+get<1>(value_coords(i));
+                    if(kb+row<end && c<VALUE_DIM) {
+                        Storage x=Storage(dv(i)),y=Storage(dv(i+1));
+                        uint32_t packed=uint32_t(x.x)|(uint32_t(y.x)<<16);
+                        *reinterpret_cast<uint32_t*>(p.outputs[2].data+((kb+row)*HEADS+head)*VALUE_DIM+c)=packed;
+                    }
                 }
-                float inverse_norm = norm>0.f ? 1.f/norm : 0.f;
-                delta*=inverse_norm;
+            } else {
                 #pragma unroll
-                for (int n = 0; n<KeyTiles; ++n) {
-                    prob[(row+m)*Tile+col+n*KeyStride]*=inverse_norm;
-                    float value = prob[(row+m)*Tile+col+n*KeyStride]*(matrix[m][n]-delta);
-                    adj[(row+m)*Tile+col+n*KeyStride] = value;
-                    if constexpr (BIAS==2 && (NEEDS&8)) if (q<end && begin+col+n*KeyStride<end)
-                        p.outputs[3].at(segment, head, row+m, col+n*KeyStride) = value;
+                for(int i=0;i<size(dv);++i) {
+                    int row=get<0>(value_coords(i)),c=channel_base+get<1>(value_coords(i));
+                    if(kb+row<end && c<VALUE_DIM)
+                        p.outputs[2].data[((kb+row)*HEADS+head)*VALUE_DIM+c]=Storage(dv(i));
                 }
             }
         }
         __syncthreads();
     }
-    #pragma unroll
-    for (int output=0;output<3;++output) if (NEEDS&(1<<output)) {
-        int width=output<2 ? D:V, source=output==0 ? 1:output==1 ? 0:4;
-        constexpr int Columns=(CacheWidth+15)/16;
-        backward_row_cache<Tile,CachePitch,H,COMPACT,Threads>(p.inputs[source],smem,begin,end,head,0,width,width);
+
+#else
+    for(int64_t qb=begin+int64_t(blockIdx.z)*32;qb<end;qb+=int64_t(gridDim.z)*32) {
+        if constexpr(NEEDS&11) {
+            // Softmax centering is dot(g, the saved forward output).
+            for(int row=warp;row<32;row+=4) {
+                float sum=0.f;
+                if(qb+row<end) for(int c=lane;c<VALUE_DIM;c+=32)
+                    sum+=attention_feature(p.inputs[4],qb+row,head,c,VALUE_DIM)*
+                         attention_feature(p.inputs[5],qb+row,head,c,VALUE_DIM);
+                sum=attention_sum(sum);
+                if(lane==0) delta[row]=sum;
+            }
+        }
         __syncthreads();
-        float sum[Rows][Columns]={};
-        if (begin+row<end) {
-            #pragma unroll 2
-            for (int k=0;k<end-begin;++k) {
-                float weights[Rows];
-                #pragma unroll
-                for (int m=0;m<Rows;++m)
-                    weights[m]=output==2 ? prob[k*Tile+row+m]:output==0 ? adj[(row+m)*Tile+k]:adj[k*Tile+row+m];
-                #pragma unroll
-                for (int c=0;c<Columns;++c) if (lane+c*16<width) {
-                    float value=smem[k*CachePitch+lane+c*16];
-                    #pragma unroll
-                    for (int m=0;m<Rows;++m) sum[m][c]=multiply_add(weights[m],value,sum[m][c]);
+        for(int64_t kb=begin;kb<end;kb+=32) {
+            backward_pairs(p,gemm.score,probability,value,begin,end,qb,kb,segment,head);
+            for(int i=threadIdx.x;i<1024;i+=128) {
+                if constexpr(NEEDS&11) {
+                    value[(i/32)*AttentionScoreStride+i%32]=probability[(i/32)*AttentionScoreStride+i%32]*(value[(i/32)*AttentionScoreStride+i%32]-delta[i/32]);
                 }
             }
-            #pragma unroll
-            for (int m=0;m<Rows;++m) if (begin+row+m<end) {
-                #pragma unroll
-                for (int c=0;c<Columns;++c) if (lane+c*16<width)
-                    backward_feature<H,true>(p.outputs[output],begin+row+m,head,lane+c*16,width)=sum[m][c]*(output<2 ? p.scale:1.f);
-            }
-        }
-        __syncthreads();
-    }
-    if constexpr (BIAS==1 && (NEEDS&8)) {
-        int lane32 = tid%32, key = (tid/32)*(Tile/(Threads/32));
-        #pragma unroll
-        for (int m = 0; m<Tile/(Threads/32); ++m) {
-            float sum = adj[lane32*Tile+key+m]+(lane32+32<Tile ? adj[(lane32+32)*Tile+key+m]:0.f);
-            #pragma unroll
-            for (int shift = 16; shift>0; shift/=2) sum+=__shfl_xor_sync(0xffffffff, sum, shift);
-            if (lane32==0 && begin+key+m<end) p.outputs[3].at(begin+key+m, head) = sum;
+            __syncthreads();
+            attention_output<0,1>(p,gemm.output,value,gemm.output.result,qb,kb,end,head,DIM,p.scale,kb==begin);
+            attention_output<1,0,true>(p,gemm.output,value,gemm.output.result,qb,kb,end,head,DIM,p.scale);
+            attention_output<2,4,true>(p,gemm.output,probability,gemm.output.result,qb,kb,end,head,VALUE_DIM);
+            attention_bias_output<3,AttentionScoreStride>(p,value,segment,head,begin,qb,kb,end);
         }
     }
+#endif
 }
 
+void attention_backward(std::vector<std::optional<at::Tensor>> inputs,at::Tensor rowptr,at::Tensor state,
+    std::vector<std::optional<at::Tensor>> outputs,double scale,std::vector<std::optional<at::Tensor>> partials) {
+    c10::cuda::CUDAGuard guard(inputs[0]->device());
+    auto p=make_params(inputs,partials,rowptr,state,scale);
+    if(p.groups) {
+#if LOW_PRECISION && (NEEDS&9)
+        attention_center_initialize_kernel<<<dim3(p.groups,HEADS),128,0,at::cuda::getCurrentCUDAStream()>>>(p);
+#elif !LOW_PRECISION
+        attention_initialize_kernel<4><<<dim3(p.groups,HEADS),128,0,at::cuda::getCurrentCUDAStream()>>>(p);
 #endif
-
-template <int D, int V, int H, bool COMPACT, int BIAS, bool CAUSAL, int NEEDS, int Threads, int TileLimit, int Minimum>
-__global__ __launch_bounds__(Threads, Minimum ? BACKWARD_LONG_BLOCKS : BACKWARD_MIN_BLOCKS) void attention_backward_kernel(const __grid_constant__ AttentionParams p) {
-    extern __shared__ float smem[];
-    constexpr int Workers=LOW_PRECISION || Minimum==0 ? 1:BACKWARD_WORKERS;
-    int64_t segment = blockIdx.x/Workers;
-    int worker=blockIdx.x%Workers;
-    int head = blockIdx.y;
-    int64_t begin = p.offset(segment), end = p.offset(segment+1);
-    if constexpr (Minimum>0)
-        if (end-begin<=Minimum || (end-begin<=64 && worker>0)) return;
 #if LOW_PRECISION
-    if constexpr (Minimum==0) if (end-begin>TileLimit) return;
+        p.outputs[1]=make_tensor(outputs[1]);
+        p.outputs[2]=make_tensor(outputs[2]);
+        constexpr int QueryChannels=(NEEDS&3) ? DIM:0;
+        constexpr int ValueChannels=(NEEDS&4) ? VALUE_DIM:0;
+        constexpr int Channels=QueryChannels>ValueChannels ? QueryChannels:ValueChannels;
+        constexpr int Blocks=(Channels+255)/256;
+        constexpr int Workers=4*(Blocks>0 ? Blocks:1);
+#else
+        constexpr int Workers=4;
 #endif
-#if !LOW_PRECISION
-    if constexpr (Minimum==0) if (end-begin>TileLimit) {
-        if constexpr (BACKWARD_WORKERS>1) if(end-begin>64) {
-            #pragma unroll
-            for (int output=1;output<4;++output) if ((NEEDS&(1<<output)) && (output<3 || BIAS==1)) {
-                int width=output==1 ? D:output==2 ? V:1;
-                for(int64_t x=threadIdx.x;x<(end-begin)*width;x+=Threads) {
-                    int64_t row=begin+x/width; int column=x%width;
-                    if(output<3) p.outputs[output].at(row,head,column)=0.f;
-                    else p.outputs[output].at(row,head)=0.f;
-                }
-            }
-        }
-        return;
+        attention_backward_kernel<<<dim3(p.groups,HEADS,Workers),128,sizeof(AttentionBackwardShared),at::cuda::getCurrentCUDAStream()>>>(p);
+#if LOW_PRECISION && (NEEDS&9)
+        auto conversion=make_params(partials,{outputs[0],std::nullopt,std::nullopt,outputs[3]},rowptr,state,scale);
+        attention_convert_kernel<4><<<dim3(p.groups,HEADS),128,0,at::cuda::getCurrentCUDAStream()>>>(conversion);
+#endif
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-#endif
-    if constexpr (BIAS==2 && (NEEDS&8)) {
-        auto out = p.outputs[3];
-        for (int64_t x = threadIdx.x; x<out.size[2]*out.size[3]; x+=Threads)
-            out.at(segment, head, x/out.size[3], x%out.size[3]) = 0.f;
-        __syncthreads();
-    }
-    if (begin==end) return;
-#if LOW_PRECISION
-    if (!BACKWARD_RESIDENT || end-begin>TileLimit) {
-        backward_tiled<D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem,0,1);
-        return;
-    }
-#endif
-
-#if LOW_PRECISION
-    if (end-begin<=32) backward_lowp_segment<32,D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem);
-    else backward_lowp_segment<TileLimit,D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem);
-    return;
-#endif
-#if !LOW_PRECISION
-    if constexpr (Minimum>0 && D<=128 && V<=128) {
-        if (end-begin<=64) {
-            backward_segment<64,D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem);
-            return;
-        }
-    }
-    if constexpr (Minimum==0 && D<=128 && V<=128) {
-        if (end-begin<=32) backward_segment<32,D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem);
-        else if (end-begin<=48) backward_segment<48,D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem);
-        else backward_segment<64,D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem);
-    } else backward_tiled<D,V,H,COMPACT,BIAS,CAUSAL,NEEDS,Threads>(p,begin,end,segment,head,smem,worker,Workers);
-#endif
 }
-'''
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
+    m.def("run",&attention_backward);
+    m.def("configure",[]() {
+        C10_CUDA_CHECK(cudaFuncSetAttribute(attention_backward_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(AttentionBackwardShared)));
+    });
+}
+"""
 
 
-def attention_backward(inputs, rowptr, state, config, needs):
-    parallel = inputs[0].dtype == torch.float32 and inputs[0].shape[0] > 32 * (rowptr.numel()-1) and config[6] != 2
-    results = tuple(
-        torch.empty(value.shape, device=value.device, dtype=value.dtype)
-        if need and value is not None else None
-        for value, need in zip(inputs[:4], needs)
-    )
+def attention_backward(inputs, rowptr, state, config, needs, output):
+    results = tuple(torch.empty(value.shape, device=value.device, dtype=value.dtype)
+                    if need and value is not None else None
+                    for value, need in zip(inputs[:4], needs))
     if not any(value is not None and value.numel() for value in results):
         return results
-    dim, value_dim, heads, scale, causal, steps, bias_kind = config
-    mask = sum(1 << i for i, value in enumerate(results) if value is not None)
-    compact = all(value.is_contiguous() for i, value in enumerate(inputs) if i != 3 and value is not None)
-    key = dim, value_dim, heads, compact, bias_kind, causal, mask, inputs[0].device, inputs[0].dtype, parallel
-    kernel = COMPILED.get(key)
+    inputs = (*inputs, output)
+    dim, value_dim, heads, scale, causal, bias_kind = config
+    wanted = sum(1 << i for i, value in enumerate(results) if value is not None)
+    if inputs[0].dtype != torch.float32 and wanted & 9:
+        inputs = (*inputs, torch.empty(inputs[0].shape[:2], device=inputs[0].device, dtype=torch.float32))
+    present = sum(1 << i for i, value in enumerate(inputs[:5]) if value is not None)
+    compact = all(value.is_contiguous() for i, value in enumerate(inputs)
+                  if value is not None and i not in (3, 8, 12))
+    key = compact, dim, value_dim, heads, causal, bias_kind, wanted, present, inputs[0].device, inputs[0].dtype
+    kernel = KERNELS.get(key)
     if kernel is None:
-        properties = get_device_properties(inputs[0].device)
-        maximum = max(dim, value_dim)
-        low_precision = inputs[0].dtype != torch.float32
-        threads = 128 if low_precision and maximum <= 64 else 256
-        cache_width, cached_tiles = 64, 1
-        minimum_blocks = 5 if threads == 128 else 4
-        short_tile = 64 if low_precision else 48
-        resident = True
-        if low_precision:
-            pitch = (maximum + 15) // 16 * 16 + 8
-            shared = 3 * short_tile * pitch // 2 + short_tile * (short_tile + 8) + short_tile * short_tile // 16
-            shared_capacity = properties.shared_memory_per_block_optin
-            if shared * 4 > shared_capacity:
-                short_tile = 32
-                shared = 3 * short_tile * pitch // 2 + short_tile * (short_tile + 8) + short_tile * short_tile // 16
-            resident = shared * 4 <= shared_capacity
-            cached_tiles = 3
-            stream_width = (shared_capacity // 4 - cached_tiles * 2048 - 64) // 132 // 32 * 32
-            cache_width = min((maximum + 31) // 32 * 32, stream_width)
-            if not resident:
-                shared = 132 * cache_width + cached_tiles * 2048 + 64
-            shared_per_sm = properties.shared_memory_per_multiprocessor
-            minimum_blocks = min(4, shared_per_sm // (shared * 4))
-        else:
-            shared_capacity = properties.shared_memory_per_multiprocessor
-            cache_width = (maximum + 31) // 32 * 32
-            if 2 * (132 * cache_width + 2112) * 4 > shared_capacity:
-                cache_width = 64
-            resident_blocks = min(1024 // threads, shared_capacity // ((132 * cache_width + 2112) * 4))
-            minimum_blocks = min(minimum_blocks, resident_blocks)
-            cached_tiles = max(1, min(8, (shared_capacity // resident_blocks - (132 * cache_width + 64) * 4 - 1024) // 8192))
-            shared = 132 * cache_width + cached_tiles * 2048 + 64
-        if not low_precision and threads==256 and maximum<=128:
-            shared=max(shared,64*max(72,(maximum+3)//4*4+4)+8192)
-        stream_shared, long_blocks = shared, minimum_blocks
-        if not low_precision and maximum<=128:
-            shared=short_tile*max(72,(maximum+3)//4*4+4)+2*short_tile*short_tile
-            minimum_blocks=min(8,shared_capacity//(shared*4+1024))
-        if not low_precision:
-            threads=128
-        kernel_symbol = f"attention_backward_kernel<{dim},{value_dim},{heads},{str(compact).lower()},{bias_kind},{str(causal).lower()},{mask},{threads},{short_tile},0>"
-        long_shared = 0
-        if low_precision:
-            long_tile = short_tile
-            while resident:
-                tile = long_tile + 16
-                required = 3 * tile * pitch // 2 + tile * (tile + 8) + tile * tile // 16
-                if required * 4 > shared_capacity:
-                    break
-                long_tile = tile
-            resident_shared = 3 * long_tile * pitch // 2 + long_tile * (long_tile + 8) + long_tile * long_tile // 16
-            long_shared = max(resident_shared if resident else 0, 132 * cache_width + cached_tiles * 2048 + 64)
-            long_symbol = f"attention_backward_kernel<{dim},{value_dim},{heads},{str(compact).lower()},{bias_kind},{str(causal).lower()},{mask},256,{long_tile},{short_tile}>"
-        else:
-            long_shared=stream_shared
-            long_symbol=f"attention_backward_kernel<{dim},{value_dim},{heads},{str(compact).lower()},{bias_kind},{str(causal).lower()},{mask},256,64,{short_tile}>"
-        configure = ""
-        if shared * 4 > 48 * 1024:
-            configure = f'''C10_CUDA_CHECK(cudaFuncSetAttribute({kernel_symbol}, cudaFuncAttributeMaxDynamicSharedMemorySize, {shared*4}));
-    C10_CUDA_CHECK(cudaFuncSetAttribute({kernel_symbol}, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));'''
-        configure += f"C10_CUDA_CHECK(cudaFuncSetAttribute({long_symbol}, cudaFuncAttributeMaxDynamicSharedMemorySize, {long_shared*4}));"
-        long_launch = f"{long_symbol}<<<dim3(p.groups*{4 if parallel else 1},{heads}),256,{long_shared*4},at::cuda::getCurrentCUDAStream()>>>(p);"
-        binding = f'''
-void run(std::vector<std::optional<torch::Tensor>> inputs, torch::Tensor rowptr,
-         torch::Tensor state, std::vector<std::optional<torch::Tensor>> outputs, double scale) {{
-    c10::cuda::CUDAGuard guard(inputs[0]->device());
-    auto p=make_params(inputs,outputs,rowptr,state,scale);
-    {kernel_symbol}<<<dim3(p.groups,{heads}),{threads},{shared*4},at::cuda::getCurrentCUDAStream()>>>(p);
-    {long_launch}
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{
-    m.def("run",&run);
-    m.def("configure", []() {{ {configure} }});
-}}
-'''
-        constants = f"#define BACKWARD_RESIDENT {int(resident)}\n#define BACKWARD_WORKERS {4 if parallel else 1}\n#define BACKWARD_LONG_BLOCKS {1 if low_precision else long_blocks}\n#define BACKWARD_WIDTH {cache_width}\n#define BACKWARD_CACHE_TILES {cached_tiles}\n#define BACKWARD_MIN_BLOCKS {minimum_blocks}\n"
-        module = load_cuda_extension("attention_backward", constants + dtype_defines(inputs[0].dtype) + CUDA_SOURCE + BACKWARD_SOURCE + binding, arch=get_cuda_arch(inputs[0].device), use_fast_math=False, minimal_headers=True)
+        defines = (f"#define DIM {dim}\n#define VALUE_DIM {value_dim}\n#define HEADS {heads}\n"
+                   f"#define COMPACT {int(compact)}\n#define CAUSAL {int(causal)}\n#define BIAS_KIND {bias_kind}\n"
+                   f"#define PRESENT {present}\n#define NEEDS {wanted}\n")
+        if inputs[0].dtype == torch.float32:
+            width = min(128, max(32, 32*((max(dim, value_dim)+31)//32)))
+            defines += f"#define BACKWARD_WIDTH {width}\n#define ATTENTION_BACKWARD_SINGLE_STAGE 1\n"
+        module = load_cuda_extension(
+            "attention_backward", dtype_defines(inputs[0].dtype) + defines + CUDA_SOURCE
+            + GEMM_SOURCE + ATTENTION_SOURCE + BIAS_SOURCE + BACKWARD_SOURCE,
+            arch=get_cuda_arch(inputs[0].device), use_fast_math=False, minimal_headers=True,
+        )
         with torch.cuda.device(inputs[0].device):
             module.configure()
         kernel = module.run
-        COMPILED[key] = kernel
-    kernel(inputs, rowptr, state, results, scale)
+        KERNELS[key] = kernel
+    partials = tuple(None if i in (1, 2) else
+                     torch.empty_like(value, dtype=torch.float32)
+                     if value is not None and value.dtype != torch.float32 else value
+                     for i, value in enumerate(results)) if inputs[0].dtype != torch.float32 else results
+    kernel(inputs, rowptr, state, results, scale, partials)
     return results

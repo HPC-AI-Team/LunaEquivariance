@@ -1,13 +1,14 @@
 """UVW convolution double backward CUDA and native launch."""
 
 from __future__ import annotations
+import textwrap
 import torch
 from ...utils.cg import emit_cg_source
-from ....utils.precision import get_fp64_mma, cuda_source_for_dtype
+from ....utils.precision import cuda_source_for_dtype
 from ....utils.extension import load_cuda_extension
 from ...utils.runtime import auxiliary_streams
-from .backward import make_uvw_conv_gemm_mma, run_external, load_node_contraction, load_weight_contraction
-from .utils import get_uvw_conv_weight_layout, set_arch
+from .backward import run_external, load_node_contraction, load_weight_contraction
+from .utils import MAX_OUTPUT_SPLITS, TARGET_OUTPUT_BLOCKS, get_uvw_conv_weight_layout, set_arch
 
 
 def make_uvw_conv_q_shared_source(meta, queries, inputs):
@@ -48,35 +49,35 @@ def make_uvw_conv_q_shared_source(meta, queries, inputs):
             )
             lines = [
                 f"case {spec_index}: {{",
-                f"for({channel_type} p=threadIdx.x;p<{channels};p+=blockDim.x) {{",
-                f"int u=p/{edges},v=p%{edges};",
+                f"    for({channel_type} p=threadIdx.x;p<{channels};p+=blockDim.x) {{",
+                f"        int u=p/{edges},v=p%{edges};",
                 *[f"float acc{k}=0.f;" for k in range(d3)],
-                "for(Index pos=begin;pos<end;++pos) {",
-                "const Index item=__ldg(edge_by_dst+pos);",
-                "const int source_node=__ldg(src+pos);",
+                "        for(Index pos=begin;pos<end;++pos) {",
+                "            const Index item=__ldg(edge_by_dst+pos);",
+                "            const int source_node=__ldg(src+pos);",
             ]
             for product in products:
                 pair = tuple(
                     f"ptr_{role}" if role is not None else None for role in product
                 )
                 lines += [
-                    "{",
-                    emit_cg_source(
+                    "            {",
+                    textwrap.indent(emit_cg_source(
                         meta,
                         spec,
                         pairs=(pair,),
                         x_row="source_node",
                         coefficient_first=False,
                         accumulator="acc",
-                    ),
-                    "}",
+                    ), '                '),
+                    "            }",
                 ]
-            lines.append("}")
+            lines.append("        }")
             lines += [
-                f"q_{query_index}_{group_index}[({row_offset}+p)*(num_nodes*int64_t({d3}))+Index(node)*{d3}+{k}]=acc{k};"
+                f"        q_{query_index}_{group_index}[({row_offset}+p)*(num_nodes*int64_t({d3}))+Index(node)*{d3}+{k}]=acc{k};"
                 for k in range(d3)
             ]
-            lines += ["}", "break;", "}"]
+            lines += ["    }", "    break;", "}"]
             cases.append("\n".join(lines))
         query_cases.append(
             f"case {query_index}: {{ switch(blockIdx.y) {{ {chr(10).join(cases)} }} break; }}"
@@ -102,23 +103,31 @@ def make_uvw_conv_q_shared_source(meta, queries, inputs):
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <vector>
-__global__ __launch_bounds__({threads},4)
-void lunatp_uvwconv_bwd_q_shared_fp32({input_pointers},const int32_t* src,const EdgeIndex* edge_by_dst,const EdgeIndex* rowptr,{output_pointers},int64_t num_nodes) {{
-    const Index node=blockIdx.x;
-    if(node>=num_nodes) return;
-    const Index begin=__ldg(rowptr+node),end=__ldg(rowptr+node+1);
-    switch(blockIdx.z) {{ {query_cases} }}
+__global__ __launch_bounds__({threads}, 4) void lunatp_uvwconv_bwd_q_shared_fp32({input_pointers}, const int32_t *src,
+                                                                                     const EdgeIndex *edge_by_dst,
+                                                                                     const EdgeIndex *rowptr,
+                                                                                     {output_pointers}, int64_t num_nodes) {{
+    const Index node = blockIdx.x;
+    if (node >= num_nodes)
+        return;
+    const Index begin = __ldg(rowptr + node), end = __ldg(rowptr + node + 1);
+    switch (blockIdx.z) {{ {query_cases} }}
 }}
-std::vector<std::vector<at::Tensor>> launch({input_parameters},at::Tensor src,at::Tensor edge_by_dst,at::Tensor rowptr,int64_t num_nodes) {{
+std::vector<std::vector<at::Tensor>> launch({input_parameters}, at::Tensor src, at::Tensor edge_by_dst, at::Tensor rowptr,
+                                            int64_t num_nodes) {{
     c10::cuda::CUDAGuard guard(x.device());
     std::vector<std::vector<at::Tensor>> q_groups;
-    {allocations}
-    auto stream=at::cuda::getCurrentCUDAStream();
-    if(num_nodes>0) lunatp_uvwconv_bwd_q_shared_fp32<<<dim3(static_cast<unsigned int>(num_nodes),{specs_count},{queries_count}),{threads},0,stream>>>({arguments});
+{allocations}
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (num_nodes > 0)
+        lunatp_uvwconv_bwd_q_shared_fp32<<<dim3(static_cast<unsigned int>(num_nodes), {specs_count}, {queries_count}),
+                                           {threads}, 0, stream>>>({arguments});
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return q_groups;
 }}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{ m.def("launch",&launch); }}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("launch", &launch);
+}}
 """.format(
             threads=threads,
             input_pointers=",".join(
@@ -127,7 +136,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{ m.def("launch",&launch); }}
             output_pointers=",".join(output_pointers),
             query_cases=chr(10).join(query_cases),
             input_parameters=",".join((f"at::Tensor {name}" for name in inputs)),
-            allocations=chr(10).join(allocations),
+            allocations=textwrap.indent(chr(10).join(allocations), '    '),
             specs_count=len(specs),
             queries_count=len(queries),
             arguments=",".join(arguments),
@@ -136,159 +145,132 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{ m.def("launch",&launch); }}
     )
 
 
-def make_uvw_conv_double_backward_output_shared_source(meta, *, arch):
-    groups, rows, _ = get_uvw_conv_weight_layout(meta["generated_specs"])
+def make_uvw_conv_output_cutlass_source(meta):
+    """Contract grouped Q and weights directly into the node output layout."""
+    groups, group_rows, _ = get_uvw_conv_weight_layout(meta["generated_specs"])
+    output_tiles = " + ".join(f"((nodes*int64_t({key[2]})+63)/64)*{(key[1]+63)//64}" for key, _ in groups)
+    declarations = []
     cases = []
-    a_store = "i"
-    b_store = "i"
-    mma = {
-        "declaration": r"""using Mma=cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<2,4,1>,float,cutlass::layout::RowMajor,float,cutlass::layout::RowMajor,float,cutlass::layout::RowMajor,cutlass::arch::OpMultiplyAdd>;
-    Mma::FragmentC acc;acc.clear();""",
-        "compute": r"""#pragma unroll 4
-        for(int k=0;k<32;++k) {
-            #pragma unroll
-            for(int p=0;p<Products;++p) {
-                Mma::FragmentA av;av[0]=a[p][k*16+local_row];av[1]=a[p][k*16+local_row+1];
-                Mma::FragmentB bv;
-                #pragma unroll
-                for(int c=0;c<4;++c) bv[c]=b[p][k*64+local_column+c*16];
-                Mma()(acc,av,bv,acc);
-            }
-        }""",
-        "row": "row_base+local_row+r",
-        "column": "column_base+local_column+c*16",
-        "value": "acc[r*4+c]",
-        "rows": 2,
-        "columns": 4,
-    }
-    if meta.get("dtype") == torch.float64:
-        a_store = "(i/16)*16+((i%16)^(((i/16)&3)<<2))"
-        b_store = "(i/64)*64+((i%64)^(((i/64)&3)<<2))"
-        mma = make_uvw_conv_gemm_mma(
-            meta,
-            "a[p][input*16+(row^((input&3)<<2))]",
-            "b[p][input*64+(column^((input&3)<<2))]",
-            arch=arch,
-        )
-    for group, ((offset, channels, d3), specs) in enumerate(groups):
-        path_type = "int64_t" if rows[group] > (1 << 31) - 32 else "int"
-        bound_type = "int64_t" if path_type == "int64_t" else "Index"
-        dimensions = f"constexpr int K={rows[group]},Columns={channels};"
-        weight_position = "int k=base+i/64,column=column_base+i%64;"
-        q_position = "Index row=row_base+i%16,k=base+i/16;"
-        if path_type == "int64_t":
-            dimensions = (
-                f"constexpr int64_t K={rows[group]}; constexpr int Columns={channels};"
-            )
-            weight_position = "int64_t k=base+i/64; int column=column_base+i%64;"
-            q_position = "Index row=row_base+i%16; int64_t k=base+i/16;"
-        weights = []
-        for s in specs:
-            begin = s["row_offset"]
-            end = begin + s["path_channels"]
-            weights.append(
-                f"""if(k>={begin} && k<{end}) pointer=inputs.w[p]+{s["weight_offset"]}+int64_t(k-{begin})*{channels}+column;"""
-            )
-        cases.append(
-            r"""
-case {group}: {{
-    {dimensions}
-    const Index total_m=nodes*{d3};
-    if(row_base>=total_m || column_base>=Columns) return;
-    const {bound_type} tiles=(K+31)/32,per_split=(tiles+3)/4;
-    const {bound_type} begin=split*per_split*32,end=min({bound_type}(K),begin+per_split*32);
-    if(begin>=end) return;
-    {declaration}
-    for({path_type} base=begin;base<end;base+=32) {{
-        #pragma unroll
-        for(int p=0;p<Products;++p) {{
-            for(int i=threadIdx.x;i<512;i+=128) {{
-                {q_position}
-                a[p][{a_store}]=(row<total_m && k<end)?__ldg(inputs.q[p][{group}]+int64_t(k)*total_m+row):0.f;
-            }}
-            for(int i=threadIdx.x;i<2048;i+=128) {{
-                {weight_position}
-                const float* pointer=inputs.w[p];
-                bool valid=k<end && column<Columns;
-                if(valid) {{
-                    {weights}
+    for group, ((offset, channels, d), specs) in enumerate(groups):
+        stores = f'atomicAdd(pointer+int64_t(r/{d})*{meta["out_dim"]}+{offset}+int64_t(c)*{d}+r%{d},value);'
+        weight_rows = '\n'.join(f'if(q.strided()>={t["row_offset"]} && q.strided()<{t["row_offset"]+t["path_channels"]}) return int64_t({t["weight_offset"]})+int64_t(q.strided()-{t["row_offset"]})*{channels}+q.contiguous();' for t in specs)
+        declarations.append(f'''
+struct WeightLayout{group} {{
+    using Index = int32_t;
+    using LongIndex = int64_t;
+    CUTLASS_HOST_DEVICE WeightLayout{group}(cutlass::layout::PitchLinearCoord, Index) {{
+    }}
+    CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::layout::PitchLinearCoord q) const {{
+{textwrap.indent(weight_rows, '        ')}
+        return 0;
+    }}
+}};
+template <typename Iterator> struct OutputIterator{group} : Iterator {{
+    using ThreadMap = typename Iterator::ThreadMap;
+    using Fragment = typename Iterator::Fragment;
+    using Params = typename Iterator::Params;
+    float *pointer;
+    CUTLASS_DEVICE OutputIterator{group}(Params const &p, float *out, cutlass::MatrixCoord extent, int thread,
+    cutlass::MatrixCoord offset = {{}}, int const *indices = nullptr)
+    : Iterator(p, out, extent, thread, offset, indices), pointer(out) {{
+    }}
+    CUTLASS_DEVICE void store(Fragment const &fragment) const {{
+        typename Iterator::Mask mask;
+        this->get_mask(mask);
+#pragma unroll
+        for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster; ++cluster) {{
+#pragma unroll
+            for (int group = 0; group < ThreadMap::Iterations::kGroup; ++group) {{
+#pragma unroll
+                for (int row = 0; row < ThreadMap::Iterations::kRow; ++row) {{
+                    int r = this->thread_start_row() + row * ThreadMap::Delta::kRow + group * ThreadMap::Delta::kGroup +
+                    cluster * ThreadMap::Delta::kCluster;
+                    int fr = row + ThreadMap::Iterations::kRow * (group + ThreadMap::Iterations::kGroup * cluster);
+#pragma unroll
+                    for (int col = 0; col < ThreadMap::Iterations::kColumn; ++col) {{
+                        int c = this->thread_start_column() + col * ThreadMap::Delta::kColumn;
+                        float value = fragment[fr * ThreadMap::Iterations::kColumn + col];
+                        if (r < this->extent_row() && mask.predicates[col]) {{
+                            {stores}
+                        }}
+                    }}
                 }}
-                b[p][{b_store}]=valid?__ldg(pointer):0.f;
             }}
         }}
-        __syncthreads();
-        {compute}
-        __syncthreads();
     }}
-    #pragma unroll
-    for(int r=0;r<{rows};++r) {{
-        Index row={row};
-        #pragma unroll
-        for(int c=0;c<{columns};++c) {{
-            int column={column};
-            if(row<total_m && column<Columns) atomicAdd(out+int64_t(row/{d3})*{out_dim}+{offset}+column*{d3}+row%{d3},{value});
-        }}
+}};
+using Gemm{group} = cutlass::gemm::device::GemmUniversal<
+float, cutlass::layout::ColumnMajor, float, cutlass::layout::RowMajor, float, cutlass::layout::RowMajor, float,
+cutlass::arch::OpClassSimt, cutlass::arch::Sm80, cutlass::gemm::GemmShape<64, 64, 8>,
+cutlass::gemm::GemmShape<32, 32, 8>, cutlass::gemm::GemmShape<1, 1, 1>,
+cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2, 1, 1, cutlass::arch::OpMultiplyAdd,
+cutlass::ComplexTransform::kNone, cutlass::ComplexTransform::kNone, false, false, false, cutlass::layout::NoPermute,
+cutlass::layout::NoPermute, WeightLayout{group}>;
+''')
+        cases.append(f'''
+case {group}: {{
+    using Kernel=typename Gemm{group}::GemmKernel;
+    using Mma=typename Kernel::Mma;
+    using Base=typename Kernel::Epilogue;
+    using Epilogue=cutlass::epilogue::threadblock::Epilogue<typename Base::Shape,typename Base::WarpMmaOperator,Base::kPartitionsK,
+    OutputIterator{group}<typename Base::OutputTileIterator>,typename Base::AccumulatorFragmentIterator,typename Base::WarpTileIterator,
+    typename Base::SharedLoadIterator,typename Base::OutputOp,typename Base::Padding>;
+    auto& storage=shared.s{group};
+    const int64_t first_node=int64_t(blockIdx.y)*64/{d};
+    const int row=int64_t(blockIdx.y)*64%{d},column=blockIdx.x*64;
+    if(first_node>=nodes || column>={channels}) return;
+    const int rows=min(int64_t(64+{d}),(nodes-first_node)*{d});
+    const int total_k={group_rows[group]},tiles=(total_k+7)/8,per_split=(tiles+splits-1)/splits;
+    const int begin=split*per_split*8,end=min(total_k,begin+per_split*8);
+    if(begin>=end) return;
+    typename Mma::FragmentC accum;accum.clear();
+#pragma unroll
+    for(int p=0;p<Products;++p) {{
+        typename Mma::IteratorA a(typename Mma::IteratorA::Params(cutlass::layout::ColumnMajor(nodes*{d})),
+        const_cast<float*>(inputs.q[p][{group}]+first_node*{d}),{{rows,end}},threadIdx.x,{{row,begin}});
+        typename Mma::IteratorB b(typename Mma::IteratorB::Params(cutlass::layout::RowMajor({channels})),
+        const_cast<float*>(inputs.w[p]),{{end,{channels}}},threadIdx.x,{{begin,column}});
+        Mma mma(storage.main_loop,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+        mma((end-begin+7)/8,accum,a,b,accum);__syncthreads();
     }}
+    typename Epilogue::OutputTileIterator output(typename Epilogue::OutputTileIterator::Params(cutlass::layout::RowMajor({channels})),out+first_node*{meta['out_dim']},{{rows,{channels}}},threadIdx.x,{{row,column}});
+    Epilogue epilogue(storage.epilogue,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+    epilogue(typename Kernel::EpilogueOutputOp(1.0f,0.0f),output,accum,output);
     return;
 }}
-""".format(
-                group=group,
-                dimensions=dimensions,
-                d3=d3,
-                bound_type=bound_type,
-                declaration=mma["declaration"],
-                path_type=path_type,
-                q_position=q_position,
-                a_store=a_store,
-                weight_position=weight_position,
-                weights=chr(10).join(weights),
-                b_store=b_store,
-                compute=mma["compute"],
-                rows=mma["rows"],
-                row=mma["row"],
-                columns=mma["columns"],
-                column=mma["column"],
-                out_dim=meta["out_dim"],
-                offset=offset,
-                value=mma["value"],
-            )
-        )
-    out_tiles = (max(channels for (_, channels, _), _ in groups) + 63) // 64
-    max_d3 = max(components for (_, _, components), _ in groups)
-    mma_include = (
-        "\n" + get_fp64_mma(arch)[0] if meta.get("dtype") == torch.float64 else ""
-    )
-    return cuda_source_for_dtype(
-        r"""
+''')
+    source = f'''
 #include <ATen/ATen.h>
 #include <torch/csrc/utils/pybind.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cutlass/gemm/thread/mma.h>{mma_include}
 #include <vector>
-struct Inputs {{const float* q[2][{groups_count}];const float* w[2];}};
-template<int Products>
-__global__ __launch_bounds__(128,4)
-void lunatp_uvwconv_bwd_output_shared_fp32(Inputs inputs,float* out,Index nodes) {{
-    __shared__ float a[Products][512];
-    __shared__ float b[Products][2048];
-    const Index row_base=blockIdx.y*16; const int column_base=blockIdx.x*64;
-    const int local_row=(threadIdx.x/16)*2,local_column=threadIdx.x%16;
-    const int split=blockIdx.z%4;
-    switch(blockIdx.z/4) {{
-{cases}
-    }}
+#include <cutlass/gemm/device/gemm_universal.h>
+#include <limits.h>
+struct Inputs {{const float* q[2][{len(groups)}];const float* w[2];}};
+{''.join(declarations)}
+template<int Products> __global__ void lunatp_uvwconv_bwd_output_shared_fp32(Inputs inputs,float* out,int64_t nodes) {{
+    union Storage {{ {' '.join(f"typename Gemm{i}::GemmKernel::SharedStorage s{i};" for i in range(len(groups)))} }};
+    __shared__ Storage shared;
+    const int64_t tiles={output_tiles};
+    const int splits=min(int64_t({MAX_OUTPUT_SPLITS}),max(int64_t(1),({TARGET_OUTPUT_BLOCKS}+tiles-1)/tiles));
+    const int split=blockIdx.z%splits;
+    switch(blockIdx.z/splits) {{{chr(10).join(cases)}}}
 }}
+
 at::Tensor launch_pair(std::vector<at::Tensor> q0,std::vector<at::Tensor> q1,at::Tensor w0,at::Tensor w1,int64_t nodes) {{
     Inputs inputs{{}};
-    for(int i=0;i<{groups_count};++i) {{inputs.q[0][i]=q0[i].data_ptr<float>();inputs.q[1][i]=q1[i].data_ptr<float>();}}
+    for(int i=0;i<{len(groups)};++i) {{inputs.q[0][i]=q0[i].data_ptr<float>();inputs.q[1][i]=q1[i].data_ptr<float>();}}
     inputs.w[0]=w0.data_ptr<float>();inputs.w[1]=w1.data_ptr<float>();
     c10::cuda::CUDAGuard guard(w0.device());
-    auto out=at::zeros({{nodes,int64_t({out_dim})}},w0.options());
+    auto out=at::zeros({{nodes,int64_t({meta['out_dim']})}},w0.options());
     if(nodes==0) return out;
+    const int64_t tiles={output_tiles};
+    const int splits=std::min<int64_t>({MAX_OUTPUT_SPLITS},std::max<int64_t>(1,({TARGET_OUTPUT_BLOCKS}+tiles-1)/tiles));
     auto stream=at::cuda::getCurrentCUDAStream();
-    lunatp_uvwconv_bwd_output_shared_fp32<2><<<dim3({out_tiles},(nodes*{max_d3}+15)/16,{output_tasks}),128,0,stream>>>(inputs,out.data_ptr<float>(),nodes);
+    lunatp_uvwconv_bwd_output_shared_fp32<2><<<dim3({max((key[1]+63)//64 for key,_ in groups)},(nodes*{max(key[2] for key,_ in groups)}+63)/64,{len(groups)}*splits),128,0,stream>>>(inputs,out.data_ptr<float>(),nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
 }}
 void accumulate(std::vector<at::Tensor> q,at::Tensor weight,at::Tensor out) {{
@@ -296,24 +278,17 @@ void accumulate(std::vector<at::Tensor> q,at::Tensor weight,at::Tensor out) {{
     const int64_t nodes=out.size(0);
     if(nodes==0) return;
     Inputs inputs{{}};
-    for(int i=0;i<{groups_count};++i) inputs.q[0][i]=q[i].data_ptr<float>();
+    for(int i=0;i<{len(groups)};++i) inputs.q[0][i]=q[i].data_ptr<float>();
     inputs.w[0]=weight.data_ptr<float>();
+    const int64_t tiles={output_tiles};
+    const int splits=std::min<int64_t>({MAX_OUTPUT_SPLITS},std::max<int64_t>(1,({TARGET_OUTPUT_BLOCKS}+tiles-1)/tiles));
     auto stream=at::cuda::getCurrentCUDAStream();
-    lunatp_uvwconv_bwd_output_shared_fp32<1><<<dim3({out_tiles},(nodes*{max_d3}+15)/16,{output_tasks}),128,0,stream>>>(inputs,out.data_ptr<float>(),nodes);
+    lunatp_uvwconv_bwd_output_shared_fp32<1><<<dim3({max((key[1]+63)//64 for key,_ in groups)},(nodes*{max(key[2] for key,_ in groups)}+63)/64,{len(groups)}*splits),128,0,stream>>>(inputs,out.data_ptr<float>(),nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{m.def("launch_pair",&launch_pair);m.def("accumulate",&accumulate);}}
-""".format(
-            mma_include=mma_include,
-            groups_count=len(groups),
-            cases=chr(10).join(cases),
-            out_dim=meta["out_dim"],
-            out_tiles=out_tiles,
-            max_d3=max_d3,
-            output_tasks=len(groups) * 4,
-        ),
-        meta.get("dtype", torch.float32),
-    )
+'''
+    return cuda_source_for_dtype(source, meta.get("dtype", torch.float32))
 
 
 def run(
@@ -330,7 +305,6 @@ def run(
     needs=None,
 ):
     set_arch(op, x.get_device())
-    src, dst = graph.src, graph.dst
     num_nodes = graph.num_nodes
     if op.weight_mode == "shared":
         if op.node_contraction is None:
@@ -340,8 +314,8 @@ def run(
         if op.output_contraction is None:
             op.output_contraction = load_cuda_extension(
                 f"lunatp_uvwconv_bwd_output_shared_{op.dtype_tag}",
-                make_uvw_conv_double_backward_output_shared_source(
-                    op.meta, arch=op.arch
+                make_uvw_conv_output_cutlass_source(
+                    op.meta
                 ),
                 arch=op.arch,
                 use_fast_math=False,
@@ -399,7 +373,6 @@ def run(
         grad_weight.record_stream(current_stream)
         grad_grad_out.record_stream(current_stream)
         return grad_x, grad_edge, grad_weight, grad_grad_out
-    dx, dy, dw, dg = run_external(
-        op, 2, (x, edge_attr, weight, grad_out, rx, ry, rw), src, dst, needs=needs
+    return run_external(
+        op, 2, (x, edge_attr, weight, grad_out, rx, ry, rw), graph, needs=needs
     )
-    return dx, dy, dw, dg

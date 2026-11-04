@@ -2,6 +2,8 @@
 
 import re
 
+from textwrap import indent
+
 import torch
 
 from ....utils.extension import combine_cuda_sources
@@ -76,102 +78,140 @@ def make_reduction_prelude(
         )
         for i, b in enumerate(plan.blocks)
     ]
-    block_cases = "\n".join(f"case {i}: return {value};" for i, value in enumerate(bdesc[:-1]))
+    block_cases = "\n".join(f"""case {i}:
+    return {value};""" for i, value in enumerate(bdesc[:-1]))
     thread = "row_thread()" if paired else "(threadIdx.x&31)" if warp else "threadIdx.x"
     row_thread = (
-        "__device__ __forceinline__ int row_thread() { return int(threadIdx.x)&(ROW_THREADS-1); }\n"
+        """__device__ __forceinline__ int row_thread() {
+    return int(threadIdx.x) & (ROW_THREADS - 1);
+}
+"""
         if paired
         else ""
     )
     sync_body = (
-        '''    const int barrier=1+int(threadIdx.x)/ROW_THREADS;
-    asm volatile("bar.sync %0, %1;" :: "r"(barrier), "n"(ROW_THREADS) : "memory");'''
+        '''const int barrier = 1 + int(threadIdx.x) / ROW_THREADS;
+asm volatile("bar.sync %0, %1;" ::"r"(barrier), "n"(ROW_THREADS) : "memory");'''
         if paired
-        else '''    if constexpr(ROW_THREADS==32) __syncwarp();
-    else __syncthreads();'''
+        else '''if constexpr (ROW_THREADS == 32)
+    __syncwarp();
+else
+    __syncthreads();'''
     )
     reduce_storage = (
-        "__shared__ Acc reduce_storage[2*K*32];\n    Acc* shared=reduce_storage+(int(threadIdx.x)/ROW_THREADS)*K*32;"
+        """__shared__ Acc reduce_storage[2 * K * 32];
+Acc* shared = reduce_storage + (int(threadIdx.x) / ROW_THREADS) * K * 32;"""
         if paired
-        else "__shared__ Acc shared[K*32];"
+        else """__shared__ Acc shared[K * 32];"""
     )
     max_storage = (
-        "__shared__ Acc max_storage[2*32];\n    Acc* shared=max_storage+(int(threadIdx.x)/ROW_THREADS)*32;"
+        """__shared__ Acc max_storage[2 * 32];
+Acc* shared = max_storage + (int(threadIdx.x) / ROW_THREADS) * 32;"""
         if paired
-        else "__shared__ Acc shared[32];"
+        else """__shared__ Acc shared[32];"""
     )
-    block_sync = "row_sync();" if paired else "__syncthreads();"
-    constants = f"""constexpr int D={plan.dim}, P={plan.param_dim}, BIAS={plan.bias_dim};
-constexpr int NB={len(plan.blocks)}, NG={plan.num_groups}, NCENTER={plan.num_centers};
-constexpr int FW={(plan.num_centers + plan.num_groups)}, SW={sw if workspace_width is None else workspace_width}, THREADS={max(128, row_threads)}, ROW_THREADS={row_threads};
-constexpr bool IR_MUL={str(plan.layout == "ir_mul").lower()};
-struct Block {{ int offset, channels, components, param_offset, bias_offset, group, center_index, cache_offset; Acc weight; }};
+    block_sync = """row_sync();""" if paired else """__syncthreads();"""
+    constants = f"""constexpr int D = {plan.dim}, P = {plan.param_dim}, BIAS = {plan.bias_dim};
+constexpr int NB = {len(plan.blocks)}, NG = {plan.num_groups}, NCENTER = {plan.num_centers};
+constexpr int FW = {(plan.num_centers + plan.num_groups)}, SW = {sw if workspace_width is None else workspace_width}, THREADS = {max(128, row_threads)}, ROW_THREADS = {row_threads};
+constexpr bool IR_MUL = {str(plan.layout == "ir_mul").lower()};
+struct Block {{
+    int offset, channels, components, param_offset, bias_offset, group, center_index, cache_offset;
+    Acc weight;
+}};
 __device__ __forceinline__ Block block_at(int i) {{
-    switch(i) {{ {block_cases} default: return {bdesc[-1]}; }}
+    switch (i) {{
+{indent(block_cases, '    ')}
+    default:
+        return {bdesc[-1]};
+    }}
 }}
 """
     maximum = r"""__device__ __forceinline__ Acc reduce_max(Acc value) {
-    #pragma unroll
-    for(int d=16;d>0;d>>=1) value=fmax(value,__shfl_down_sync(0xffffffff,value,d));
-    return __shfl_sync(0xffffffff,value,0);
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1)
+        value = fmax(value, __shfl_down_sync(0xffffffff, value, d));
+    return __shfl_sync(0xffffffff, value, 0);
 }
 """ if warp else f"""__device__ __forceinline__ Acc reduce_max(Acc value) {{
-    {max_storage}
-    const int lane={thread}&31, warp={thread}>>5;
-    for(int d=16;d>0;d>>=1) value=fmax(value,__shfl_down_sync(0xffffffff,value,d));
-    if(lane==0) shared[warp]=value;
+{indent(max_storage, '    ')}
+    const int lane = {thread} & 31, warp = {thread} >> 5;
+    for (int d = 16; d > 0; d >>= 1)
+        value = fmax(value, __shfl_down_sync(0xffffffff, value, d));
+    if (lane == 0)
+        shared[warp] = value;
     row_sync();
-    if(warp==0) {{
-        value=lane<ROW_THREADS/32?shared[lane]:0.0;
-        for(int d=ROW_THREADS/64;d>0;d>>=1) value=fmax(value,__shfl_down_sync(0xffffffff,value,d));
-        if(lane==0) shared[0]=value;
+    if (warp == 0) {{
+        value = lane < ROW_THREADS / 32 ? shared[lane] : 0.0;
+        for (int d = ROW_THREADS / 64; d > 0; d >>= 1)
+            value = fmax(value, __shfl_down_sync(0xffffffff, value, d));
+        if (lane == 0)
+            shared[0] = value;
     }}
     row_sync();
     return shared[0];
 }}
 """
-    helpers = f"""{row_thread}__device__ __forceinline__ int channel(const Block& b,int j) {{ return IR_MUL ? j%b.channels : j/b.components; }}
-__device__ __forceinline__ int local_index(const Block& b,int c,int m) {{ return IR_MUL ? m*b.channels+c : c*b.components+m; }}
-__device__ __forceinline__ Acc inverse_sqrt(Acc x) {{ return __ddiv_rn(1.0,__dsqrt_rn(x)); }}
-__device__ __forceinline__ void row_sync() {{
-{sync_body}
+    helpers = f"""
+{row_thread}
+__device__ __forceinline__ int channel(const Block& b, int j) {{
+    return IR_MUL ? j % b.channels : j / b.components;
 }}
-template<int K,int Workers=THREADS> __device__ __forceinline__ void reduce(Acc (&v)[K]) {{
-    if constexpr(Workers==32) {{
-        #pragma unroll
-        for(int k=0;k<K;++k) {{
-            #pragma unroll
-            for(int d=16;d>0;d>>=1) v[k]+=__shfl_down_sync(0xffffffff,v[k],d);
-            v[k]=__shfl_sync(0xffffffff,v[k],0);
+__device__ __forceinline__ int local_index(const Block& b, int c, int m) {{
+    return IR_MUL ? m * b.channels + c : c * b.components + m;
+}}
+__device__ __forceinline__ Acc inverse_sqrt(Acc x) {{
+    return __ddiv_rn(1.0, __dsqrt_rn(x));
+}}
+__device__ __forceinline__ void row_sync() {{
+
+{indent(sync_body, '    ')}
+}}
+template <int K, int Workers = THREADS> __device__ __forceinline__ void reduce(Acc (&v)[K]) {{
+    if constexpr (Workers == 32) {{
+#pragma unroll
+        for (int k = 0; k < K; ++k) {{
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1)
+                v[k] += __shfl_down_sync(0xffffffff, v[k], d);
+            v[k] = __shfl_sync(0xffffffff, v[k], 0);
         }}
     }} else {{
-    {reduce_storage}
-    const int lane={thread}&31, warp={thread}>>5;
-    #pragma unroll
-    for(int k=0;k<K;++k) {{
-        #pragma unroll
-        for(int d=16;d>0;d>>=1) v[k]+=__shfl_down_sync(0xffffffff,v[k],d);
-        if(lane==0) shared[k*32+warp]=v[k];
-    }}
-    {block_sync}
-    if(warp==0) {{
-        #pragma unroll
-        for(int k=0;k<K;++k) {{
-            Acc t=lane<Workers/32?shared[k*32+lane]:0.0;
-            #pragma unroll
-            for(int d=Workers/64;d>0;d>>=1) t+=__shfl_down_sync(0xffffffff,t,d);
-            if(lane==0) shared[k*32]=t;
+{indent(reduce_storage, '        ')}
+        const int lane = {thread} & 31, warp = {thread} >> 5;
+#pragma unroll
+        for (int k = 0; k < K; ++k) {{
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1)
+                v[k] += __shfl_down_sync(0xffffffff, v[k], d);
+            if (lane == 0)
+                shared[k * 32 + warp] = v[k];
         }}
-    }}
-    {block_sync}
-    #pragma unroll
-    for(int k=0;k<K;++k) v[k]=shared[k*32];
+        {block_sync}
+        if (warp == 0) {{
+#pragma unroll
+            for (int k = 0; k < K; ++k) {{
+                Acc t = lane < Workers / 32 ? shared[k * 32 + lane] : 0.0;
+#pragma unroll
+                for (int d = Workers / 64; d > 0; d >>= 1)
+                    t += __shfl_down_sync(0xffffffff, t, d);
+                if (lane == 0)
+                    shared[k * 32] = t;
+            }}
+        }}
+        {block_sync}
+#pragma unroll
+        for (int k = 0; k < K; ++k)
+            v[k] = shared[k * 32];
     }}
 }}
-{maximum}__device__ __forceinline__ Acc centered(View v,int64_t row,const Block& b,int j,const Acc* means,int mean_slot) {{
-    const Acc val=v.get<UnitStride>(row,b.offset+j);
-    if(b.center_index<0 || !v.data) return val;
-    return (val-v.get<UnitStride>(row,b.offset))-means[mean_slot*NCENTER+b.center_index];
+
+{maximum}
+__device__ __forceinline__ Acc centered(View v, int64_t row, const Block& b, int j, const Acc* means, int mean_slot) {{
+    const Acc val = v.get<UnitStride>(row, b.offset + j);
+    if (b.center_index < 0 || !v.data)
+        return val;
+    return (val - v.get<UnitStride>(row, b.offset)) - means[mean_slot * NCENTER + b.center_index];
 }}
 """
     if dtype == torch.float32:
@@ -218,40 +258,63 @@ def make_binding(
 #include <vector>
 using Element = {scalar};
 using Acc = {scalar};
-struct View {{ const Element* data; int64_t s0,s1,s2,width; }};
-struct Inputs {{ View v[11]; }};
-struct Outputs {{ Element* v[7]; }};
-void launch(Inputs,Outputs,const Acc*,Acc*,int64_t,cudaStream_t);{launch_declarations}
-{workspace_definition}"""
+struct View {{
+    const Element* data;
+    int64_t s0, s1, s2, width;
+}};
+struct Inputs {{
+    View v[11];
+}};
+struct Outputs {{
+    Element* v[7];
+}};
+void launch(Inputs, Outputs, const Acc*, Acc*, int64_t, cudaStream_t);
+{launch_declarations}
+
+{workspace_definition}
+"""
     host += """View view(const std::optional<torch::Tensor>& t) {
-    if(!t.has_value()) return {nullptr,0,0,0,1};
-    const auto& a=t.value();
-    if(a.dim()==1) return {a.data_ptr<Element>(),0,a.stride(0),0,1};
-    if(a.dim()==2) return {a.data_ptr<Element>(),a.stride(0),a.stride(1),0,1};
-    return {a.data_ptr<Element>(),a.stride(0),a.stride(1),a.stride(2),a.size(2)};
+    if (!t.has_value())
+        return {nullptr, 0, 0, 0, 1};
+    const auto& a = t.value();
+    if (a.dim() == 1)
+        return {a.data_ptr<Element>(), 0, a.stride(0), 0, 1};
+    if (a.dim() == 2)
+        return {a.data_ptr<Element>(), a.stride(0), a.stride(1), 0, 1};
+    return {a.data_ptr<Element>(), a.stride(0), a.stride(1), a.stride(2), a.size(2)};
 }
 void run(std::vector<std::optional<torch::Tensor>> inputs,
          std::vector<std::optional<torch::Tensor>> outputs,
-         torch::Tensor fwd_stats,torch::Tensor workspace) {
-    const auto& x=inputs[0].value();
+         torch::Tensor fwd_stats, torch::Tensor workspace) {
+    const auto& x = inputs[0].value();
     c10::cuda::CUDAGuard guard(x.device());
-    Inputs in{}; Outputs out{};
-    for(size_t i=0;i<inputs.size();++i) in.v[i]=view(inputs[i]);
-    for(size_t i=0;i<outputs.size();++i) out.v[i]=outputs[i].has_value()?outputs[i]->data_ptr<Element>():nullptr;
-    const int64_t N=x.size(0);
-    if(N==0) {
-        for(auto& a:outputs) if(a.has_value()) a->zero_();
+    Inputs in{};
+    Outputs out{};
+    for (size_t i = 0; i < inputs.size(); ++i)
+        in.v[i] = view(inputs[i]);
+    for (size_t i = 0; i < outputs.size(); ++i)
+        out.v[i] = outputs[i].has_value() ? outputs[i]->data_ptr<Element>() : nullptr;
+    const int64_t N = x.size(0);
+    if (N == 0) {
+        for (auto& a : outputs)
+            if (a.has_value())
+                a->zero_();
         return;
     }
-    auto stream=at::cuda::getCurrentCUDAStream();
+    auto stream = at::cuda::getCurrentCUDAStream();
 """
-    host += f"""TORCH_CHECK(workspace.numel()>=workspace_size(N,{parameter_guard}),"equ_norm workspace is too small");
-    launch(in,out,fwd_stats.data_ptr<Acc>(),workspace.data_ptr<Acc>(),N,stream);
+    host += f"""    TORCH_CHECK(workspace.numel() >= workspace_size(N, {parameter_guard}), "equ_norm workspace is too small");
+    launch(in, out, fwd_stats.data_ptr<Acc>(), workspace.data_ptr<Acc>(), N, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
-{wrapper}PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{{registrations}
-    m.def("run",&run); m.attr("stats_width")={stats_width};
-    m.def("workspace_size",&workspace_size,pybind11::arg("n"),pybind11::arg("parameters")=true);
+
+{wrapper}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+{indent(registrations, '    ')}
+
+    m.def("run", &run);
+    m.attr("stats_width") = {stats_width};
+    m.def("workspace_size", &workspace_size, pybind11::arg("n"), pybind11::arg("parameters") = true);
 }}
 """
     return host
@@ -318,24 +381,33 @@ def make_tensor_views(plan, dtype):
     input_c = plan.blocks[0].channels
     uniform_channels = all(b.channels == input_c for b in plan.blocks)
     views = f"""struct View {{
-    const Element* data; int64_t s0,s1,s2,width;
-    template<bool Unit> __device__ __forceinline__ Acc get(int64_t row,int j,Acc missing=0.0) const {{
-if constexpr(Unit) return data?Acc(data[row*s0+j]):missing;
-else {{
-        if(!data) return missing;
-        if({str(not uniform_channels).lower()} || width==1) return Acc(data[row*s0+int64_t(j)*s1]);
-        return Acc(data[row*s0+(j/{input_c if uniform_channels else "width"})*s1+(j%{input_c if uniform_channels else "width"})*s2]);
+    const Element* data;
+    int64_t s0, s1, s2, width;
+    template <bool Unit> __device__ __forceinline__ Acc get(int64_t row, int j, Acc missing = 0.0) const {{
+        if constexpr (Unit)
+            return data ? Acc(data[row * s0 + j]) : missing;
+        else {{
+            if (!data)
+                return missing;
+            if ({str(not uniform_channels).lower()} || width == 1)
+                return Acc(data[row * s0 + int64_t(j) * s1]);
+            return Acc(data[row * s0 + (j / {input_c if uniform_channels else "width"}) * s1 + (j % {input_c if uniform_channels else "width"}) * s2]);
+        }}
     }}
-}}
-    template<bool Unit> __device__ __forceinline__ Acc parameter(int j,Acc missing=0.0) const {{
-if constexpr(Unit) return data?Acc(data[j]):missing;
-else {{
-        return data?Acc(data[int64_t(j)*s1]):missing;
+    template <bool Unit> __device__ __forceinline__ Acc parameter(int j, Acc missing = 0.0) const {{
+        if constexpr (Unit)
+            return data ? Acc(data[j]) : missing;
+        else {{
+            return data ? Acc(data[int64_t(j) * s1]) : missing;
+        }}
     }}
-}}
 }};
-struct Inputs {{ View v[11]; }};
-struct Outputs {{ Element* v[7]; }};"""
+struct Inputs {{
+    View v[11];
+}};
+struct Outputs {{
+    Element* v[7];
+}};"""
     return suffix_float32_literals(views) if dtype == torch.float32 else views
 
 
@@ -358,20 +430,35 @@ def fast_view_source(source, plan, dtype, active_inputs=None):
         body = "\n" * len(source.get("includes", ())) + prefix["cuda_body_prefix"] + body
     result = (
         "\n".join(dict.fromkeys(includes)) + "\n"
-        + f"using Element={scalar};using Acc={scalar};\n" + views + "\n"
+        + f"""using Element = {scalar};
+using Acc = {scalar};
+""" + views + "\n"
     )
     for name, fast in (("unit", "true"), ("general", "false")):
-        result += f"namespace {name} {{ constexpr bool UnitStride={fast};\n" + body + "\n}\n"
+        result += f"""namespace {name} {{
+constexpr bool UnitStride = {fast};
+""" + body + """
+}
+"""
 
     if active_inputs is None:
         active_inputs = tuple(range(11))
     predicate = (" && ".join(f"(!in.v[{i}].data || (in.v[{i}].width==1 && in.v[{i}].s1==1))" for i in active_inputs) or "true")
     result += (
-        "void launch(Inputs in,Outputs out,const Acc* fs,Acc* stats,int64_t N,cudaStream_t stream) {\n"
-        + f"if({predicate}) unit::launch(in,out,fs,stats,N,stream);\nelse general::launch(in,out,fs,stats,N,stream);\n}}\n"
+        """void launch(Inputs in, Outputs out, const Acc* fs, Acc* stats, int64_t N, cudaStream_t stream) {
+"""
+        + f"""    if ({predicate})
+        unit::launch(in, out, fs, stats, N, stream);
+    else
+        general::launch(in, out, fs, stats, N, stream);
+}}
+"""
     )
     if source.get("cuda_workspace", False):
-        result += "int64_t workspace_size(int64_t n,bool parameters) { return max(unit::workspace_size(n,parameters),general::workspace_size(n,parameters)); }\n"
+        result += """int64_t workspace_size(int64_t n, bool parameters) {
+    return max(unit::workspace_size(n, parameters), general::workspace_size(n, parameters));
+}
+"""
     return {"cpp": source["cpp"], "cuda": result}
 
 

@@ -2,130 +2,86 @@
 
 from collections import OrderedDict
 from functools import lru_cache
-from hashlib import sha256
 
 import torch
 
 from ...o3.irreps import PublicIrreps as Irreps, irreps_key
 from .kernels.forward import load_dropout_kernel
 from .kernels.utils import MAX_DIMS
-from ...utils import REGISTER_OPERATOR_LOCK, is_compiling
+from ...utils import is_compiling
+from ...utils.operator_config import encode_config, decode_config
+
+__all__ = ['dropout']
 
 
 UNSET = object()
 
 
-@torch.compiler.assume_constant_result
-def register_ops(groups):
-    suffix = sha256(repr(groups).encode()).hexdigest()[:24]
-    name = f"dropout_{suffix}_forward"
-    with REGISTER_OPERATOR_LOCK:
-        if hasattr(torch.ops.lunaeq, name):
-            return name
-        copies = sum(mul for mul, _ in groups)
-
-        @lru_cache(maxsize=128)
-        def runtime(dtype, device):
-            major, minor = torch.cuda.get_device_capability(device)
-            return load_dropout_kernel(groups, dtype, f"{major}{minor}")
-
-        @torch.library.custom_op(f"lunaeq::dropout_{suffix}_forward", mutates_args=(),
-                                 tags=(torch.Tag.nondeterministic_seeded,))
-        def dropout_forward_op(x: torch.Tensor, probability: float) -> tuple[torch.Tensor, torch.Tensor]:
-            return runtime(x.dtype, x.device).launch(x, probability)
-
-        @dropout_forward_op.register_fake
-        def dropout_forward_fake(x, probability):
-            return x.new_empty(x.shape), x.new_empty((x.shape[0], copies), dtype=torch.uint8)
-
-        @torch.library.custom_op(f"lunaeq::dropout_{suffix}_backward", mutates_args=())
-        def dropout_backward_op(direction: torch.Tensor, state: torch.Tensor,
-                               probability: float) -> torch.Tensor:
-            return runtime(direction.dtype, direction.device).apply_mask(direction, state, probability)
-
-        @dropout_backward_op.register_fake
-        def dropout_backward_fake(direction, state, probability):
-            return direction.new_empty(direction.shape)
-
-        def dropout_forward_setup(ctx, inputs, output):
-            _, ctx.probability = inputs
-            _, state = output
-            ctx.set_materialize_grads(False)
-            ctx.mark_non_differentiable(state)
-            ctx.save_for_backward(state)
-
-        def dropout_forward_backward(ctx, direction, state_gradient):
-            (state,) = ctx.saved_tensors
-            value = None if direction is None else dropout_backward_op(direction, state, ctx.probability)
-            return value, None
-
-        def dropout_backward_setup(ctx, inputs, output):
-            _, state, ctx.probability = inputs
-            ctx.set_materialize_grads(False)
-            ctx.save_for_backward(state)
-
-        def dropout_backward_backward(ctx, direction):
-            (state,) = ctx.saved_tensors
-            value = None if direction is None else dropout_backward_op(direction, state, ctx.probability)
-            return value, None, None
-
-        dropout_forward_op.register_autograd(dropout_forward_backward, setup_context=dropout_forward_setup)
-        dropout_backward_op.register_autograd(dropout_backward_backward, setup_context=dropout_backward_setup)
-        return name
+@lru_cache(maxsize=128)
+def get_dropout_kernel(config, dtype, device):
+    major, minor = torch.cuda.get_device_capability(device)
+    return load_dropout_kernel(decode_config(config), dtype, f"{major}{minor}")
 
 
-class DropoutBackward(torch.autograd.Function):
-    """Backward, double-backward and triple-backward reuse the fixed mask kernel."""
-
-    @staticmethod
-    def forward(ctx, direction, state, probability, runtime):
-        ctx.set_materialize_grads(False)
-        ctx.save_for_backward(state)
-        ctx.probability = probability
-        ctx.runtime = runtime
-        return runtime.apply_mask(direction, state, probability)
-
-    @staticmethod
-    def backward(ctx, direction):
-        if direction is None:
-            return None, None, None, None
-
-        (state,) = ctx.saved_tensors
-        if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
-            value = DropoutBackward.apply(direction, state, ctx.probability, ctx.runtime)
-        else:
-            value = ctx.runtime.apply_mask(direction, state, ctx.probability)
-        return value, None, None, None
+@torch.library.custom_op("lunaeq::dropout_forward", mutates_args=(),
+                         tags=(torch.Tag.nondeterministic_seeded,))
+def dropout_forward_op(x: torch.Tensor, probability: float, config: str) -> tuple[torch.Tensor, torch.Tensor]:
+    return get_dropout_kernel(config, x.dtype, x.device).launch(x, probability)
 
 
-class DropoutFunction(torch.autograd.Function):
-    """Sample once, retaining only one decision byte for each irrep copy."""
+@dropout_forward_op.register_fake
+def dropout_forward_fake(x, probability, config):
+    groups = decode_config(config)
+    copies = sum(mul for mul, _ in groups)
+    return x.new_empty(x.shape), x.new_empty((x.shape[0], copies), dtype=torch.uint8)
 
-    @staticmethod
-    def forward(ctx, x, probability, runtime):
-        output, state = runtime.launch(x, probability)
-        ctx.set_materialize_grads(False)
-        ctx.save_for_backward(state)
-        ctx.probability = probability
-        ctx.runtime = runtime
-        return output
 
-    @staticmethod
-    def backward(ctx, direction):
-        if direction is None:
-            return None, None, None
+@torch.library.custom_op("lunaeq::dropout_backward", mutates_args=())
+def dropout_backward_op(direction: torch.Tensor, state: torch.Tensor,
+                       probability: float, config: str) -> torch.Tensor:
+    return get_dropout_kernel(config, direction.dtype, direction.device).apply_mask(direction, state, probability)
 
-        (state,) = ctx.saved_tensors
-        if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
-            value = DropoutBackward.apply(direction, state, ctx.probability, ctx.runtime)
-        else:
-            value = ctx.runtime.apply_mask(direction, state, ctx.probability)
-        return value, None, None
+
+@dropout_backward_op.register_fake
+def dropout_backward_fake(direction, state, probability, config):
+    return direction.new_empty(direction.shape)
+
+
+def dropout_forward_setup(ctx, inputs, output):
+    _, ctx.probability, ctx.config = inputs
+    _, state = output
+    ctx.set_materialize_grads(False)
+    ctx.mark_non_differentiable(state)
+    ctx.save_for_backward(state)
+
+
+def dropout_forward_backward(ctx, direction, state_gradient):
+    (state,) = ctx.saved_tensors
+    value = None if direction is None else dropout_backward_op(direction, state, ctx.probability, ctx.config)
+    return value, None, None
+
+
+def dropout_backward_setup(ctx, inputs, output):
+    _, state, ctx.probability, ctx.config = inputs
+    ctx.set_materialize_grads(False)
+    ctx.save_for_backward(state)
+
+
+def dropout_backward_backward(ctx, direction):
+    (state,) = ctx.saved_tensors
+    value = None if direction is None else dropout_backward_op(direction, state, ctx.probability, ctx.config)
+    return value, None, None, None
+
+
+dropout_forward_op.register_autograd(dropout_forward_backward, setup_context=dropout_forward_setup)
+dropout_backward_op.register_autograd(dropout_backward_backward, setup_context=dropout_backward_setup)
 
 
 def layout_metadata(irreps):
+    groups = tuple((int(mul), int(ir.dim)) for mul, ir in irreps)
     return dict(
-        _groups=tuple((int(mul), int(ir.dim)) for mul, ir in irreps),
+        _groups=groups,
+        operator_config=encode_config(groups),
         _feature_width=irreps.dim,
         _group_count=len(irreps),
         _max_multiplicity=max((mul for mul, _ in irreps), default=0),
@@ -143,7 +99,7 @@ def functional_plan(irreps):
 
 
 def dropout(x, irreps, p, training=True, *, config=None):
-    """Drop irrep copies; the functional cache owns static layout metadata only."""
+    """Drop complete irrep copies with probability p."""
     if not training:
         if config is not None:
             config["last_execution_backend"] = "identity"
@@ -168,7 +124,7 @@ def dropout(x, irreps, p, training=True, *, config=None):
     ):
         if is_compiling():
             probability = 0.0 if p <= 0 else 1.0 if p >= 1 else float(p)
-            return getattr(torch.ops.lunaeq, register_ops(config["_groups"])).default(x, probability)[0]
+            return torch.ops.lunaeq.dropout_forward.default(x, probability, config["operator_config"])[0]
         irreps = config['irreps']
         key = dtype, x.device
         if key == config["_last_native_key"]:
@@ -219,4 +175,50 @@ def dropout(x, irreps, p, training=True, *, config=None):
     return x * noise
 
 
-__all__ = ['dropout']
+class DropoutFunction(torch.autograd.Function):
+    """Sample once, retaining only one decision byte for each irrep copy."""
+
+    @staticmethod
+    def forward(ctx, x, probability, runtime):
+        output, state = runtime.launch(x, probability)
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(state)
+        ctx.probability = probability
+        ctx.runtime = runtime
+        return output
+
+    @staticmethod
+    def backward(ctx, direction):
+        if direction is None:
+            return None, None, None
+
+        (state,) = ctx.saved_tensors
+        if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
+            value = DropoutBackward.apply(direction, state, ctx.probability, ctx.runtime)
+        else:
+            value = ctx.runtime.apply_mask(direction, state, ctx.probability)
+        return value, None, None
+
+
+class DropoutBackward(torch.autograd.Function):
+    """Backward, double-backward and triple-backward reuse the fixed mask kernel."""
+
+    @staticmethod
+    def forward(ctx, direction, state, probability, runtime):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(state)
+        ctx.probability = probability
+        ctx.runtime = runtime
+        return runtime.apply_mask(direction, state, probability)
+
+    @staticmethod
+    def backward(ctx, direction):
+        if direction is None:
+            return None, None, None, None
+
+        (state,) = ctx.saved_tensors
+        if torch.is_grad_enabled() and not torch.is_inference_mode_enabled():
+            value = DropoutBackward.apply(direction, state, ctx.probability, ctx.runtime)
+        else:
+            value = ctx.runtime.apply_mask(direction, state, ctx.probability)
+        return value, None, None, None

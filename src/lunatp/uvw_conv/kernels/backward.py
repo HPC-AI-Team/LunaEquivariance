@@ -1,11 +1,11 @@
 """UVW convolution backward CUDA and native launch."""
 
 from __future__ import annotations
+import textwrap
 from collections.abc import Mapping
-from operator import itemgetter
 import torch
 from ...utils.cg import emit_cg_source
-from ....utils.precision import get_fp64_mma, cuda_source_for_dtype, float_literal
+from ....utils.precision import cuda_source_for_dtype, float_literal
 from ....utils.extension import load_tp_extension, load_cuda_extension
 from ...utils.runtime import auxiliary_streams, get_overlap_state
 from ...utils.contractions import (
@@ -17,211 +17,84 @@ from ...utils.contractions import (
     OUTPUT_SHAPES,
 )
 from .forward import make_uvw_conv_forward_external_kernel
-from .utils import get_uvw_conv_node_layout, get_uvw_conv_weight_layout, set_arch
+from .utils import (
+    get_uvw_conv_node_layout, get_uvw_conv_weight_layout, set_arch,
+    get_uvw_conv_backward_layout, get_uvw_conv_tr_layout, make_tr_plan,
+    MAX_WEIGHT_BLOCKS, MAX_WEIGHT_SPLITS, MIN_WEIGHT_SPLITS, WEIGHT_SPLIT_NODES,
+    BACKWARD_NEIGHBOR_SPLITS,
+)
 
 
-def make_uvw_conv_gemm_mma(meta, a_read, b_read, *, arch):
-    """Emit FP64 warp MMA for the existing 16x64, K32 shared GEMM tiles.
-
-    Each of the four warps owns 16 columns and all 16 rows. Read expressions
-    use local row/column/input coordinates and product index p. The same
-    accumulator sums the existing one- or two-product contraction.
-    """
-    if meta.get("dtype") != torch.float64:
-        raise ValueError("The warp MMA fragment requires FP64 metadata")
-    return {
-        "declaration": r"""using Mma={mma_type};
-    const int mma_lane=threadIdx.x&31,mma_warp=threadIdx.x>>5;
-    double acc[2][4]={{}};""".format(mma_type=get_fp64_mma(arch)[1]),
-        "compute": r"""#pragma unroll
-        for(int k=0;k<32;k+=16) {{
-            #pragma unroll
-            for(int p=0;p<Products;++p) {{
-                double av[8];
-                #pragma unroll
-                for(int i=0;i<8;++i) {{
-                    const int row=(mma_lane>>2)+(i&1)*8;
-                    const int input=k+(mma_lane&3)+(i>>1)*4;
-                    av[i]={a_read};
-                }}
-                #pragma unroll
-                for(int n=0;n<2;++n) {{
-                    double bv[4];
-                    #pragma unroll
-                    for(int i=0;i<4;++i) {{
-                        const int column=mma_warp*16+n*8+(mma_lane>>2);
-                        const int input=k+(mma_lane&3)+i*4;
-                        bv[i]={b_read};
-                    }}
-                    Mma::fma(acc[n][0],acc[n][1],acc[n][2],acc[n][3],
-                        av[0],av[1],av[2],av[3],av[4],av[5],av[6],av[7],
-                        bv[0],bv[1],bv[2],bv[3],
-                        acc[n][0],acc[n][1],acc[n][2],acc[n][3]);
-                }}
-            }}
-        }}""".format(
-            a_read=a_read,
-            b_read=b_read,
-        ),
-        "row": "row_base+(mma_lane>>2)+(r>>1)*8",
-        "column": "column_base+mma_warp*16+c*8+(mma_lane&3)*2+(r&1)",
-        "value": "acc[c][r]",
-        "rows": 4,
-        "columns": 2,
-    }
-
-
-def make_uvw_conv_node_shared_source(meta, kernel_name, *, arch):
-    specs = meta["generated_specs"]
-    offsets, total = get_uvw_conv_node_layout(specs)
-    column_index = "int64_t(column)" if total > (1 << 31) - 1 else "column"
+def make_uvw_conv_node_cutlass_source(meta, kernel_name):
+    """Contract node gradients and weights without packing either operand."""
+    offsets, total = get_uvw_conv_node_layout(meta["generated_specs"])
     cases = []
-    a_store = "i"
-    b_store = "u*32+((i%32)^(u&31))"
-    mma = {
-        "declaration": r"""using Mma=cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<2,4,1>,
-        float,cutlass::layout::RowMajor,float,cutlass::layout::RowMajor,
-        float,cutlass::layout::RowMajor,cutlass::arch::OpMultiplyAdd>;
-    Mma::FragmentC acc;acc.clear();""",
-        "compute": r"""#pragma unroll 4
-        for(int k=0;k<32;++k) {
-            #pragma unroll
-            for(int p=0;p<Products;++p) {
-                Mma::FragmentA av;av[0]=a[p][k*16+local_row];av[1]=a[p][k*16+local_row+1];
-                Mma::FragmentB bv;
-                #pragma unroll
-                for(int c=0;c<4;++c) {
-                    int u=local_column+c*16;
-                    bv[c]=b[p][u*32+(k^(u&31))];
-                }
-                Mma()(acc,av,bv,acc);
-            }
-        }""",
-        "row": "row_base+local_row+r",
-        "column": "column_base+local_column+c*16",
-        "value": "acc[r*4+c]",
-        "rows": 2,
-        "columns": 4,
-    }
-    if meta.get("dtype") == torch.float64:
-        a_store = "(i/16)*16+((i%16)^(((i/16)&3)<<2))"
-        b_store = "u*32+((i%32)^((u&3)<<2))"
-        mma = make_uvw_conv_gemm_mma(
-            meta,
-            "a[p][input*16+(row^((input&3)<<2))]",
-            "b[p][column*32+(input^((column&3)<<2))]",
-            arch=arch,
-        )
-    column_type = (
-        "int64_t" if max(s["path_channels"] for s in specs) > (1 << 31) - 64 else "int"
-    )
-    column_base = (
-        "int64_t(blockIdx.x)*64" if column_type == "int64_t" else "blockIdx.x*64"
-    )
-    for index, s in enumerate(specs):
-        d = s["d3"]
-        columns = s["path_channels"]
-        kdim = s["out_channels"]
-        input_type = "int64_t" if kdim > (1 << 31) - 32 else "int"
-        if input_type == "int64_t":
-            dimensions = f"constexpr {column_type} Columns={columns}; constexpr int64_t K={kdim};"
-            load_position = (
-                f"int u=i/32; int64_t k=base+i%32; {column_type} column=column_base+u;"
-            )
-            grad_position = "Index row=row_base+i%16; int64_t k=base+i/16;"
-        else:
-            grad_position = "Index row=row_base+i%16,k=base+i/16;"
-            if column_type == "int64_t":
-                dimensions = (
-                    f"constexpr int64_t Columns={columns}; constexpr int K={kdim};"
-                )
-                load_position = "int u=i/32,k=base+i%32; int64_t column=column_base+u;"
-            else:
-                dimensions = f"constexpr int Columns={columns},K={kdim};"
-                load_position = "int u=i/32,k=base+i%32,column=column_base+u;"
-        cases.append(
-            r"""
+    for index, spec in enumerate(meta["generated_specs"]):
+        d, channels, k = spec["d3"], spec["path_channels"], spec["out_channels"]
+        cases.append(f"""
 case {index}: {{
-    {dimensions}
-    const Index rows=nodes*{d};
-    if(row_base>=rows || column_base>=Columns) return;
-    {declaration}
-    for({input_type} base=0;base<K;base+=32) {{
-        #pragma unroll
-        for(int p=0;p<Products;++p) {{
-            const float* grad=p==0?g0:g1;
-            const float* weight=p==0?w0:w1;
-            for(int i=threadIdx.x;i<512;i+=128) {{
-                {grad_position}
-                a[p][{a_store}]=(row<rows && k<K)?__ldg(grad+int64_t(row/{d})*{out_dim}+{out_offset}+k*{d}+row%{d}):0.f;
-            }}
-            for(int i=threadIdx.x;i<2048;i+=128) {{
-                {load_position}
-                b[p][{b_store}]=(column<Columns && k<K)?__ldg(weight+{weight_offset}+int64_t(column)*K+k):0.f;
-            }}
-        }}
-        __syncthreads();
-        {compute}
+    using Kernel=typename {kernel_name}_Gemm<{d}>::GemmKernel;
+    using Mma=typename Kernel::Mma;
+    using Epilogue=typename Kernel::Epilogue;
+    auto& storage=shared.s{index};
+    const int64_t first_node=int64_t(blockIdx.y)*64/{d};
+    const int row=int64_t(blockIdx.y)*64%{d},column=blockIdx.x*64;
+    const int rows=min(int64_t(64+{d}), (nodes-first_node)*{d});
+    if(first_node>=nodes || column>={channels}) return;
+    typename Mma::FragmentC acc; acc.clear();
+#pragma unroll
+    for(int p=0;p<Products;++p) {{
+        const float* grad=p==0?g0:g1;
+        const float* weight=p==0?w0:w1;
+        typename Mma::IteratorA a(
+        typename Mma::IteratorA::Params(cutlass::layout::RowMajor({meta['out_dim']})),
+        const_cast<float*>(grad+first_node*{meta['out_dim']}+{spec['out_offset']}),{{rows,{k}}},threadIdx.x,{{row,0}});
+        typename Mma::IteratorB b(
+        typename Mma::IteratorB::Params(cutlass::layout::ColumnMajor({k})),
+        const_cast<float*>(weight+{spec['weight_offset']}),{{{k},{channels}}},threadIdx.x,{{0,column}});
+        Mma mma(storage.main_loop,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+        mma(({k}+7)/8,acc,a,b,acc);
         __syncthreads();
     }}
-    #pragma unroll
-    for(int r=0;r<{rows};++r) {{
-        Index row={row};
-        #pragma unroll
-        for(int c=0;c<{columns};++c) {{
-            {column_type} column={column};
-            if(row<rows && column<Columns) z[int64_t(row/{d})*{total}+{offsets_value}+{column_index}*{d}+row%{d}]={value};
-        }}
-    }}
+    typename Epilogue::OutputTileIterator output(
+    typename Epilogue::OutputTileIterator::Params(cutlass::layout::RowMajor({total})),
+    z+first_node*{total}+{offsets[index]},{{rows,{channels}}},threadIdx.x,{{row,column}});
+    Epilogue epilogue(storage.epilogue,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+    epilogue(typename Kernel::EpilogueOutputOp(1.0f,0.0f),output,acc,output);
     return;
 }}
-""".format(
-                index=index,
-                dimensions=dimensions,
-                d=d,
-                declaration=mma["declaration"],
-                input_type=input_type,
-                grad_position=grad_position,
-                a_store=a_store,
-                out_dim=meta["out_dim"],
-                out_offset=s["out_offset"],
-                load_position=load_position,
-                b_store=b_store,
-                weight_offset=s["weight_offset"],
-                compute=mma["compute"],
-                rows=mma["rows"],
-                row=mma["row"],
-                columns=mma["columns"],
-                column_type=column_type,
-                column=mma["column"],
-                total=total,
-                offsets_value=offsets[index],
-                column_index=column_index,
-                value=mma["value"],
-            )
-        )
-    return cuda_source_for_dtype(
-        r"""
-// W*G stays in node-major Z; source-CSR and edge consumers share this layout.
-// XOR-swizzled weights give coalesced global loads and conflict-free MMA reads.
+""")
+    return f"""
+#include <cutlass/gemm/device/gemm_universal.h>
+// Read and write [node, channel, component] directly, without packing.
+template<int Components, int Stride> struct {kernel_name}_Layout {{
+    using Index=int32_t; using LongIndex=int64_t;
+    CUTLASS_HOST_DEVICE {kernel_name}_Layout(cutlass::MatrixCoord,Index) {{}}
+    CUTLASS_HOST_DEVICE {kernel_name}_Layout(cutlass::layout::PitchLinearCoord,Index) {{}}
+    CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::MatrixCoord q) const {{
+        return LongIndex(q.row()/Components)*Stride+LongIndex(q.column())*Components+q.row()%Components;
+    }}
+    CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::layout::PitchLinearCoord q) const {{
+        return operator()(cutlass::MatrixCoord(q.strided(),q.contiguous()));
+    }}
+}};
+template<int Components> using {kernel_name}_Gemm=cutlass::gemm::device::GemmUniversal<
+    float,cutlass::layout::RowMajor,float,cutlass::layout::ColumnMajor,float,cutlass::layout::RowMajor,
+    float,cutlass::arch::OpClassSimt,cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64,64,8>,cutlass::gemm::GemmShape<32,32,8>,cutlass::gemm::GemmShape<1,1,1>,
+    cutlass::epilogue::thread::LinearCombination<float,1,float,float>,
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,2,1,1,cutlass::arch::OpMultiplyAdd,
+    cutlass::ComplexTransform::kNone,cutlass::ComplexTransform::kNone,false,false,false,
+    {kernel_name}_Layout<Components,{total}>,{kernel_name}_Layout<Components,{meta['out_dim']}>>;
 template<int Products>
-__global__ __launch_bounds__(128,4)
-void {kernel_name}(const float* w0,const float* g0,const float* w1,const float* g1,float* z,int64_t nodes) {{
-    __shared__ float a[Products][512],b[Products][2048];
-    const Index row_base=blockIdx.y*16; const {column_type} column_base={column_base};
-    const int local_row=(threadIdx.x/16)*2,local_column=threadIdx.x%16;
+__global__ void {kernel_name}(const float* w0,const float* g0,const float* w1,const float* g1,float* z,int64_t nodes) {{
+    union Storage {{ {' '.join(f"typename {kernel_name}_Gemm<{s['d3']}>::GemmKernel::SharedStorage s{i};" for i,s in enumerate(meta["generated_specs"]))} }};
+    __shared__ Storage shared;
     switch(blockIdx.z) {{
-{cases}
+{textwrap.indent(chr(10).join(cases), '        ')}
     }}
 }}
-""".format(
-            kernel_name=kernel_name,
-            column_type=column_type,
-            column_base=column_base,
-            cases=chr(10).join(cases),
-        ),
-        meta.get("dtype", torch.float32),
-    )
+"""
 
 
 def grad_x_allocator(meta):
@@ -301,17 +174,17 @@ def emit_dx_lines(
         for name in arrays
     ]
     lines = [
-        r"""__global__ __launch_bounds__({threads}, 4)
-void {kernel_name}(
+        r"""__global__ __launch_bounds__({threads}, 4) void {kernel_name}(
 {parameters}
-    const int32_t* __restrict__ dst,
-    const EdgeIndex* __restrict__ src_rowptr,
-    const EdgeIndex* __restrict__ edge_by_src,
+    const int32_t *__restrict__ dst,
+    const EdgeIndex *__restrict__ src_rowptr,
+    const EdgeIndex *__restrict__ edge_by_src,
 {output_parameters}
     int64_t num_nodes) {{
     const int s = blockIdx.x;
     const int u = blockIdx.y * {threads} + threadIdx.x;
-    if (s >= num_nodes || u >= {channel_bound}) return;""".format(
+    if (s >= num_nodes || u >= {channel_bound})
+        return;""".format(
             threads=threads,
             kernel_name=kernel_name,
             parameters="\n".join(parameters),
@@ -361,7 +234,7 @@ void {kernel_name}(
             lines.append(f"        if (u < {in_channels}) {{")
             edge_channels, d2 = int(spec["edge_channels"]), int(spec["d2"])
             if edge_channels != 1:
-                lines.append(f"        for (int v = 0; v < {edge_channels}; ++v) {{")
+                lines.append(f"            for (int v = 0; v < {edge_channels}; ++v) {{")
             edge_offset = f"v * {d2} + " if edge_channels != 1 else ""
             channel = "int64_t(u)" if wide_z else "u"
             path = (
@@ -433,12 +306,12 @@ void {kernel_name}(
                     for target in targets
                 ]
         if len(groups) > 1:
-            lines += ["    return;", "    }"]
+            lines += ["    return;", "}"]
     lines.append("}")
     return lines, (f", {len(groups)}" if len(groups) > 1 else "")
 
 
-def make_uvw_conv_backward_dx_shared_source(meta: Mapping[str, object], *, arch) -> str:
+def make_uvw_conv_backward_dx_shared_source(meta: Mapping[str, object]) -> str:
     specs = list(meta["generated_specs"])
     in1_dim = int(meta["in1_dim"])
     z_offsets, total_z = get_uvw_conv_node_layout(specs)
@@ -470,16 +343,12 @@ def make_uvw_conv_backward_dx_shared_source(meta: Mapping[str, object], *, arch)
         wide_z=wide_z,
     )
 
-    mma_include = (
-        "\n" + get_fp64_mma(arch)[0] if meta.get("dtype") == torch.float64 else ""
-    )
     return cuda_source_for_dtype(
         r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cutlass/gemm/thread/mma.h>{mma_include}
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -490,11 +359,11 @@ constexpr {z_type} GEN_TOTAL_Z = {total_z};
 {path_constant}constexpr {channel_type} GEN_MAX_CHANNELS = {max_channels};
 constexpr int GEN_MAX_D3 = {max_d3};
 constexpr int GEN_X_TILE = {x_tile};
-constexpr int GEN_Z_TILE_M = 16;
+constexpr int GEN_Z_TILE_M = {node_tile_m};
 constexpr int GEN_Z_TILE_N = 64;
 
 
-{make_uvw_conv_node_shared_source}
+{node_contraction_source}
 
 {x_lines}
 }}  // namespace
@@ -512,14 +381,14 @@ torch::Tensor lunatp_uvwconv_bwd_dx_shared_launch_fp32(
     auto grad_x = {grad_x_alloc}({{num_nodes, GEN_IN1_DIM}}, edge_attr.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_x_zgemm_fp32<1><<<dim3(
-        static_cast<unsigned int>(({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N),
-        static_cast<unsigned int>((num_nodes * int64_t(GEN_MAX_D3) + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M),
-        GEN_NUM_SPECS), 128, 0, stream>>>(
-        weight.data_ptr<float>(), grad_out.data_ptr<float>(), nullptr, nullptr, z.data_ptr<float>(), num_nodes);
+                   static_cast<unsigned int>(({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N),
+                   static_cast<unsigned int>((num_nodes * int64_t(GEN_MAX_D3) + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M),
+                   GEN_NUM_SPECS), 128, 0, stream>>>(
+                weight.data_ptr<float>(), grad_out.data_ptr<float>(), nullptr, nullptr, z.data_ptr<float>(), num_nodes);
     if (num_nodes > 0) lunatp_uvwconv_bwd_x_src_apply_fp32<<<dim3(static_cast<unsigned int>(num_nodes),
-        static_cast<unsigned int>((GEN_MAX_CHANNELS + GEN_X_TILE - 1) / GEN_X_TILE){x_group_grid}), GEN_X_TILE, 0, stream>>>(
-        edge_attr.data_ptr<float>(), z.data_ptr<float>(), dst.data_ptr<int32_t>(),
-        src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(), grad_x.data_ptr<float>(), num_nodes);
+                                                   static_cast<unsigned int>((GEN_MAX_CHANNELS + GEN_X_TILE - 1) / GEN_X_TILE){x_group_grid}), GEN_X_TILE, 0, stream>>>(
+            edge_attr.data_ptr<float>(), z.data_ptr<float>(), dst.data_ptr<int32_t>(),
+            src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(), grad_x.data_ptr<float>(), num_nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return grad_x;
 }}
@@ -528,7 +397,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("lunatp_uvwconv_bwd_dx_shared_launch_fp32", &lunatp_uvwconv_bwd_dx_shared_launch_fp32, "Graph-conv shared grad_x source-CSR backward launch");
 }}
 """.format(
-            mma_include=mma_include,
             specs_count=len(specs),
             in1_dim=in1_dim,
             z_type=z_type,
@@ -538,8 +406,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
             max_channels=max_channels,
             max_d3=max_d3,
             x_tile=x_tile,
-            make_uvw_conv_node_shared_source=make_uvw_conv_node_shared_source(
-                meta, "lunatp_uvwconv_bwd_x_zgemm_fp32", arch=arch
+            node_tile_m=64,
+            node_contraction_source=make_uvw_conv_node_cutlass_source(
+                meta, "lunatp_uvwconv_bwd_x_zgemm_fp32"
             ),
             x_lines=chr(10).join(x_lines),
             grad_x_alloc=grad_x_alloc,
@@ -551,7 +420,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 
 
 def make_uvw_conv_backward_dxdy_shared_source(
-    meta: Mapping[str, object], *, arch
+    meta: Mapping[str, object]
 ) -> str:
     specs = list(meta["generated_specs"])
     in1_dim = int(meta["in1_dim"])
@@ -629,10 +498,10 @@ def make_uvw_conv_backward_dxdy_shared_source(
                 f"    const float* __restrict__ {edge_name},"
                 for edge_name in edge_arrays
             ],
-            "    const int32_t* __restrict__ src,",
-            "    const int32_t* __restrict__ dst,",
+            "const int32_t* __restrict__ src,",
+            "const int32_t* __restrict__ dst,",
             "    float* __restrict__ grad_edge,",
-            "    int64_t num_edges) {",
+            "int64_t num_edges) {",
             "    __shared__ float smem[GEN_Y_WARPS * GEN_IN2_DIM];",
             "    const Index e = blockIdx.x;",
             "    const int u = threadIdx.x;",
@@ -690,21 +559,21 @@ def make_uvw_conv_backward_dxdy_shared_source(
                     if paired:
                         for edge_product in range(2):
                             edge_lines.append(
-                                f"        const float x{edge_product}v{edge_spec_idx}_{edge_i} = __ldg(x{edge_product} + Index(s) * {edge_in1_dim} + {edge_x_offset} + u * {edge_d1} + {edge_i});"
+                                f"    const float x{edge_product}v{edge_spec_idx}_{edge_i} = __ldg(x{edge_product} + Index(s) * {edge_in1_dim} + {edge_x_offset} + u * {edge_d1} + {edge_i});"
                             )
                     else:
                         edge_lines.append(
-                            f"        const float xv{edge_spec_idx}_{edge_i} = __ldg(x + Index(s) * {edge_in1_dim} + {edge_x_offset} + u * {edge_d1} + {edge_i});"
+                            f"    const float xv{edge_spec_idx}_{edge_i} = __ldg(x + Index(s) * {edge_in1_dim} + {edge_x_offset} + u * {edge_d1} + {edge_i});"
                         )
                 for edge_k in sorted({int(edge_t[2]) for edge_t in edge_terms}):
                     if paired:
                         for edge_product in range(2):
                             edge_lines.append(
-                                f"        const float z{edge_product}v{edge_spec_idx}_{edge_k} = __ldg(z{edge_product} + Index(t) * GEN_TOTAL_Z + {z_offsets[edge_spec_idx]} + {edge_path} * {edge_d3} + {edge_k});"
+                                f"    const float z{edge_product}v{edge_spec_idx}_{edge_k} = __ldg(z{edge_product} + Index(t) * GEN_TOTAL_Z + {z_offsets[edge_spec_idx]} + {edge_path} * {edge_d3} + {edge_k});"
                             )
                     else:
                         edge_lines.append(
-                            f"        const float zv{edge_spec_idx}_{edge_k} = __ldg(z + Index(t) * GEN_TOTAL_Z + {z_offsets[edge_spec_idx]} + {edge_path} * {edge_d3} + {edge_k});"
+                            f"    const float zv{edge_spec_idx}_{edge_k} = __ldg(z + Index(t) * GEN_TOTAL_Z + {z_offsets[edge_spec_idx]} + {edge_path} * {edge_d3} + {edge_k});"
                         )
                 for edge_i, edge_j, edge_k, edge_coeff in edge_terms:
                     edge_component = (
@@ -714,31 +583,35 @@ def make_uvw_conv_backward_dxdy_shared_source(
                     )
                     if paired:
                         edge_lines.append(
-                            f"""        acc_y{edge_component} = fmaf({float_literal(float(edge_coeff), meta.get("dtype"))}, x0v{edge_spec_idx}_{int(edge_i)} * z0v{edge_spec_idx}_{int(edge_k)} + x1v{edge_spec_idx}_{int(edge_i)} * z1v{edge_spec_idx}_{int(edge_k)}, acc_y{edge_component});"""
+                            f"""    acc_y{edge_component} = fmaf({float_literal(float(edge_coeff), meta.get("dtype"))}, x0v{edge_spec_idx}_{int(edge_i)} * z0v{edge_spec_idx}_{int(edge_k)} + x1v{edge_spec_idx}_{int(edge_i)} * z1v{edge_spec_idx}_{int(edge_k)}, acc_y{edge_component});"""
                         )
                     else:
                         edge_lines.append(
-                            f"""        acc_y{edge_component} = fmaf({float_literal(float(edge_coeff), meta.get("dtype"))} * xv{edge_spec_idx}_{int(edge_i)}, zv{edge_spec_idx}_{int(edge_k)}, acc_y{edge_component});"""
+                            f"""    acc_y{edge_component} = fmaf({float_literal(float(edge_coeff), meta.get("dtype"))} * xv{edge_spec_idx}_{int(edge_i)}, zv{edge_spec_idx}_{int(edge_k)}, acc_y{edge_component});"""
                         )
-                edge_lines.append("    }")
+                edge_lines.append("}")
                 if edge_channels != 1:
-                    edge_lines.append("    }")
+                    edge_lines.append("}")
             for edge_j in edge_components:
                 edge_lines += r"""    float sum{j} = acc_y{j};
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) sum{j} += __shfl_down_sync(0xffffffff, sum{j}, offset);
-    if ((threadIdx.x & 31) == 0) smem[(threadIdx.x >> 5) * GEN_IN2_DIM + {j}] = sum{j};""".format(j=edge_j).split("\n")
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    sum{j} += __shfl_down_sync(0xffffffff, sum{j}, offset);
+    if ((threadIdx.x & 31) == 0)
+    smem[(threadIdx.x >> 5) * GEN_IN2_DIM + {j}] = sum{j};""".format(j=edge_j).split("\n")
             edge_lines += "    __syncthreads();\n    if (threadIdx.x < 32) {".split(
                 "\n"
             )
             for edge_j in edge_components:
                 edge_lines += r"""        float block_sum{j} = (threadIdx.x < GEN_Y_WARPS) ? smem[threadIdx.x * GEN_IN2_DIM + {j}] : 0.0f;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) block_sum{j} += __shfl_down_sync(0xffffffff, block_sum{j}, offset);
-        if (threadIdx.x == 0) grad_edge[e * GEN_IN2_DIM + {j}] = block_sum{j};""".format(j=edge_j).split("\n")
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+        block_sum{j} += __shfl_down_sync(0xffffffff, block_sum{j}, offset);
+        if (threadIdx.x == 0)
+        grad_edge[e * GEN_IN2_DIM + {j}] = block_sum{j};""".format(j=edge_j).split("\n")
             edge_lines.append("    }")
             if len(edge_groups) > 1:
-                edge_lines += ["    return;", "    }"]
+                edge_lines += ["    return;", "}"]
         edge_lines.append("}")
         edge_grid = "static_cast<unsigned int>(num_edges)"
         if len(edge_groups) > 1:
@@ -746,16 +619,12 @@ def make_uvw_conv_backward_dxdy_shared_source(
         edge_kernels.append((edge_lines, edge_grid))
     (y_kernel_lines, y_grid), (y_pair_kernel_lines, y_pair_grid) = edge_kernels
 
-    mma_include = (
-        "\n" + get_fp64_mma(arch)[0] if meta.get("dtype") == torch.float64 else ""
-    )
     return cuda_source_for_dtype(
         r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cutlass/gemm/thread/mma.h>{mma_include}
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <vector>
@@ -771,11 +640,11 @@ constexpr int GEN_MAX_D2 = {max_d2};
 constexpr {z_type} GEN_TOTAL_Z = {total_z};
 {path_constant}constexpr {channel_type} GEN_MAX_IN_CHANNELS = {max_in_channels};
 constexpr int GEN_MAX_D3 = {max_d3};
-constexpr int GEN_Z_TILE_M = 16;
+constexpr int GEN_Z_TILE_M = {node_tile_m};
 constexpr int GEN_Z_TILE_N = 64;
 
 
-{make_uvw_conv_node_shared_source}
+{node_contraction_source}
 
 {x_lines}
 
@@ -805,10 +674,10 @@ torch::Tensor lunatp_uvwconv_bwd_xy_source_z_fp32(
     auto z = torch::empty({{num_nodes, GEN_TOTAL_Z}}, grad_out.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_xy_source_zgemm_fp32<1><<<dim3(
-        static_cast<unsigned int>(({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N),
-        static_cast<unsigned int>((num_nodes * int64_t(GEN_MAX_D3) + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M),
-        GEN_NUM_SPECS), 128, 0, stream>>>(
-        weight.data_ptr<float>(), grad_out.data_ptr<float>(), nullptr, nullptr, z.data_ptr<float>(), num_nodes);
+                   static_cast<unsigned int>(({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N),
+                   static_cast<unsigned int>((num_nodes * int64_t(GEN_MAX_D3) + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M),
+                   GEN_NUM_SPECS), 128, 0, stream>>>(
+                weight.data_ptr<float>(), grad_out.data_ptr<float>(), nullptr, nullptr, z.data_ptr<float>(), num_nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return z;
 }}
@@ -821,11 +690,11 @@ torch::Tensor lunatp_uvwconv_bwd_xy_source_z_pair_fp32(
     auto z = torch::empty({{num_nodes, GEN_TOTAL_Z}}, grad0.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_xy_source_zgemm_fp32<2><<<dim3(
-        ({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N,
-        (num_nodes * GEN_MAX_D3 + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M,
-        GEN_NUM_SPECS), 128, 0, stream>>>(
-        weight0.data_ptr<float>(), grad0.data_ptr<float>(),
-        weight1.data_ptr<float>(), grad1.data_ptr<float>(), z.data_ptr<float>(), num_nodes);
+                   ({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N,
+                   (num_nodes * GEN_MAX_D3 + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M,
+                   GEN_NUM_SPECS), 128, 0, stream>>>(
+                weight0.data_ptr<float>(), grad0.data_ptr<float>(),
+                weight1.data_ptr<float>(), grad1.data_ptr<float>(), z.data_ptr<float>(), num_nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return z;
 }}
@@ -841,9 +710,9 @@ torch::Tensor lunatp_uvwconv_bwd_xy_source_x_from_z_fp32(
     auto grad_x = {grad_x_alloc}({{num_nodes, GEN_IN1_DIM}}, edge_attr.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_xy_source_x_apply_fp32<<<dim3(static_cast<unsigned int>(num_nodes),
-        static_cast<unsigned int>((GEN_MAX_IN_CHANNELS + GEN_X_THREADS - 1) / GEN_X_THREADS){x_group_grid}), GEN_X_THREADS, 0, stream>>>(
-        edge_attr.data_ptr<float>(), z.data_ptr<float>(), dst.data_ptr<int32_t>(),
-        src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(), grad_x.data_ptr<float>(), num_nodes);
+                                                        static_cast<unsigned int>((GEN_MAX_IN_CHANNELS + GEN_X_THREADS - 1) / GEN_X_THREADS){x_group_grid}), GEN_X_THREADS, 0, stream>>>(
+            edge_attr.data_ptr<float>(), z.data_ptr<float>(), dst.data_ptr<int32_t>(),
+            src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(), grad_x.data_ptr<float>(), num_nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return grad_x;
 }}
@@ -858,8 +727,8 @@ torch::Tensor lunatp_uvwconv_bwd_xy_source_y_from_z_fp32(
     auto grad_edge = torch::empty({{num_edges, GEN_IN2_DIM}}, x.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_edges > 0) lunatp_uvwconv_bwd_xy_source_y_apply_fp32<<<{y_grid}, GEN_Y_THREADS, 0, stream>>>(
-        x.data_ptr<float>(), z.data_ptr<float>(), src.data_ptr<int32_t>(), dst.data_ptr<int32_t>(),
-        grad_edge.data_ptr<float>(), num_edges);
+            x.data_ptr<float>(), z.data_ptr<float>(), src.data_ptr<int32_t>(), dst.data_ptr<int32_t>(),
+            grad_edge.data_ptr<float>(), num_edges);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return grad_edge;
 }}
@@ -882,13 +751,13 @@ std::vector<torch::Tensor> lunatp_uvwconv_bwd_xy_source_pair_from_z_fp32(
     auto grad_edge = torch::empty({{num_edges, GEN_IN2_DIM}}, x0.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_xy_source_x_pair_apply_fp32<<<dim3(static_cast<unsigned int>(num_nodes),
-        static_cast<unsigned int>((GEN_MAX_IN_CHANNELS + GEN_X_THREADS - 1) / GEN_X_THREADS){x_group_grid}), GEN_X_THREADS, 0, stream>>>(
-        edge0.data_ptr<float>(), z0.data_ptr<float>(), edge1.data_ptr<float>(), z1.data_ptr<float>(),
-        dst.data_ptr<int32_t>(), src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(),
-        grad_x.data_ptr<float>(), num_nodes);
+                                                              static_cast<unsigned int>((GEN_MAX_IN_CHANNELS + GEN_X_THREADS - 1) / GEN_X_THREADS){x_group_grid}), GEN_X_THREADS, 0, stream>>>(
+            edge0.data_ptr<float>(), z0.data_ptr<float>(), edge1.data_ptr<float>(), z1.data_ptr<float>(),
+            dst.data_ptr<int32_t>(), src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(),
+            grad_x.data_ptr<float>(), num_nodes);
     if (num_edges > 0) lunatp_uvwconv_bwd_xy_source_y_pair_apply_fp32<<<{y_pair_grid}, GEN_Y_THREADS, 0, stream>>>(
-        x0.data_ptr<float>(), z0.data_ptr<float>(), x1.data_ptr<float>(), z1.data_ptr<float>(),
-        src.data_ptr<int32_t>(), dst.data_ptr<int32_t>(), grad_edge.data_ptr<float>(), num_edges);
+            x0.data_ptr<float>(), z0.data_ptr<float>(), x1.data_ptr<float>(), z1.data_ptr<float>(),
+            src.data_ptr<int32_t>(), dst.data_ptr<int32_t>(), grad_edge.data_ptr<float>(), num_edges);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {{grad_x, grad_edge}};
 }}
@@ -911,17 +780,17 @@ std::vector<torch::Tensor> lunatp_uvwconv_bwd_dxdy_shared_launch_fp32(
     auto grad_edge = torch::empty({{num_edges, GEN_IN2_DIM}}, x.options());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_xy_source_zgemm_fp32<1><<<dim3(
-        static_cast<unsigned int>(({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N),
-        static_cast<unsigned int>((num_nodes * int64_t(GEN_MAX_D3) + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M),
-        GEN_NUM_SPECS), 128, 0, stream>>>(
-        weight.data_ptr<float>(), grad_out.data_ptr<float>(), nullptr, nullptr, z.data_ptr<float>(), num_nodes);
+                   static_cast<unsigned int>(({z_channels} + GEN_Z_TILE_N - 1) / GEN_Z_TILE_N),
+                   static_cast<unsigned int>((num_nodes * int64_t(GEN_MAX_D3) + GEN_Z_TILE_M - 1) / GEN_Z_TILE_M),
+                   GEN_NUM_SPECS), 128, 0, stream>>>(
+                weight.data_ptr<float>(), grad_out.data_ptr<float>(), nullptr, nullptr, z.data_ptr<float>(), num_nodes);
     if (num_nodes > 0) lunatp_uvwconv_bwd_xy_source_x_apply_fp32<<<dim3(static_cast<unsigned int>(num_nodes),
-        static_cast<unsigned int>((GEN_MAX_IN_CHANNELS + GEN_X_THREADS - 1) / GEN_X_THREADS){x_group_grid}), GEN_X_THREADS, 0, stream>>>(
-        edge_attr.data_ptr<float>(), z.data_ptr<float>(), dst.data_ptr<int32_t>(),
-        src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(), grad_x.data_ptr<float>(), num_nodes);
+                                                        static_cast<unsigned int>((GEN_MAX_IN_CHANNELS + GEN_X_THREADS - 1) / GEN_X_THREADS){x_group_grid}), GEN_X_THREADS, 0, stream>>>(
+            edge_attr.data_ptr<float>(), z.data_ptr<float>(), dst.data_ptr<int32_t>(),
+            src_rowptr.data_ptr<EdgeIndex>(), edge_by_src.data_ptr<EdgeIndex>(), grad_x.data_ptr<float>(), num_nodes);
     if (num_edges > 0) lunatp_uvwconv_bwd_xy_source_y_apply_fp32<<<{y_grid}, GEN_Y_THREADS, 0, stream>>>(
-        x.data_ptr<float>(), z.data_ptr<float>(), src.data_ptr<int32_t>(), dst.data_ptr<int32_t>(),
-        grad_edge.data_ptr<float>(), num_edges);
+            x.data_ptr<float>(), z.data_ptr<float>(), src.data_ptr<int32_t>(), dst.data_ptr<int32_t>(),
+            grad_edge.data_ptr<float>(), num_edges);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {{grad_x, grad_edge}};
 }}
@@ -935,7 +804,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("lunatp_uvwconv_bwd_dxdy_shared_launch_fp32", &lunatp_uvwconv_bwd_dxdy_shared_launch_fp32, "Graph-conv shared grad_x+grad_edge source-CSR backward launch");
 }}
 """.format(
-            mma_include=mma_include,
             specs_count=len(specs),
             x_threads=x_threads,
             y_threads=y_threads,
@@ -948,8 +816,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
             channel_type=channel_type,
             max_in_channels=max_in_channels,
             max_d3=max_d3,
-            make_uvw_conv_node_shared_source=make_uvw_conv_node_shared_source(
-                meta, "lunatp_uvwconv_bwd_xy_source_zgemm_fp32", arch=arch
+            node_tile_m=64,
+            node_contraction_source=make_uvw_conv_node_cutlass_source(
+                meta, "lunatp_uvwconv_bwd_xy_source_zgemm_fp32"
             ),
             x_lines=chr(10).join(x_lines),
             x_pair_lines=chr(10).join(x_pair_lines),
@@ -980,7 +849,7 @@ def make_uvw_conv_backward_dw_preprocess_shared_source(
     for group_id, ((_out_offset, _out_channels, d3), _group_specs) in enumerate(groups):
         params.append(f"    float* __restrict__ q_group{group_id},")
         allocs.append(
-            f"    q_groups.push_back(torch::empty({{{group_rows[group_id]}, num_nodes * int64_t({d3})}}, q_options));"
+            f"q_groups.push_back(torch::empty({{{group_rows[group_id]}, num_nodes * int64_t({d3})}}, q_options));"
         )
         ptrs.append(f"        q_groups[{group_id}].data_ptr<float>(),")
     cases = []
@@ -1012,23 +881,23 @@ def make_uvw_conv_backward_dw_preprocess_shared_source(
             const int s = __ldg(src + p);""".format().split("\n"))
         for i in unique_i:
             lines.append(
-                f"            const float xv{i} = __ldg(x + Index(s) * {in1_dim} + {x_offset} + {input_channel} * {d1} + {i});"
+                f"        const float xv{i} = __ldg(x + Index(s) * {in1_dim} + {x_offset} + {input_channel} * {d1} + {i});"
             )
         for j in unique_j:
             lines.append(
-                f"            const float yv{j} = __ldg(edge_attr + e * {in2_dim} + {edge_offset}{y_offset + j});"
+                f"        const float yv{j} = __ldg(edge_attr + e * {in2_dim} + {edge_offset}{y_offset + j});"
             )
         for i_idx, j_idx, k_idx, coeff in terms:
             lines.append(
-                f"""            acc{int(k_idx)} = fmaf({float_literal(float(coeff), meta.get("dtype"))}, xv{int(i_idx)} * yv{int(j_idx)}, acc{int(k_idx)});"""
-            )
-        lines.append("        }")
-        for k in range(d3):
-            lines.append(
-                f"        q_group{group_id}[({row_offset} + u) * (num_nodes * int64_t({d3})) + Index(node) * {d3} + {k}] = acc{k};"
+                f"""        acc{int(k_idx)} = fmaf({float_literal(float(coeff), meta.get("dtype"))}, xv{int(i_idx)} * yv{int(j_idx)}, acc{int(k_idx)});"""
             )
         lines.append("    }")
-        lines.append("    break;")
+        for k in range(d3):
+            lines.append(
+                f"    q_group{group_id}[({row_offset} + u) * (num_nodes * int64_t({d3})) + Index(node) * {d3} + {k}] = acc{k};"
+            )
+        lines.append("}")
+        lines.append("break;")
         lines.append("}")
         cases.append("\n".join(lines))
 
@@ -1055,15 +924,15 @@ def make_uvw_conv_backward_dw_preprocess_shared_source(
             )
         for i_idx, j_idx, k_idx, coeff in terms:
             pair_lines.append(
-                f"""            acc{int(k_idx)} = fmaf({float_literal(float(coeff), meta.get("dtype"))}, x0v{int(i_idx)} * y0v{int(j_idx)} + x1v{int(i_idx)} * y1v{int(j_idx)}, acc{int(k_idx)});"""
-            )
-        pair_lines.append("        }")
-        for k in range(d3):
-            pair_lines.append(
-                f"        q_group{group_id}[({row_offset} + u) * (num_nodes * int64_t({d3})) + Index(node) * {d3} + {k}] = acc{k};"
+                f"""        acc{int(k_idx)} = fmaf({float_literal(float(coeff), meta.get("dtype"))}, x0v{int(i_idx)} * y0v{int(j_idx)} + x1v{int(i_idx)} * y1v{int(j_idx)}, acc{int(k_idx)});"""
             )
         pair_lines.append("    }")
-        pair_lines.append("    break;")
+        for k in range(d3):
+            pair_lines.append(
+                f"    q_group{group_id}[({row_offset} + u) * (num_nodes * int64_t({d3})) + Index(node) * {d3} + {k}] = acc{k};"
+            )
+        pair_lines.append("}")
+        pair_lines.append("break;")
         pair_lines.append("}")
         pair_cases.append("\n".join(pair_lines))
 
@@ -1084,14 +953,14 @@ constexpr int GEN_NUM_GROUPS = {groups_count};
 
 
 __global__ __launch_bounds__(GEN_THREADS, 4)
-void lunatp_uvwconv_bwd_weight_grouped_q_fp32(
-    const float* __restrict__ x,
-    const float* __restrict__ edge_attr,
-    const int32_t* __restrict__ src,
-    const EdgeIndex* __restrict__ edge_by_dst,
-    const EdgeIndex* __restrict__ rowptr,
-{params}
-    int64_t num_nodes) {{
+    void lunatp_uvwconv_bwd_weight_grouped_q_fp32(
+        const float* __restrict__ x,
+        const float* __restrict__ edge_attr,
+        const int32_t* __restrict__ src,
+        const EdgeIndex* __restrict__ edge_by_dst,
+        const EdgeIndex* __restrict__ rowptr,
+        {params}
+        int64_t num_nodes) {{
     const Index node = blockIdx.x;
     const int spec = blockIdx.y;
     if (node >= num_nodes) return;
@@ -1099,22 +968,22 @@ void lunatp_uvwconv_bwd_weight_grouped_q_fp32(
     const Index e_end = __ldg(rowptr + node + 1);
     switch (spec) {{
 {cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
 __global__ __launch_bounds__(GEN_THREADS, 4)
-void lunatp_uvwconv_bwd_weight_grouped_q_pair_fp32(
-    const float* __restrict__ x0,
-    const float* __restrict__ edge0,
-    const float* __restrict__ x1,
-    const float* __restrict__ edge1,
-    const int32_t* __restrict__ src,
-    const EdgeIndex* __restrict__ edge_by_dst,
-    const EdgeIndex* __restrict__ rowptr,
-{params}
-    int64_t num_nodes) {{
+    void lunatp_uvwconv_bwd_weight_grouped_q_pair_fp32(
+        const float* __restrict__ x0,
+        const float* __restrict__ edge0,
+        const float* __restrict__ x1,
+        const float* __restrict__ edge1,
+        const int32_t* __restrict__ src,
+        const EdgeIndex* __restrict__ edge_by_dst,
+        const EdgeIndex* __restrict__ rowptr,
+        {params}
+        int64_t num_nodes) {{
     const Index node = blockIdx.x;
     const int spec = blockIdx.y;
     if (node >= num_nodes) return;
@@ -1122,8 +991,8 @@ void lunatp_uvwconv_bwd_weight_grouped_q_pair_fp32(
     const Index e_end = __ldg(rowptr + node + 1);
     switch (spec) {{
 {pair_cases}
-    default:
-        break;
+        default:
+            break;
     }}
 }}
 
@@ -1142,13 +1011,13 @@ std::vector<torch::Tensor> lunatp_uvwconv_bwd_weight_grouped_q_launch_fp32(
 {allocs}
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_weight_grouped_q_fp32<<<dim3(static_cast<unsigned int>(num_nodes), GEN_NUM_SPECS), GEN_THREADS, 0, stream>>>(
-        x.data_ptr<float>(),
-        edge_attr.data_ptr<float>(),
-        src.data_ptr<int32_t>(),
-        edge_by_dst.data_ptr<EdgeIndex>(),
-        rowptr.data_ptr<EdgeIndex>(),
+            x.data_ptr<float>(),
+            edge_attr.data_ptr<float>(),
+            src.data_ptr<int32_t>(),
+            edge_by_dst.data_ptr<EdgeIndex>(),
+            rowptr.data_ptr<EdgeIndex>(),
 {ptrs}
-        num_nodes);
+            num_nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return q_groups;
 }}
@@ -1168,15 +1037,15 @@ std::vector<torch::Tensor> lunatp_uvwconv_bwd_weight_grouped_q_pair_launch_fp32(
 {allocs}
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     if (num_nodes > 0) lunatp_uvwconv_bwd_weight_grouped_q_pair_fp32<<<dim3(static_cast<unsigned int>(num_nodes), GEN_NUM_SPECS), GEN_THREADS, 0, stream>>>(
-        x0.data_ptr<float>(),
-        edge0.data_ptr<float>(),
-        x1.data_ptr<float>(),
-        edge1.data_ptr<float>(),
-        src.data_ptr<int32_t>(),
-        edge_by_dst.data_ptr<EdgeIndex>(),
-        rowptr.data_ptr<EdgeIndex>(),
+            x0.data_ptr<float>(),
+            edge0.data_ptr<float>(),
+            x1.data_ptr<float>(),
+            edge1.data_ptr<float>(),
+            src.data_ptr<int32_t>(),
+            edge_by_dst.data_ptr<EdgeIndex>(),
+            rowptr.data_ptr<EdgeIndex>(),
 {ptrs}
-        num_nodes);
+            num_nodes);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return q_groups;
 }}
@@ -1190,706 +1059,956 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
             threads=threads,
             groups_count=len(groups),
             params=chr(10).join(params),
-            cases=chr(10).join(cases),
-            pair_cases=chr(10).join(pair_cases),
-            allocs=chr(10).join(allocs),
-            ptrs=chr(10).join(ptrs),
+            cases=textwrap.indent(chr(10).join(cases), '        '),
+            pair_cases=textwrap.indent(chr(10).join(pair_cases), '        '),
+            allocs=textwrap.indent(chr(10).join(allocs), '    '),
+            ptrs=textwrap.indent(chr(10).join(ptrs), '    '),
         ),
         meta.get("dtype", torch.float32),
     )
 
 
-def make_uvw_conv_backward_dw_reduce_shared_source(meta, *, arch):
+def make_uvw_conv_weight_cutlass_source(meta):
+    """Reduce Q × gradient with one fused CUTLASS mainloop and atomic epilogue."""
     groups, group_rows, _ = get_uvw_conv_weight_layout(meta["generated_specs"])
-    fp64 = meta.get("dtype") == torch.float64
-    mma = (
-        make_uvw_conv_gemm_mma(
-            meta,
-            "a[p][row*32+(input^((row&3)<<2))]",
-            "b[p][input*64+(column^((input&3)<<2))]",
-            arch=arch,
-        )
-        if fp64
-        else {
-            "declaration": r"""using Mma=cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<2,4,1>,float,cutlass::layout::RowMajor,float,cutlass::layout::RowMajor,float,cutlass::layout::RowMajor,cutlass::arch::OpMultiplyAdd>;
-    Mma::FragmentC acc;acc.clear();""",
-            "compute": r"""#pragma unroll 4
-        for(int k=0;k<32;++k) {
-            #pragma unroll
-            for(int p=0;p<Products;++p) {
-                Mma::FragmentA av;av[0]=a[p][local_row*32+(k^(local_row&7))];av[1]=a[p][(local_row+1)*32+(k^((local_row+1)&7))];
-                Mma::FragmentB bv;
-                #pragma unroll
-                for(int c=0;c<4;++c) bv[c]=b[p][k*64+local_column+c*16];
-                Mma()(acc,av,bv,acc);
-            }
-        }""",
-            "row": "row_base+local_row+r",
-            "column": "column_base+local_column+c*16",
-            "value": "acc[r*4+c]",
-            "rows": 2,
-            "columns": 4,
-        }
-    )
-    a_index = (
-        "(i/32)*32+((i%32)^(((i/32)&3)<<2))"
-        if fp64
-        else "(i/32)*32+((i%32)^((i/32)&7))"
-    )
-    b_index = "(i/64)*64+((i%64)^(((i/64)&3)<<2))" if fp64 else "i"
-    work_index = "Index" if fp64 else "int"
-    grad_position = (
-        "Index k=base+i/64; int column=column_base+i%64;"
-        if fp64
-        else "int k=base+i/64,column=column_base+i%64;"
-    )
-    row_type = "int64_t" if max(group_rows) > (1 << 31) - 16 else "Index"
-    row_base = "int64_t(blockIdx.y)*16" if row_type == "int64_t" else "blockIdx.y*16"
-    q_position = "Index row=row_base+i/32,k=base+i%32;"
-    if row_type == "int64_t":
-        q_position = "int64_t row=row_base+i/32; Index k=base+i%32;"
+    tiles = sum(((rows + 63) // 64) * ((key[1] + 63) // 64)
+                for rows, (key, _) in zip(group_rows, groups))
+    split_cap = max(MIN_WEIGHT_SPLITS, min(MAX_WEIGHT_SPLITS, MAX_WEIGHT_BLOCKS // max(1, tiles)))
+    declarations = []
     cases = []
-    for group, ((offset, channels, d3), specs) in enumerate(groups):
-        dimensions = f"constexpr int Rows={group_rows[group]},Columns={channels};"
-        if group_rows[group] > (1 << 31) - 16:
-            dimensions = f"constexpr int64_t Rows={group_rows[group]}; constexpr int Columns={channels};"
-        stores = []
-        for spec in specs:
-            begin = spec["row_offset"]
-            end = begin + spec["path_channels"]
-            stores.append(
-                f"""if(row>={begin} && row<{end}) atomicAdd(out+{spec["weight_offset"]}+int64_t(row-{begin})*{channels}+column,{mma["value"]});"""
-            )
-        cases.append(
-            r"""
+    for group, ((offset, channels, d), specs) in enumerate(groups):
+        stores = '\n'.join(f'if(r>={s["row_offset"]} && r<{s["row_offset"]+s["path_channels"]}) atomicAdd(pointer+{s["weight_offset"]}+int64_t(r-{s["row_offset"]})*{channels}+c,value);' for s in specs)
+        declarations.append(f'''
+template <typename Iterator> struct WeightOutput{group} : Iterator {{
+    using ThreadMap = typename Iterator::ThreadMap;
+    using Fragment = typename Iterator::Fragment;
+    using Params = typename Iterator::Params;
+    float *pointer;
+    CUTLASS_DEVICE WeightOutput{group}(Params const &p, float *out, cutlass::MatrixCoord extent, int thread,
+    cutlass::MatrixCoord offset = {{}}, int const *indices = nullptr)
+    : Iterator(p, out, extent, thread, offset, indices), pointer(out) {{
+    }}
+    CUTLASS_DEVICE void store(Fragment const &fragment) const {{
+        typename Iterator::Mask mask;
+        this->get_mask(mask);
+#pragma unroll
+        for (int cluster = 0; cluster < ThreadMap::Iterations::kCluster; ++cluster) {{
+#pragma unroll
+            for (int group = 0; group < ThreadMap::Iterations::kGroup; ++group) {{
+#pragma unroll
+                for (int row = 0; row < ThreadMap::Iterations::kRow; ++row) {{
+                    int r = this->thread_start_row() + row * ThreadMap::Delta::kRow + group * ThreadMap::Delta::kGroup +
+                    cluster * ThreadMap::Delta::kCluster;
+                    int fr = row + ThreadMap::Iterations::kRow * (group + ThreadMap::Iterations::kGroup * cluster);
+#pragma unroll
+                    for (int col = 0; col < ThreadMap::Iterations::kColumn; ++col) {{
+                        int c = this->thread_start_column() + col * ThreadMap::Delta::kColumn;
+                        float value = fragment[fr * ThreadMap::Iterations::kColumn + col];
+                        if (r < this->extent_row() && mask.predicates[col]) {{
+{textwrap.indent(stores, '                            ')}
+                        }}
+                    }}
+                }}
+            }}
+        }}
+    }}
+}};
+using Gemm{group} = cutlass::gemm::device::GemmUniversal<
+float, cutlass::layout::RowMajor, float, cutlass::layout::RowMajor, float, cutlass::layout::RowMajor, float,
+cutlass::arch::OpClassSimt, cutlass::arch::Sm80, cutlass::gemm::GemmShape<64, 64, 8>,
+cutlass::gemm::GemmShape<32, 32, 8>, cutlass::gemm::GemmShape<1, 1, 1>,
+cutlass::epilogue::thread::LinearCombination<float, 1, float, float>,
+cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, 2, 1, 1, cutlass::arch::OpMultiplyAdd,
+cutlass::ComplexTransform::kNone, cutlass::ComplexTransform::kNone, false, false, false, cutlass::layout::NoPermute,
+cutlass::layout::NoPermute, GradLayout<{d}, {meta['out_dim']}>>;
+''')
+        cases.append(f'''
 case {group}: {{
-    {dimensions}
-    const Index total_k=nodes*{d3};
-    if(row_base>=Rows || column_base>=Columns) return;
-    const Index tiles=(total_k+31)/32,per_split=(tiles+7)/8;
-    const Index begin=split*per_split*32,end=min(total_k,begin+per_split*32);
-    if(begin>=end) return;
-    {declaration}
-    for({work_index} base=begin;base<end;base+=32) {{
-        #pragma unroll
-        for(int p=0;p<Products;++p) {{
-            for(int i=threadIdx.x;i<512;i+=128) {{
-                {q_position}
-                a[p][{a_index}]=(row<Rows && k<end)?__ldg(inputs.q[p][{group}]+int64_t(row)*total_k+k):0.f;
-            }}
-            for(int i=threadIdx.x;i<2048;i+=128) {{
-                {grad_position}
-                b[p][{b_index}]=(k<end && column<Columns)?__ldg(inputs.g[p]+int64_t(k/{d3})*{out_dim}+{offset}+column*{d3}+k%{d3}):0.f;
-            }}
-        }}
-        __syncthreads();
-        {compute}
-        __syncthreads();
-    }}
-    #pragma unroll
-    for(int r=0;r<{rows};++r) {{
-        {row_type} row={row};
-        #pragma unroll
-        for(int c=0;c<{columns};++c) {{
-            int column={column};
-            if(row<Rows && column<Columns) {{
-                {stores}
-            }}
+    using Kernel=typename Gemm{group}::GemmKernel;
+    using Mma=typename Kernel::Mma;
+    using Base=typename Kernel::Epilogue;
+    using Epilogue=cutlass::epilogue::threadblock::Epilogue<typename Base::Shape,typename Base::WarpMmaOperator,Base::kPartitionsK,
+    WeightOutput{group}<typename Base::OutputTileIterator>,typename Base::AccumulatorFragmentIterator,typename Base::WarpTileIterator,
+    typename Base::SharedLoadIterator,typename Base::OutputOp,typename Base::Padding>;
+    auto& storage=shared.s{group};
+    const int row=blockIdx.y*64,column=blockIdx.x*64;
+    if(row>={group_rows[group]} || column>={channels}) return;
+    const int64_t total_k=nodes*{d};
+    // Partition by complete nodes so the gradient AoS origin stays aligned.
+    const int64_t nodes_per_split=(nodes+splits-1)/splits;
+    const int64_t first=split*nodes_per_split,count=min(nodes_per_split,nodes-first);
+    if(count<=0) return;
+    typename Mma::FragmentC accum;accum.clear();
+#pragma unroll
+    for(int p=0;p<Products;++p) {{
+        for(int64_t chunk=0;chunk<count;chunk+=(INT_MAX-8)/{d}) {{
+            const int k=min(int64_t((INT_MAX-8)/{d}),count-chunk)*{d};
+            typename Mma::IteratorA a(typename Mma::IteratorA::Params(cutlass::layout::RowMajor(total_k)),
+            const_cast<float*>(inputs.q[p][{group}]+(first+chunk)*{d}),{{{group_rows[group]},k}},threadIdx.x,{{row,0}});
+            typename Mma::IteratorB b(typename Mma::IteratorB::Params(cutlass::layout::RowMajor({meta['out_dim']})),
+            const_cast<float*>(inputs.g[p]+(first+chunk)*{meta['out_dim']}+{offset}),{{k,{channels}}},threadIdx.x,{{0,column}});
+            Mma mma(storage.main_loop,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+            mma((k+7)/8,accum,a,b,accum);__syncthreads();
         }}
     }}
+    typename Epilogue::OutputTileIterator output(typename Epilogue::OutputTileIterator::Params(cutlass::layout::RowMajor({channels})),out,{{{group_rows[group]},{channels}}},threadIdx.x,{{row,column}});
+    Epilogue epilogue(storage.epilogue,threadIdx.x,threadIdx.x/32,threadIdx.x%32);
+    epilogue(typename Kernel::EpilogueOutputOp(1.0f,0.0f),output,accum,output);
     return;
 }}
-""".format(
-                group=group,
-                dimensions=dimensions,
-                d3=d3,
-                declaration=mma["declaration"],
-                work_index=work_index,
-                q_position=q_position,
-                a_index=a_index,
-                grad_position=grad_position,
-                b_index=b_index,
-                out_dim=meta["out_dim"],
-                offset=offset,
-                compute=mma["compute"],
-                rows=mma["rows"],
-                row_type=row_type,
-                row=mma["row"],
-                columns=mma["columns"],
-                column=mma["column"],
-                stores=chr(10).join(stores),
-            )
-        )
-    mma_include = (
-        "\n" + get_fp64_mma(arch)[0] if meta.get("dtype") == torch.float64 else ""
-    )
-    return cuda_source_for_dtype(
-        r"""
+''')
+    source = f'''
 #include <ATen/ATen.h>
 #include <torch/csrc/utils/pybind.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cutlass/gemm/thread/mma.h>
-#include <vector>{mma_include}
-struct Inputs {{const float* q[2][{groups_count}];const float* g[2];}};
-template<int Products>
-__global__ __launch_bounds__(128,4)
-void lunatp_uvwconv_bwd_weight_shared_fp32(Inputs inputs,float* out,Index nodes) {{
-    __shared__ float a[Products][512];
-    __shared__ float b[Products][2048];
-    const {row_type} row_base={row_base}; const int column_base=blockIdx.x*64;
-    const int local_row=(threadIdx.x/16)*2,local_column=threadIdx.x%16;
-    const int split=blockIdx.z%8;
-    switch(blockIdx.z/8) {{
-{cases}
-    }}
+#include <vector>
+#include <cutlass/gemm/device/gemm_universal.h>
+#include <limits.h>
+struct Inputs {{const float* q[2][{len(groups)}];const float* g[2];}};
+template<int Components,int Stride> struct GradLayout {{
+    using Index=int32_t;using LongIndex=int64_t;
+    CUTLASS_HOST_DEVICE GradLayout(cutlass::layout::PitchLinearCoord,Index) {{}}
+    CUTLASS_HOST_DEVICE LongIndex operator()(cutlass::layout::PitchLinearCoord q) const {{return LongIndex(q.strided()/Components)*Stride+LongIndex(q.contiguous())*Components+q.strided()%Components;}}
+}};
+{''.join(declarations)}
+template<int Products> __global__ void lunatp_uvwconv_bwd_weight_shared_fp32(Inputs inputs,float* out,int64_t nodes) {{
+    union Storage {{ {' '.join(f"typename Gemm{i}::GemmKernel::SharedStorage s{i};" for i in range(len(groups)))} }};
+    __shared__ Storage shared;
+    const int splits=min(int64_t({split_cap}),max(int64_t({MIN_WEIGHT_SPLITS}),(nodes+{WEIGHT_SPLIT_NODES-1})/{WEIGHT_SPLIT_NODES}));
+    const int split=blockIdx.z%splits;
+    switch(blockIdx.z/splits) {{{chr(10).join(cases)}}}
 }}
+
 template<int Products>
 at::Tensor reduce(Inputs inputs,at::Tensor grad) {{
     c10::cuda::CUDAGuard guard(grad.device());
-    auto out=at::zeros({{{weight_numel}}},grad.options());
+    auto out=at::zeros({{{meta['weight_numel']}}},grad.options());
     if(grad.size(0)==0) return out;
+    const int64_t splits=std::min<int64_t>({split_cap},std::max<int64_t>({MIN_WEIGHT_SPLITS},(grad.size(0)+{WEIGHT_SPLIT_NODES-1})/{WEIGHT_SPLIT_NODES}));
     auto stream=at::cuda::getCurrentCUDAStream();
-    lunatp_uvwconv_bwd_weight_shared_fp32<Products><<<dim3({column_tiles},{row_tiles},{reduction_tasks}),128,0,stream>>>(inputs,out.data_ptr<float>(),grad.size(0));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
+    lunatp_uvwconv_bwd_weight_shared_fp32<Products><<<dim3({max((key[1]+63)//64 for key,_ in groups)},{max((r+63)//64 for r in group_rows)},splits*{len(groups)}),128,0,stream>>>(inputs,out.data_ptr<float>(),grad.size(0));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();return out;
 }}
 at::Tensor launch(std::vector<at::Tensor> q,at::Tensor g) {{
     Inputs inputs{{}};
-    for(int i=0;i<{groups_count};++i) inputs.q[0][i]=q[i].data_ptr<float>();
-    inputs.g[0]=g.data_ptr<float>();
-    return reduce<1>(inputs,g);
+    for(int i=0;i<{len(groups)};++i) inputs.q[0][i]=q[i].data_ptr<float>();
+    inputs.g[0]=g.data_ptr<float>();return reduce<1>(inputs,g);
 }}
 at::Tensor launch_pair(std::vector<at::Tensor> q0,std::vector<at::Tensor> q1,at::Tensor g0,at::Tensor g1) {{
     Inputs inputs{{}};
-    for(int i=0;i<{groups_count};++i) {{inputs.q[0][i]=q0[i].data_ptr<float>();inputs.q[1][i]=q1[i].data_ptr<float>();}}
-    inputs.g[0]=g0.data_ptr<float>();inputs.g[1]=g1.data_ptr<float>();
-    return reduce<2>(inputs,g0);
+    for(int i=0;i<{len(groups)};++i) {{inputs.q[0][i]=q0[i].data_ptr<float>();inputs.q[1][i]=q1[i].data_ptr<float>();}}
+    inputs.g[0]=g0.data_ptr<float>();inputs.g[1]=g1.data_ptr<float>();return reduce<2>(inputs,g0);
 }}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{m.def("launch",&launch);m.def("launch_pair",&launch_pair);}}
-""".format(
-            mma_include=mma_include,
-            groups_count=len(groups),
-            row_type=row_type,
-            row_base=row_base,
-            cases=chr(10).join(cases),
-            weight_numel=meta["weight_numel"],
-            column_tiles=(max((key[1] for key, _ in groups)) + 63) // 64,
-            row_tiles=(max(group_rows) + 15) // 16,
-            reduction_tasks=len(groups) * 8,
-        ),
-        meta.get("dtype", torch.float32),
-    )
+'''
+    return cuda_source_for_dtype(source, meta.get("dtype", torch.float32))
+
+
+def make_uvw_conv_tr_kernel(meta, program, inputs, outputs, kernel_name):
+    """Stream each W cell through factored T/R contractions for one edge channel."""
+    plan = make_tr_plan(program, outputs)
+    threads, path_tile, warps = 128, 128, 4
+    tasks, cases = 0, []
+    t_storage, r_storage = 1, 1
+    for spec in meta["generated_specs"]:
+        d1, d2, d3 = (spec[key] for key in ("d1", "d2", "d3"))
+        xo, yo, oo, wo = (spec[key] for key in ("x_offset", "y_offset", "out_offset", "weight_offset"))
+        edges, channels, paths = (spec[key] for key in ("edge_channels", "out_channels", "path_channels"))
+        columns = get_uvw_conv_tr_layout(meta, program, outputs, spec)["column_tile"]
+        parts, u_channels = columns // 8, paths // edges
+        column_tiles = (channels + columns - 1) // columns
+        u_tiles = (u_channels + path_tile - 1) // path_tile
+        count = edges * u_tiles * column_tiles
+        t_storage = max(t_storage, len(plan["t"]) * d1 * columns)
+        r_storage = max(r_storage, len(plan["r"]) * warps * d1 * columns)
+        lines = [f"if(local<{tasks+count}) {{",
+                 f"    const int v=(local-{tasks})%{edges};",
+                 f"    const int64_t begin=(local-{tasks})/{edges}/{column_tiles}*{path_tile};",
+                 f"    const int column_base=(local-{tasks})/{edges}%{column_tiles}*{columns};"]
+        for ti, group in enumerate(plan["t"]):
+            lines += [f"    for(int c=threadIdx.x;c<{columns};c+={threads}) {{",
+                      "        const int column=column_base+c;",
+                      *[f"        float t{i}=0.f;" for i in range(d1)], f"        if(column<{channels}) {{"]
+            for name in sorted({pair[0] for pair in group["products"]}):
+                for j in sorted({term[1] for term in spec["terms"]}):
+                    lines.append(f"            const float {name}{j}=__ldg({name}+int64_t(item)*{meta['in2_dim']}+{yo}+v*{d2}+{j});")
+            for name in sorted({pair[1] for pair in group["products"]}):
+                for k in sorted({term[2] for term in spec["terms"]}):
+                    lines.append(f"            const float {name}{k}=__ldg({name}+int64_t(dest_node)*{meta['out_dim']}+{oo}+column*{d3}+{k});")
+            for i, j, k, coefficient in spec["terms"]:
+                for edge, grad in group["products"]:
+                    lines.append(f"            t{i}=fmaf({float_literal(coefficient,meta.get('dtype'))}*{edge}{j},{grad}{k},t{i});")
+            lines += ["        }", *[f"        t_values[{(ti*d1+i)*columns}+c]=t{i};" for i in range(d1)], "    }"]
+        lines.append("    __syncthreads();")
+        for ri in range(len(plan["r"])):
+            lines += [f"    float r{ri}_{i}_{part}=0.f;" for i in range(d1) for part in range(parts)]
+        x_targets = tuple(target for target in program["x"] if target in outputs)
+        w_targets = tuple(target for target in program["w"] if target in outputs)
+        x_names = {feature for group in plan["r"] for feature, _ in group["products"]}
+        x_names.update(name for group in plan["t"] for (target, name), _ in group["consumers"] if target in w_targets)
+        weights = {weight for group in plan["r"] for _, weight in group["products"]}
+        weights.update(name for group in plan["t"] for (target, name), _ in group["consumers"] if target in x_targets)
+        lines += [f"    for(int row=threadIdx.x/8;row<{path_tile};row+=16) {{",
+                  "        const int64_t u=begin+row;",
+                  f"        const unsigned mask=__ballot_sync(0xffffffffu,u<{u_channels});",
+                  f"        if(u<{u_channels}) {{"]
+        for target in x_targets:
+            lines += [f"            float {target}{i}=0.f;" for i in range(d1)]
+        for name in sorted(x_names):
+            lines += [f"            const float {name}{i}=__ldg({name}+int64_t(source_node)*{meta['in1_dim']}+{xo}+u*{d1}+{i});" for i in range(d1)]
+        for part in range(parts):
+            lines += ["            {", f"                const int c={part*8}+lane%8,column=column_base+c;", f"                if(column<{channels}) {{"]
+            for weight in sorted(weights):
+                lines.append(f"                    const float value_{weight}=__ldg({weight}+int64_t(item)*{meta['weight_numel']}+{wo}+(u*{edges}+v)*{channels}+column);")
+            for target in w_targets:
+                lines.append(f"                    float value_{target}=0.f;")
+            for ti, group in enumerate(plan["t"]):
+                lines.append("                    {")
+                for i in range(d1):
+                    lines.append(f"                        const float t{i}=t_values[{(ti*d1+i)*columns}+c];")
+                for (target, name), repeat in group["consumers"]:
+                    for _ in range(repeat):
+                        for i in range(d1):
+                            if target in x_targets:
+                                lines.append(f"                        {target}{i}=fmaf(value_{name},t{i},{target}{i});")
+                            else:
+                                lines.append(f"                        value_{target}=fmaf({name}{i},t{i},value_{target});")
+                lines.append("                    }")
+            for ri, group in enumerate(plan["r"]):
+                for feature, weight in group["products"]:
+                    lines += [f"                    r{ri}_{i}_{part}=fmaf({feature}{i},value_{weight},r{ri}_{i}_{part});" for i in range(d1)]
+            for target in w_targets:
+                lines.append(f"                    {target}[int64_t(item)*{meta['weight_numel']}+{wo}+(u*{edges}+v)*{channels}+column]=value_{target};")
+            lines += ["                }", "            }"]
+        for target in x_targets:
+            for i in range(d1):
+                lines += ["#pragma unroll", "            for(int delta=4;delta;delta/=2)",
+                          f"            {target}{i}+=__shfl_down_sync(mask,{target}{i},delta,8);",
+                          f"            if(lane%8==0)atomicAdd({target}+int64_t(source_node)*{meta['in1_dim']}+{xo}+u*{d1}+{i},{target}{i});"]
+        lines += ["        }", "    }", "#pragma unroll", "    for(int delta=16;delta>=8;delta/=2) {"]
+        for ri in range(len(plan["r"])):
+            lines += [f"        r{ri}_{i}_{part}+=__shfl_down_sync(0xffffffffu,r{ri}_{i}_{part},delta);" for i in range(d1) for part in range(parts)]
+        lines += ["    }", "    if(lane<8) {"]
+        for ri in range(len(plan["r"])):
+            lines += [f"        r_partial[(({ri}*{warps}+warp)*{d1}+{i})*{columns}+{part*8}+lane]=r{ri}_{i}_{part};" for i in range(d1) for part in range(parts)]
+        lines += ["    }", "    __syncthreads();", f"    if(threadIdx.x<{columns}) {{",
+                  "        const int c=threadIdx.x,column=column_base+c;",
+                  f"        const int active_columns=min(32,{columns}-(threadIdx.x/32)*32);"]
+        y_targets = tuple(target for target in program["y"] if target in outputs)
+        for target in y_targets:
+            lines += [f"        float {target}{j}=0.f;" for j in range(d2)]
+        if "gg" in outputs:
+            lines += [f"        float gg{k}=0.f;" for k in range(d3)]
+        lines.append(f"        if(column<{channels}) {{")
+        for ri, group in enumerate(plan["r"]):
+            lines.append("            {")
+            for i in range(d1):
+                total = "+".join(f"r_partial[{((ri*warps+w)*d1+i)*columns}+c]" for w in range(warps))
+                lines.append(f"                const float r{i}={total};")
+            for (target, name), repeat in group["consumers"]:
+                lines.append("                {")
+                if target in y_targets:
+                    lines += [f"                    const float a{k}=__ldg({name}+int64_t(dest_node)*{meta['out_dim']}+{oo}+column*{d3}+{k});" for k in sorted({term[2] for term in spec["terms"]})]
+                else:
+                    lines += [f"                    const float a{j}=__ldg({name}+int64_t(item)*{meta['in2_dim']}+{yo}+v*{d2}+{j});" for j in sorted({term[1] for term in spec["terms"]})]
+                for _ in range(repeat):
+                    for i, j, k, coefficient in spec["terms"]:
+                        component, value = (j, k) if target in y_targets else (k, j)
+                        lines.append(f"                    {target}{component}=fmaf({float_literal(coefficient,meta.get('dtype'))}*r{i},a{value},{target}{component});")
+                lines.append("                }")
+            lines.append("            }")
+        if "gg" in outputs:
+            lines += [f"            atomicAdd(gg+int64_t(dest_node)*{meta['out_dim']}+{oo}+column*{d3}+{k},gg{k});" for k in range(d3)]
+        lines += ["        }", "        const unsigned active=__activemask();"]
+        for target in y_targets:
+            for j in range(d2):
+                lines += ["#pragma unroll", "        for(int delta=16;delta;delta/=2) {",
+                          f"            const float other=__shfl_down_sync(active,{target}{j},delta);",
+                          f"            if(lane+delta<active_columns){target}{j}+=other;", "        }",
+                          f"        if(lane==0)atomicAdd({target}+int64_t(item)*{meta['in2_dim']}+{yo}+v*{d2}+{j},{target}{j});"]
+        lines += ["    }", "    return;", "}"]
+        cases.append("\n".join(lines))
+        tasks += count
+    parameters = [f"const float* __restrict__ {name}" for name in inputs]
+    parameters += ["const int32_t* __restrict__ graph_src", "const int32_t* __restrict__ graph_dst"]
+    parameters += [f"float* __restrict__ {name}" for name in outputs]
+    source = f"""
+__global__ __launch_bounds__({threads}) void {kernel_name}({','.join(parameters)}) {{
+    const int64_t task = blockIdx.x, item = task / {tasks}, local = task % {tasks};
+    const int source_node = graph_src[item], dest_node = graph_dst[item];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    __shared__ float t_values[{t_storage}];
+    __shared__ float r_partial[{r_storage}];
+{textwrap.indent(chr(10).join(cases), '    ')}
+}}
+"""
+    return cuda_source_for_dtype(source, meta.get("dtype", torch.float32)), tasks, threads
+
+
+def select_uvw_conv_t_specs(meta, outputs):
+    """Choose the lower-FMA contraction order within one CTA's shared budget."""
+    if not all(name in outputs for name in ("gx", "gy", "gw")):
+        return ()
+    specs = meta["generated_specs"]
+    max_paths = max(spec["path_channels"] for spec in specs)
+    path_tile = min(128, max(32, 1 << (max_paths - 1).bit_length()))
+    element_size = 8 if meta.get("dtype", torch.float32) == torch.float64 else 4
+    cg_values = path_tile * max(spec["d3"] for spec in specs)
+    edge_values = max(spec["edge_channels"] * spec["d2"] for spec in specs)
+    available = 32 * 1024 - (cg_values + edge_values) * element_size
+    selected = []
+    for spec in specs:
+        columns = min(64, max(32, 1 << (spec["out_channels"] - 1).bit_length()))
+        values = spec["d1"] * spec["edge_channels"] * columns
+        if 3 * spec["d1"] < 2 * spec["d3"] and values * (1 + path_tile // 32) * element_size <= available:
+            selected.append(spec)
+    return tuple(selected)
+
+
+def emit_uvw_conv_t_backward(meta, spec, path_tile, threads, task_begin):
+    """Own one v so each W cell updates one R accumulator without predicates."""
+    d1, d2, d3 = (spec[k] for k in ("d1", "d2", "d3"))
+    xo, yo, oo, wo = (spec[k] for k in ("x_offset", "y_offset", "out_offset", "weight_offset"))
+    edges, channels, paths = (spec[k] for k in ("edge_channels", "out_channels", "path_channels"))
+    column_tile = min(64, max(32, 1 << (channels - 1).bit_length()))
+    column_parts = column_tile // 8
+    column_tiles = (channels + column_tile - 1) // column_tile
+    warps = threads // 32
+    rows = (paths + edges - 1) // edges
+    count = ((rows + path_tile - 1) // path_tile) * edges * column_tiles
+    lines = [f"if (local < {task_begin + count}) {{",
+             f"    const int64_t begin = (local - {task_begin}) / {edges * column_tiles} * {path_tile};",
+             f"    const int64_t v = (local - {task_begin}) / {column_tiles} % {edges};",
+             f"    const int column_base = (local - {task_begin}) % {column_tiles} * {column_tile};",
+             f"    for (int c = threadIdx.x; c < {column_tile}; c += {threads}) {{",
+             "        const int column = column_base + c;"]
+    lines += [f"        float t{i} = 0.f;" for i in range(d1)]
+    lines.append(f"        if (column < {channels}) {{")
+    lines += [f"            const float y{j} = __ldg(y + int64_t(item) * {meta['in2_dim']} + {yo} + v * {d2} + {j});"
+              for j in sorted({term[1] for term in spec["terms"]})]
+    lines += [f"            const float g{k} = __ldg(g + int64_t(dest_node) * {meta['out_dim']} + {oo} + column * {d3} + {k});"
+              for k in sorted({term[2] for term in spec["terms"]})]
+    for i, j, k, coefficient in spec["terms"]:
+        lines.append(f"            t{i} = fmaf({float_literal(coefficient, meta.get('dtype'))} * y{j}, g{k}, t{i});")
+    lines.append("        }")
+    lines += [f"        t_values[{i} * {column_tile} + c] = t{i};" for i in range(d1)]
+    lines += ["    }", "    __syncthreads();"]
+    lines += [f"    float r{i}_{part} = 0.f;" for i in range(d1) for part in range(column_parts)]
+    lines += [f"    for (int row = warp * 4 + lane / 8; row < {path_tile}; row += {warps * 4}) {{",
+              f"        const int64_t u = begin + row, p = u * {edges} + v;",
+              f"        const unsigned active = __ballot_sync(0xffffffffu, p < {paths});",
+              f"        if (p < {paths}) {{"]
+    lines += [f"            float dx{i} = 0.f;" for i in range(d1)]
+    lines += [f"            const float x{i} = __ldg(x + int64_t(source_node) * {meta['in1_dim']} + {xo} + u * {d1} + {i});" for i in range(d1)]
+    for part in range(column_parts):
+        lines += ["            {", f"                const int column = column_base + {part * 8} + lane % 8;",
+                  f"                if (column < {channels}) {{",
+                  f"                    const float value = __ldg(w + int64_t(item) * {meta['weight_numel']} + {wo} + p * {channels} + column);",
+                  "                    float dw = 0.f;"]
+        for i in range(d1):
+            lines += [f"                    const float t{i} = t_values[{i} * {column_tile} + {part * 8} + lane % 8];",
+                      f"                    dx{i} = fmaf(value, t{i}, dx{i});",
+                      f"                    dw = fmaf(x{i}, t{i}, dw);",
+                      f"                    r{i}_{part} = fmaf(x{i}, value, r{i}_{part});"]
+        lines += [f"                    gw[int64_t(item) * {meta['weight_numel']} + {wo} + p * {channels} + column] = dw;", "                }", "            }"]
+    lines += ["#pragma unroll", "            for (int delta = 4; delta; delta /= 2) {"]
+    lines += [f"                dx{i} += __shfl_down_sync(active, dx{i}, delta, 8);" for i in range(d1)]
+    lines += ["            }", "            if (lane % 8 == 0) {"]
+    lines += [f"                atomicAdd(gx + int64_t(source_node) * {meta['in1_dim']} + {xo} + u * {d1} + {i}, dx{i});" for i in range(d1)]
+    lines += ["            }", "        }", "    }"]
+    lines += ["#pragma unroll", "    for (int delta = 16; delta >= 8; delta /= 2) {"]
+    lines += [f"        r{i}_{part} += __shfl_down_sync(0xffffffffu, r{i}_{part}, delta);"
+              for i in range(d1) for part in range(column_parts)]
+    lines += ["    }", "    if (lane < 8) {"]
+    lines += [f"        r_partial[(warp * {d1} + {i}) * {column_tile} + {part * 8} + lane] = r{i}_{part};"
+              for i in range(d1) for part in range(column_parts)]
+    lines += ["    }", "    __syncthreads();", "    if (warp == 0) {"]
+    lines += [f"        float dy{j} = 0.f;" for j in range(d2)]
+    for part in range(column_tile // 32):
+        lines += ["        {", f"            const int column = column_base + {part * 32} + lane;"]
+        for i in range(d1):
+            values = " + ".join(f"r_partial[{(warp * d1 + i) * column_tile + part * 32} + lane]" for warp in range(warps))
+            lines.append(f"            const float r{i} = {values};")
+        lines.append(f"            if (column < {channels}) {{")
+        lines += [f"                const float g{k} = __ldg(g + int64_t(dest_node) * {meta['out_dim']} + {oo} + column * {d3} + {k});"
+                  for k in sorted({term[2] for term in spec["terms"]})]
+        for i, j, k, coefficient in spec["terms"]:
+            lines.append(f"                dy{j} = fmaf({float_literal(coefficient, meta.get('dtype'))} * r{i}, g{k}, dy{j});")
+        lines += ["            }", "        }"]
+    lines += ["#pragma unroll", "        for (int delta = 16; delta; delta /= 2) {"]
+    lines += [f"            dy{j} += __shfl_down_sync(0xffffffffu, dy{j}, delta);" for j in range(d2)]
+    lines += ["        }", "        if (lane == 0) {"]
+    lines += [f"            atomicAdd(gy + int64_t(item) * {meta['in2_dim']} + {yo} + v * {d2} + {j}, dy{j});" for j in range(d2)]
+    lines += ["        }", "    }", "    return;", "}"]
+    return lines, count
+
+
+def make_uvw_conv_input_gradient_kernel(meta, program, inputs, outputs, kernel_name):
+    """Stream eight-lane channel reductions, then consume CG paths in parallel."""
+    max_paths = max(spec["path_channels"] for spec in meta["generated_specs"])
+    path_tile = min(128, max(32, 1 << (max_paths - 1).bit_length()))
+    threads = path_tile
+    x_outputs = {k: v for k, v in program["x"].items() if k in outputs}
+    y_outputs = {k: v for k, v in program["y"].items() if k in outputs}
+    needed_z = {pair[1] for pairs in (*x_outputs.values(), *y_outputs.values()) for pair in pairs}
+    contractions = {k: v for k, v in program["z"].items() if k in needed_z}
+    cases, tasks = [], 0
+    max_edge = max(s["edge_channels"] * s["d2"] for s in meta["generated_specs"])
+    max_components = max(s["d3"] for s in meta["generated_specs"])
+    t_specs = select_uvw_conv_t_specs(meta, outputs)
+    for spec in meta["generated_specs"]:
+        d1, d2, d3 = (spec[k] for k in ("d1", "d2", "d3"))
+        xo, yo, oo, wo = (spec[k] for k in ("x_offset", "y_offset", "out_offset", "weight_offset"))
+        edges, channels, paths = (spec[k] for k in ("edge_channels", "out_channels", "path_channels"))
+        if spec in t_specs:
+            lines, count = emit_uvw_conv_t_backward(meta, spec, path_tile, threads, tasks)
+            cases.append("\n".join(lines))
+            tasks += count
+            continue
+        count = (paths + path_tile - 1) // path_tile
+        lines = [f"if (local < {tasks + count}) {{",
+                 f"    const int64_t begin = (local - {tasks}) * {path_tile};"]
+        for target in y_outputs:
+            lines.append(f"    for (int i = threadIdx.x; i < {edges * d2}; i += {threads}) shared_{target}[i] = 0.f;")
+        lines += [f"    for (int path = warp * 4 + lane / 8; path < {path_tile}; path += {threads // 8}) {{",
+                  f"        const int64_t p = begin + path, u = p / {edges}, v = p % {edges};",
+                  f"        const unsigned mask = __ballot_sync(0xffffffffu, p < {paths});",
+                  f"        if (p < {paths}) {{"]
+        for zname in contractions:
+            lines += [f"            float {zname}_{k} = 0.f;" for k in range(d3)]
+        lines += ["#pragma unroll 1", f"            for (int column_base = (lane % 8) * 4; column_base < {channels}; column_base += 32) {{",
+                  "#pragma unroll", "                for (int value = 0; value < 4; ++value) {",
+                  "                    const int column = column_base + value;",
+                  f"                    if (column < {channels}) {{"]
+        weights = tuple(dict.fromkeys(w for pairs in contractions.values() for w, _ in pairs))
+        gradients = tuple(dict.fromkeys(g for pairs in contractions.values() for _, g in pairs))
+        for weight in weights:
+            lines.append(f"                        const float value_{weight} = __ldg({weight} + int64_t(item) * {meta['weight_numel']} + {wo} + p * {channels} + column);")
+        for grad in gradients:
+            lines += [f"                        const float value_{grad}_{k} = __ldg({grad} + int64_t(dest_node) * {meta['out_dim']} + {oo} + column * {d3} + {k});" for k in range(d3)]
+        for zname, pairs in contractions.items():
+            for w, g in pairs:
+                lines += [f"                        {zname}_{k} = fmaf(value_{w}, value_{g}_{k}, {zname}_{k});" for k in range(d3)]
+        lines += ["                    }", "                }", "            }", "#pragma unroll", "            for (int delta = 4; delta; delta /= 2) {"]
+        for zname in contractions:
+            lines += [f"                {zname}_{k} += __shfl_down_sync(mask, {zname}_{k}, delta, 8);" for k in range(d3)]
+        lines += ["            }", "            if (lane % 8 == 0) {"]
+        for zi, zname in enumerate(contractions):
+            lines += [f"                z[path][{zi * max_components + k}] = {zname}_{k};" for k in range(d3)]
+        lines += ["            }", "        }", "    }", "    __syncthreads();",
+                  f"    if (begin + threadIdx.x < {paths}) {{",
+                  f"        const int64_t p = begin + threadIdx.x, u = p / {edges}, v = p % {edges};"]
+        for axis, targets in (("x", x_outputs), ("y", y_outputs)):
+            for target, pairs in targets.items():
+                width = d1 if axis == "x" else d2
+                lines += ["        {", f"            float result[{width}] = {{}};"]
+                for pair in pairs:
+                    name, zname = pair[:2]
+                    factor = f"*__ldg({pair[2]} + item)" if len(pair) == 3 and pair[2] is not None else ""
+                    for i, j, k, coeff in spec["terms"]:
+                        addr = (f"{name} + int64_t(item) * {meta['in2_dim']} + {yo} + v * {d2} + {j}" if axis == "x" else
+                                f"{name} + int64_t(source_node) * {meta['in1_dim']} + {xo} + u * {d1} + {i}")
+                        component = i if axis == "x" else j
+                        lines.append(f"            result[{component}] = fmaf({float_literal(coeff, meta.get('dtype'))} * __ldg({addr}){factor}, z[threadIdx.x][{list(contractions).index(zname) * max_components + k}], result[{component}]);")
+                for c in sorted({term[0 if axis == "x" else 1] for term in spec["terms"]}):
+                    if axis == "x":
+                        lines.append(f"            atomicAdd({target} + int64_t(source_node) * {meta['in1_dim']} + {xo} + u * {d1} + {c}, result[{c}]);")
+                    else:
+                        lines.append(f"            atomicAdd(shared_{target} + v * {d2} + {c}, result[{c}]);")
+                lines.append("        }")
+        lines.append("    }")
+        lines.append("    __syncthreads();")
+        for target in y_outputs:
+            lines += [f"    for (int i = threadIdx.x; i < {edges * d2}; i += {threads}) {{",
+                      f"        atomicAdd({target} + int64_t(item) * {meta['in2_dim']} + {yo} + i, shared_{target}[i]);", "    }"]
+        lines += ["    return;", "}"]
+        cases.append("\n".join(lines))
+        tasks += count
+    parameters = [f"const float* {name}" for name in inputs]
+    parameters += ["const int32_t* graph_src", "const int32_t* graph_dst"]
+    parameters += [f"float* {name}" for name in outputs]
+    scratch = "\n".join(f"__shared__ float shared_{target}[{max_edge}];" for target in y_outputs)
+    scratch += f"\n__shared__ float z[{path_tile}][{len(contractions) * max_components}];"
+    if t_specs:
+        values = max(s["d1"] * min(64, max(32, 1 << (s["out_channels"] - 1).bit_length())) for s in t_specs)
+        scratch += f"\n__shared__ float t_values[{values}], r_partial[{threads // 32 * values}];"
+    source = f"""
+__global__ __launch_bounds__({threads}) void {kernel_name}({','.join(parameters)}) {{
+    const int64_t task = blockIdx.x, item = task / {tasks}, local = task % {tasks};
+    const int source_node = graph_src[item], dest_node = graph_dst[item];
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+{textwrap.indent(scratch, '    ')}
+{textwrap.indent(chr(10).join(cases), '    ')}
+}}
+"""
+    return cuda_source_for_dtype(source, meta.get("dtype", torch.float32)), tasks, threads
 
 
 def make_uvw_conv_backward_external_kernel(meta, program, inputs, outputs, kernel_name):
-    """Emit a path-major kernel; eight lanes cooperate on each path channel."""
-    specs = meta["generated_specs"]
+    """Reuse each weight in both channel and path contractions within a CTA."""
     x_outputs = {k: v for k, v in program["x"].items() if k in outputs}
     y_outputs = {k: v for k, v in program["y"].items() if k in outputs}
-    w_outputs = {k: v for k, v in program["w"].items() if k in outputs}
     e_outputs = {k: v for k, v in program.get("e", {}).items() if k in outputs}
-    needed_z = {
-        pair[1]
-        for pairs in (*x_outputs.values(), *y_outputs.values())
-        for pair in pairs
-    }
-    needed_z.update(z for pairs in e_outputs.values() for _, z in pairs)
+    needed_z = {p[1] for pairs in (*x_outputs.values(), *y_outputs.values(), *e_outputs.values()) for p in pairs}
     contractions = {k: v for k, v in program["z"].items() if k in needed_z}
-    forward_pairs = program["forward"] if "gg" in outputs else ()
-    needed_q = {q for pairs in w_outputs.values() for q, _ in pairs}
-    needed_q.update(q for q, _ in forward_pairs)
-    products = {k: v for k, v in program["cg"].items() if k in needed_q}
-    weights = sorted(
-        {w for pairs in contractions.values() for w, _ in pairs}
-        | {w for _, w in forward_pairs}
-    )
-    gradients = sorted(
-        {g for pairs in (*contractions.values(), *w_outputs.values()) for _, g in pairs}
-    )
-    max_edge = max(s["d2"] * s["edge_channels"] for s in specs)
-    max_d3 = max(s["d3"] for s in specs)
-    xdim, ydim, odim, wdim = (
-        meta[k] for k in ("in1_dim", "in2_dim", "out_dim", "weight_numel")
-    )
-    cases = []
-    for index, spec in enumerate(specs):
+    output_products = program["forward"] if "gg" in outputs else ()
+    weight_groups = {}
+    for zi, pairs in enumerate(contractions.values()):
+        for weight, grad in pairs:
+            weight_groups.setdefault(weight, {}).setdefault(grad, []).append(zi)
+    for _, weight in output_products:
+        weight_groups.setdefault(weight, {})
+    queries = tuple(dict.fromkeys(q for q, _ in output_products))
+    layout = get_uvw_conv_backward_layout(meta, program, outputs)
+    path_tile, column_tile = layout["path_tile"], layout["column_tile"]
+    threads, groups = layout["threads"], layout["groups"]
+    max_components = layout["components"]
+    z_stride, partial_stride = layout["z_stride"], layout["partial_stride"]
+    node_centered = bool(x_outputs)
+    tasks, cases = 0, []
+    for spec in meta["generated_specs"]:
         d1, d2, d3 = (spec[k] for k in ("d1", "d2", "d3"))
-        xo, yo, oo, wo = (
-            spec[k] for k in ("x_offset", "y_offset", "out_offset", "weight_offset")
-        )
-        edges, channels = spec["edge_channels"], spec["out_channels"]
-        path_type = "int64_t" if spec["path_channels"] > (1 << 31) - 16 else "int"
-        edge_size = edges * d2
-        # Large third-order contractions otherwise keep Z, all CG epilogue
-        # inputs and both edge accumulators live together. Shared memory bounds
-        # that register lifetime without materializing a global intermediate.
-        stage_z = len(contractions) * d3 > 24
-        lines = [f"case {index}: {{"]
-        lines += [f"float sums_{target}[{edge_size}]={{0.f}};" for target in y_outputs]
-        lines += [f"float scalar_{target}=0.f;" for target in e_outputs]
-        if forward_pairs:
-            lines += r"""using FMma=cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<1,{d3},1>,
-float,cutlass::layout::RowMajor,float,cutlass::layout::RowMajor,
-float,cutlass::layout::RowMajor,cutlass::arch::OpMultiplyAdd>;
-FMma::FragmentC forward_sum[{channels}];
-#pragma unroll
-for(int c=0;c<{channels};++c) forward_sum[c].clear();""".format(
-                d3=d3, channels=(channels + 7) // 8
-            ).split("\n")
-        lines += r"""#pragma unroll 1
-for({path_type} p=path_group;p<{path_channels};p+=16) {{
-int u=p/{edges},v=p%{edges};
-const unsigned mask={mask};""".format(
-            path_type=path_type,
-            path_channels=spec["path_channels"],
-            edges=edges,
-            # Four eight-lane path groups fill a warp. Tail groups retain
-            # their active mask; complete warps use a compile-time mask.
-            mask="0xffffffffu" if spec["path_channels"] % 4 == 0 else "__activemask()",
-        ).split("\n")
-        if stage_z:
-            lines.append("{")
-        lines += f"using ZMma=cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<1,{d3},1>,\nfloat,cutlass::layout::RowMajor,float,cutlass::layout::RowMajor,\nfloat,cutlass::layout::RowMajor,cutlass::arch::OpMultiplyAdd>;".split(
-            "\n"
-        )
-        for name in contractions:
-            lines += [f"ZMma::FragmentC contract_{name}; contract_{name}.clear();"]
-        if products:
-            lines += f"using WMma=cutlass::gemm::thread::Mma<cutlass::gemm::GemmShape<1,1,{d3}>,\nfloat,cutlass::layout::RowMajor,float,cutlass::layout::ColumnMajor,\nfloat,cutlass::layout::RowMajor,cutlass::arch::OpMultiplyAdd>;".split(
-                "\n"
-            )
-        for name, pairs in products.items():
-            lines += [f"WMma::FragmentA product_{name};", "{"]
-            lines += [f"float z{k}=0.f;" for k in range(d3)]
-            lines.append("if(lane==0) {")
-            # Reuse the CG accumulator while releasing each pair of inputs.
-            for pair in pairs:
-                lines += [
-                    "{",
-                    emit_cg_source(meta, spec, pairs=(pair,), x_row="source_node"),
-                    "}",
-                ]
-            lines.append("}")
-            lines += [
-                f"product_{name}[{k}]=__shfl_sync(mask,z{k},0,8);" for k in range(d3)
-            ]
-            lines.append("}")
-        lines += [
-            "#pragma unroll" if forward_pairs else "#pragma unroll 1",
-            f"for(int c=lane;c<{channels};c+=8) {{",
-        ]
-        for name in weights:
-            lines += f"ZMma::FragmentA weight_{name};\nweight_{name}[0]=__ldg({name}+int64_t(item)*{wdim}+{wo}+p*{channels}+c);".split(
-                "\n"
-            )
-        for name in gradients:
-            lines += [f"ZMma::FragmentB grad_{name};"]
-            lines += [
-                f"grad_{name}[{k}]=__ldg({name}+int64_t(dest_node)*{odim}+{oo}+c*{d3}+{k});"
-                for k in range(d3)
-            ]
-        for target, pairs in contractions.items():
-            for w, g in pairs:
-                lines += [
-                    f"ZMma()(contract_{target},weight_{w},grad_{g},contract_{target});"
-                ]
-        for target, pairs in w_outputs.items():
-            lines += [f"WMma::FragmentC delta_{target}; delta_{target}.clear();"]
-            for q, g in pairs:
-                lines += [
-                    f"WMma()(delta_{target},product_{q},grad_{g},delta_{target});"
-                ]
-            lines += [
-                f"{target}[int64_t(item)*{wdim}+{wo}+p*{channels}+c]=delta_{target}[0];"
-            ]
-        for q, w in forward_pairs:
-            lines.append(
-                f"FMma()(forward_sum[c/8],weight_{w},product_{q},forward_sum[c/8]);"
-            )
-        lines.append("}")
-        if contractions:
-            lines += ["#pragma unroll", "for(int delta=4;delta>0;delta>>=1) {"]
-            for name in contractions:
-                lines += [
-                    f"contract_{name}[{k}]+=__shfl_down_sync(mask,contract_{name}[{k}],delta,8);"
-                    for k in range(d3)
-                ]
-            lines.append("}")
-        # Release high-order Z before loading the CG epilogue inputs.
-        z_values = {}
-        for z_index, name in enumerate(contractions):
+        xo, yo, oo, wo = (spec[k] for k in ("x_offset", "y_offset", "out_offset", "weight_offset"))
+        edges, channels, paths = (spec[k] for k in ("edge_channels", "out_channels", "path_channels"))
+        count = (paths + path_tile - 1) // path_tile
+        lines = [f"if(local<{tasks+count}) {{", f"    const int64_t begin=(local-{tasks})*{path_tile};"]
+        if node_centered:
+            for target in x_outputs:
+                lines.append(f"    float node_{target}[{d1}]={{}};")
+            lines += [f"    for(int64_t position=int64_t(src_rowptr[source_node])+partition;position<src_rowptr[source_node+1];position+={BACKWARD_NEIGHBOR_SPLITS}) {{",
+                      "        const EdgeIndex item=edge_by_src[position];",
+                      "        const int dest_node=graph_dst[item];"]
+        for target in y_outputs:
+            lines.append(f"    for(int i=threadIdx.x;i<{edges*d2};i+={threads})edge_{target}[i]=0.f;")
+        for target in e_outputs:
+            lines.append(f"    if(threadIdx.x==0)scalar_{target}=0.f;")
+        lines += [f"    for(int i=threadIdx.x;i<{path_tile*z_stride};i+={threads})z[i]=0.f;", "    __syncthreads();"]
+        for qi, query in enumerate(queries):
+            lines += [f"    if(threadIdx.x<{path_tile} && begin+threadIdx.x<{paths}) {{",
+                      f"        const int64_t p=begin+threadIdx.x,u=p/{edges},v=p%{edges};",
+                      *[f"        float z{k}=0.f;" for k in range(d3)],
+                      textwrap.indent(emit_cg_source(meta, spec, pairs=program["cg"][query], x_row="source_node"), '        '),
+                      *[f"        query_values[({qi}*{path_tile}+threadIdx.x)*{max_components}+{k}]=z{k};" for k in range(d3)], "    }"]
+        if queries:
+            lines.append("    __syncthreads();")
+        weight_items = tuple(weight_groups.items())
+        cached_gradients = tuple(dict.fromkeys(
+            grad for products in contractions.values() for _, grad in products
+        ))
+        ncolumns = (min(channels, column_tile) + 7) // 8
+        lines += ["    {", f"        for(int column_base=0;column_base<{channels};column_base+={column_tile}) {{"]
+        for grad in cached_gradients:
+            lines += [f"            float cached_{grad}[{ncolumns*d3}]={{}};",
+                      "#pragma unroll", f"            for(int tile=0;tile<{ncolumns};++tile) {{",
+                      "                const int column=column_base+tile*8+lane;", f"                if(column<{channels}) {{"]
             for k in range(d3):
-                if stage_z:
-                    address = f"path_group*{len(contractions) * d3}+{z_index * d3 + k}"
-                    lines += [f"if(lane==0) reduced_z[{address}]=contract_{name}[{k}];"]
-                    z_values[name, k] = f"reduced_z[{address}]"
-                else:
-                    z_values[name, k] = f"contract_{name}[{k}]"
-        if stage_z:
-            lines.append("}")
-        with_env = bool(program.get("e"))
-        if x_outputs or (y_outputs and not with_env):
-            lines.append("if(lane==0) {")
-            # A single contraction can feed X and Y together, overlapping
-            # their loads and arithmetic. Higher orders release one output's
-            # inputs before starting the next to bound register lifetime.
-            roles = [(target, pairs, "x") for target, pairs in x_outputs.items()]
-            if not with_env:
-                roles += [(target, pairs, "y") for target, pairs in y_outputs.items()]
-            groups = [roles] if len(contractions) == 1 else [[role] for role in roles]
-            for group in groups:
-                lines.append("{")
-                for target, pairs, axis in sorted(
-                    group, key=itemgetter(2), reverse=True
-                ):
-                    source_axis = 1 if axis == "x" else 0
-                    dim, offset, width, channel = (
-                        (ydim, yo, d2, "v") if axis == "x" else (xdim, xo, d1, "u")
-                    )
-                    for name in sorted({pair[0] for pair in pairs}):
-                        for component in sorted(
-                            {t[source_axis] for t in spec["terms"]}
-                        ):
-                            lines += [
-                                f"""float value_{name}_{component}=__ldg({name}+int64_t({("item" if axis == "x" else "source_node")})*{dim}+{offset}+{channel}*{width}+{component});"""
-                            ]
-                    prefix = target if len(group) > 1 else "acc"
-                    for component in sorted(
-                        {t[1 - source_axis] for t in spec["terms"]}
-                    ):
-                        lines += [f"float {prefix}{component}=0.f;"]
-                for i, j, k, coeff in spec["terms"]:
-                    for target, pairs, axis in group:
-                        component, source = (i, j) if axis == "x" else (j, i)
-                        prefix = target if len(group) > 1 else "acc"
-                        for pair in pairs:
-                            name, z = pair[:2]
-                            scalar = pair[2] if len(pair) == 3 else None
-                            factor = (
-                                f"*__ldg({scalar}+item)" if scalar is not None else ""
-                            )
-                            lines += [
-                                f"""{prefix}{component}=fmaf({float_literal(coeff, meta.get("dtype"))}*value_{name}_{source}{factor},{z_values[z, k]},{prefix}{component});"""
-                            ]
-                for target, pairs, axis in group:
-                    prefix = target if len(group) > 1 else "acc"
-                    for component in sorted(
-                        {t[0 if axis == "x" else 1] for t in spec["terms"]}
-                    ):
-                        if axis == "x":
-                            lines += [
-                                f"atomicAdd({target}+int64_t(source_node)*{xdim}+{xo}+u*{d1}+{component},{prefix}{component});"
-                            ]
-                        else:
-                            lines += [
-                                f"sums_{target}[v*{d2}+{component}]+={prefix}{component};"
-                            ]
-                lines.append("}")
-            lines.append("}")
-        if with_env and (y_outputs or e_outputs):
-            edge_scalar_products = {
-                edge_target: tuple(
-                    (edge_x, edge_y, edge_z)
-                    for edge_q, edge_z in edge_products
-                    for edge_x, edge_y, edge__ in program["cg"][edge_q]
-                )
-                for edge_target, edge_products in e_outputs.items()
+                lines.append(f"                    cached_{grad}[tile*{d3}+{k}]=__ldg({grad}+int64_t(dest_node)*{meta['out_dim']}+{oo}+column*{d3}+{k});")
+            lines += ["                }", "            }"]
+        if output_products:
+            lines.append(f"            float output_accum[{ncolumns*d3}]={{}};")
+        for first in range(0, len(weight_items), 2):
+            weights = tuple(weight for weight, _ in weight_items[first:first+2])
+            updates = {
+                zi: tuple((weight, grad) for weight, grad in products if weight in weights)
+                for zi, products in enumerate(contractions.values())
             }
-            edge_families = tuple(
-                dict.fromkeys(
-                    [
-                        (edge_x, edge_z)
-                        for edge_products in y_outputs.values()
-                        for edge_x, edge_z, edge__ in edge_products
-                    ]
-                    + [
-                        (edge_x, edge_z)
-                        for edge_products in edge_scalar_products.values()
-                        for edge_x, _, edge_z in edge_products
-                    ]
-                )
-            )
-            edge_components = sorted({int(edge_term[1]) for edge_term in spec["terms"]})
-            edge_lines = ["if(lane==0) {"]
-            for edge_x, edge_z in edge_families:
-                # A family stays live only until both of its consumers have used it.
-                # This avoids repeating CG or retaining all families' accumulators.
-                edge_lines.append("{")
-                for edge_i in sorted(
-                    {int(edge_term[0]) for edge_term in spec["terms"]}
-                ):
-                    edge_lines.append(
-                        f"""float value_x{edge_i}=__ldg({edge_x}+int64_t(source_node)*{meta["in1_dim"]}+{spec["x_offset"]}+u*{spec["d1"]}+{edge_i});"""
-                    )
-                edge_lines += [
-                    f"float value_y{edge_j}=0.f;" for edge_j in edge_components
-                ]
-                for edge_i, edge_j, edge_k, edge_coefficient in spec["terms"]:
-                    edge_lines.append(
-                        f"""value_y{edge_j}=fmaf({float_literal(edge_coefficient, meta.get("dtype"))}*value_x{edge_i},{z_values[edge_z, edge_k]},value_y{edge_j});"""
-                    )
-                for edge_target, edge_products in y_outputs.items():
-                    for edge_feature, edge_matrix, edge_scalar in edge_products:
-                        if (edge_feature, edge_matrix) == (edge_x, edge_z):
-                            edge_scale = (
-                                f"*__ldg({edge_scalar}+item)"
-                                if edge_scalar is not None
-                                else ""
-                            )
-                            edge_lines += [
-                                f"""sums_{edge_target}[v*{spec["d2"]}+{edge_j}]+=value_y{edge_j}{edge_scale};"""
-                                for edge_j in edge_components
-                            ]
-                for edge_target, edge_products in edge_scalar_products.items():
-                    for edge_feature, edge_edge, edge_matrix in edge_products:
-                        if (edge_feature, edge_matrix) == (edge_x, edge_z):
-                            for edge_j in edge_components:
-                                edge_value = f"""__ldg({edge_edge}+int64_t(item)*{meta["in2_dim"]}+{spec["y_offset"]}+v*{spec["d2"]}+{edge_j})"""
-                                edge_lines.append(
-                                    f"scalar_{edge_target}=fmaf(value_y{edge_j},{edge_value},scalar_{edge_target});"
-                                )
-                edge_lines.append("}")
-            edge_lines.append("}")
-            lines += edge_lines
-        lines.append("}")
-        if e_outputs:
-            lines.append("if(lane==0) {")
-            for target_index, target in enumerate(e_outputs):
-                lines.append(
-                    f"scalar_partial[{target_index * 16}+path_group]=scalar_{target};"
-                )
-            lines += "}\n__syncthreads();".split("\n")
-            for target_index, target in enumerate(e_outputs):
-                lines += r"""if(threadIdx.x=={target_thread}) {{
-float value=0.f;
-#pragma unroll
-for(int group=0;group<16;++group) value+=scalar_partial[{partial_base}+group];
-atomicAdd({target}+item,value);
-}}""".format(
-                    target_thread=target_index,
-                    partial_base=target_index * 16,
-                    target=target,
-                ).split("\n")
-        if forward_pairs:
-            # Each lane owns output columns; reduce the sixteen path groups
-            # once per CTA rather than atomically updating for every channel.
-            lines += [
-                "#pragma unroll",
-                f"for(int c=lane;c<{channels};c+=8) {{",
-                *[
-                    f"forward_partial[(path_group*{channels}+c)*{d3}+{k}]=forward_sum[c/8][{k}];"
-                    for k in range(d3)
-                ],
-                "}",
-                "__syncthreads();",
-                f"for(int j=threadIdx.x;j<{channels * d3};j+=128) {{",
-                "float value=0.f;",
-                "#pragma unroll",
-                f"for(int group=0;group<16;++group) value+=forward_partial[group*{channels * d3}+j];",
-                f"atomicAdd(gg+int64_t(dest_node)*{odim}+{oo}+j,value);",
-                "}",
-            ]
+            updates = {zi: products for zi, products in updates.items() if products}
+            pairs = {weight: tuple(q for q, w in output_products if w == weight) for weight in weights}
+            gradients = tuple(dict.fromkeys(
+                grad for products in updates.values() for _, grad in products
+            ))
+            lines.append("            {")
+            lines.append(f"                for(int row=group;row<{path_tile} && begin+row<{paths};row+={groups}) {{")
+            for zi in updates:
+                lines.append(f"                    float grad_accum{zi}[{d3}]={{}};")
+            for weight, queries_for_weight in pairs.items():
+                for k in range(d3):
+                    if queries_for_weight:
+                        value = "+".join(f"query_values[({queries.index(q)}*{path_tile}+row)*{max_components}+{k}]" for q in queries_for_weight)
+                        lines.append(f"                    const float q_{weight}{k}={value};")
+            lines += ["#pragma unroll", f"                    for(int tile=0;tile<{ncolumns};++tile) {{",
+                      "                        const int column=column_base+tile*8+lane;", f"                        if(column<{channels}) {{"]
+            for weight in weights:
+                lines.append(f"                            const float value_{weight}=__ldg({weight}+int64_t(item)*{meta['weight_numel']}+{wo}+(begin+row)*{channels}+column);")
+            for grad in gradients:
+                for k in range(d3):
+                    lines.append(f"                            const float value_{grad}{k}=cached_{grad}[tile*{d3}+{k}];")
+            for zi, products in updates.items():
+                for weight, grad in products:
+                    for k in range(d3):
+                        lines.append(f"                            grad_accum{zi}[{k}]=fmaf(value_{weight},value_{grad}{k},grad_accum{zi}[{k}]);")
+            for weight, queries_for_weight in pairs.items():
+                if queries_for_weight:
+                    for k in range(d3):
+                        lines.append(f"                            output_accum[tile*{d3}+{k}]=fmaf(value_{weight},q_{weight}{k},output_accum[tile*{d3}+{k}]);")
+            lines += ["                        }", "                    }"]
+            for zi in updates:
+                for k in range(d3):
+                    lines += ["#pragma unroll", "                    for(int delta=4;delta>0;delta/=2)",
+                              f"                    grad_accum{zi}[{k}]+=__shfl_down_sync(0xffu << (warp_lane & ~7),grad_accum{zi}[{k}],delta,8);",
+                              f"                    if(lane==0)z[row*{z_stride}+{zi*d3+k}]+=grad_accum{zi}[{k}];"]
+            lines.append("                }")
+            lines.append("            }")
+        if output_products:
+            lines += ["#pragma unroll", f"            for(int tile=0;tile<{ncolumns};++tile)",
+                      "#pragma unroll", f"            for(int k=0;k<{d3};++k)",
+                      f"            output_partial[group*{partial_stride}+(tile*8+lane)*{max_components}+k]=output_accum[tile*{d3}+k];",
+                      "            __syncthreads();", f"            for(int i=threadIdx.x;i<min({column_tile},{channels}-column_base)*{d3};i+={threads}) {{",
+                      f"                const int column=i/{d3},k=i%{d3};float value=0.f;",
+                      "#pragma unroll", f"                for(int p=0;p<{groups};++p)value+=output_partial[p*{partial_stride}+column*{max_components}+k];",
+                      f"                atomicAdd(gg+int64_t(dest_node)*{meta['out_dim']}+{oo}+(column_base+column)*{d3}+k,value);", "            }", "            __syncthreads();"]
+        lines += ["        }", "    }"]
+        lines.append("    __syncthreads();")
         if y_outputs:
-            lines += [
-                "if(lane==0) {",
-                "#pragma unroll",
-                f"for(int j=0;j<{edge_size};++j) {{",
-            ]
-            for target_index, target in enumerate(y_outputs):
-                lines += [
-                    f"edge_partial[{target_index * 16 * edge_size}+path_group*{edge_size}+j]=sums_{target}[j];"
-                ]
-            lines += r"""}}
-}}
-__syncthreads();
-for(int j=threadIdx.x;j<{size};j+=128) {{""".format(size=edge_size).split("\n")
-            for target_index, target in enumerate(y_outputs):
-                lines += r"""{{
-float value=0.f;
-#pragma unroll
-for(int group=0;group<16;++group) value+=edge_partial[{size_target_index}+group*{size}+j];
-atomicAdd({target}+int64_t(item)*{ydim}+{yo}+j,value);
-}}""".format(
-                    size_target_index=target_index * 16 * edge_size,
-                    size=edge_size,
-                    target=target,
-                    ydim=ydim,
-                    yo=yo,
-                ).split("\n")
+            lines.append(f"    const unsigned valid_path_mask=__ballot_sync(physical_warp_mask,threadIdx.x<{path_tile} && begin+threadIdx.x<{paths});")
+        lines += [f"    if(threadIdx.x<{path_tile} && begin+threadIdx.x<{paths}) {{",
+                  f"        const int row=threadIdx.x;const int64_t p=begin+row,u=p/{edges},v=p%{edges};"]
+        for axis, targets in (("x", x_outputs), ("y", y_outputs)):
+            for target, pairs in targets.items():
+                width = d1 if axis == "x" else d2
+                lines += ["        {", f"            float result[{width}]={{}};"]
+                for pair in pairs:
+                    name, zname = pair[:2]
+                    zi = list(contractions).index(zname)
+                    factor = f"*__ldg({pair[2]}+item)" if len(pair) == 3 and pair[2] is not None else ""
+                    for i, j, k, coeff in spec["terms"]:
+                        addr = f"{name}+int64_t(item)*{meta['in2_dim']}+{yo}+v*{d2}+{j}" if axis == "x" else f"{name}+int64_t(source_node)*{meta['in1_dim']}+{xo}+u*{d1}+{i}"
+                        component = i if axis == "x" else j
+                        lines.append(f"            result[{component}]=fmaf({float_literal(coeff,meta.get('dtype'))}*__ldg({addr}){factor},z[row*{z_stride}+{zi*d3+k}],result[{component}]);")
+                for c in sorted({term[0 if axis == "x" else 1] for term in spec["terms"]}):
+                    address = f"{target}+int64_t(source_node)*{meta['in1_dim']}+{xo}+u*{d1}+{c}" if axis == "x" else f"edge_{target}+v*{d2}+{c}"
+                    if axis == "x" and node_centered:
+                        lines.append(f"            node_{target}[{c}]+=result[{c}];")
+                    elif axis == "y":
+                        lines += ["            {", f"                float partial=result[{c}];", "                const unsigned mask=valid_path_mask;",
+                                  "#pragma unroll", f"                for(int delta={edges};delta<32;delta*=2) {{",
+                                  "                    const float other=__shfl_down_sync(mask,partial,delta);",
+                                  f"                    if(warp_lane+delta<32 && row+delta<{path_tile} && begin+row+delta<{paths})partial+=other;", "                }",
+                                  f"                if(warp_lane<{edges})atomicAdd({address},partial);", "            }"]
+                    else:
+                        lines.append(f"            atomicAdd({address},result[{c}]);")
+                lines.append("        }")
+        for target, pairs in e_outputs.items():
+            lines += ["        {", "            float value=0.f;"]
+            for q, zname in pairs:
+                zi = list(contractions).index(zname)
+                lines += ["            {", *[f"                float z{k}=0.f;" for k in range(d3)],
+                          textwrap.indent(emit_cg_source(meta,spec,pairs=program["cg"][q],x_row="source_node"), '                ')]
+                lines += [f"                value=fmaf(z{k},z[row*{z_stride}+{zi*d3+k}],value);" for k in range(d3)]
+                lines.append("            }")
+            lines += [f"            atomicAdd(&scalar_{target},value);", "        }"]
+        lines += ["    }", "    __syncthreads();"]
+        for target in y_outputs:
+            lines.append(f"    for(int i=threadIdx.x;i<{edges*d2};i+={threads})atomicAdd({target}+int64_t(item)*{meta['in2_dim']}+{yo}+i,edge_{target}[i]);")
+        for target in e_outputs:
+            lines.append(f"    if(threadIdx.x==0)atomicAdd({target}+item,scalar_{target});")
+        if node_centered:
+            lines += ["    __syncthreads();", "}", f"if(threadIdx.x<{path_tile} && begin+threadIdx.x<{paths}) {{", f"    const int64_t u=(begin+threadIdx.x)/{edges};"]
+            for target in x_outputs:
+                for c in sorted({term[0] for term in spec["terms"]}):
+                    lines.append(f"    atomicAdd({target}+int64_t(source_node)*{meta['in1_dim']}+{xo}+u*{d1}+{c},node_{target}[{c}]);")
             lines.append("}")
-        lines += ["return;", "}"]
+        lines += ["    return;", "}"]
         cases.append("\n".join(lines))
+        tasks += count
     parameters = [f"const float* __restrict__ {name}" for name in inputs]
     parameters += ["const int32_t* graph_src", "const int32_t* graph_dst"]
+    if node_centered:
+        parameters += ["const EdgeIndex* src_rowptr", "const EdgeIndex* edge_by_src"]
     parameters += [f"float* __restrict__ {name}" for name in outputs]
-    storage = []
-    if forward_pairs:
-        forward_size = max(s["out_channels"] * s["d3"] for s in specs)
-        storage.append(f"__shared__ float forward_partial[{16 * forward_size}];")
-    if y_outputs:
-        storage.append(
-            f"__shared__ float edge_partial[{16 * len(y_outputs) * max_edge}];"
-        )
-    if e_outputs:
-        storage.append(f"__shared__ float scalar_partial[{16 * len(e_outputs)}];")
-    if len(contractions) * max_d3 > 24:
-        storage.append(
-            f"__shared__ volatile float reduced_z[{16 * len(contractions) * max_d3}];"
-        )
-    # Large directional contractions need a larger per-thread register budget
-    # to avoid spilling the Z fragments into local memory.
-    resident_blocks = 2 if len(contractions) * max_d3 > 48 else 4
-    return cuda_source_for_dtype(
-        r"""
-__global__ __launch_bounds__(128,{resident_blocks})
-void {kernel_name}({parameters}) {{
-    int lane=threadIdx.x&7,path_group=threadIdx.x>>3;
-    Index item=blockIdx.x;
-    const int source_node=__ldg(graph_src+item),dest_node=__ldg(graph_dst+item);
-    {storage}
-    switch(blockIdx.y) {{
-{cases}
-    }}
-}}
-""".format(
-            resident_blocks=resident_blocks,
-            kernel_name=kernel_name,
-            parameters=",".join(parameters),
-            storage=chr(10).join(storage),
-            cases=chr(10).join(cases),
-        ),
-        meta.get("dtype", torch.float32),
+    task_decode = (
+        f"const int64_t task=blockIdx.x,source_node=task/{tasks*BACKWARD_NEIGHBOR_SPLITS},partition=task/{tasks}%{BACKWARD_NEIGHBOR_SPLITS},local=task%{tasks};\n"
+        "if(src_rowptr[source_node]+partition>=src_rowptr[source_node+1]) return;"
+        if node_centered else
+        f"const int64_t task=blockIdx.x,item=task/{tasks},local=task%{tasks};\n"
+        "const int source_node=graph_src[item],dest_node=graph_dst[item];"
     )
+    scratch = [f"__shared__ float z[{path_tile*z_stride}];"]
+    scratch.extend(f"__shared__ float edge_{name}[{max(s['edge_channels']*s['d2'] for s in meta['generated_specs'])}];" for name in y_outputs)
+    scratch.extend(f"__shared__ float scalar_{name};" for name in e_outputs)
+    if queries:
+        scratch.append(f"__shared__ float query_values[{len(queries)*path_tile*max_components}];")
+    if output_products:
+        scratch.append(f"__shared__ float output_partial[{groups*partial_stride}];")
+    source = f"""
+__global__ __launch_bounds__({threads}) void {kernel_name}({','.join(parameters)}) {{
+{textwrap.indent(task_decode, '    ')}
+    const int lane = threadIdx.x % 8, group = threadIdx.x / 8, warp_lane = threadIdx.x % 32;
+    const unsigned physical_warp_mask = 0x{(1 << min(threads,32))-1:08x}u;
+{textwrap.indent(''.join(scratch), '    ')}
+{textwrap.indent(chr(10).join(cases), '    ')}
+}}
+"""
+    return cuda_source_for_dtype(source, meta.get("dtype", torch.float32)), tasks, threads
+
+
+def make_uvw_conv_weight_gradient_kernel(
+    meta, program, inputs, outputs, kernel_name, *, static_columns=False,
+):
+    """Write the actual path/column cells after cooperative CG and gradient gathers."""
+    path_tile, column_tile, threads = 64, 64, 128
+    max_components = max(spec["d3"] for spec in meta["generated_specs"])
+    queries = tuple(dict.fromkeys(q for target in outputs for q, _ in program["w"][target]))
+    gradients = tuple(dict.fromkeys(g for target in outputs for _, g in program["w"][target]))
+    scalar_bytes = 8 if meta.get("dtype") == torch.float64 else 4
+    while max_components * (len(queries)*path_tile + len(gradients)*column_tile) * scalar_bytes > 47*1024:
+        if column_tile > 1:
+            column_tile //= 2
+        elif path_tile > 1:
+            path_tile //= 2
+        else:
+            raise ValueError("Weight-gradient tile exceeds shared memory capacity")
+    cases, tasks = [], 0
+    for spec in meta["generated_specs"]:
+        d3, channels, paths = (spec[k] for k in ("d3", "out_channels", "path_channels"))
+        columns = (channels + column_tile - 1) // column_tile
+        count = ((paths + path_tile - 1) // path_tile) * columns
+        lines = [f"if (local < {tasks + count}) {{",
+                 f"    const int64_t begin = (local - {tasks}) / {columns} * {path_tile};",
+                 f"    const int column = (local - {tasks}) % {columns} * {column_tile};",
+                 f"    const int rows = int(min(int64_t({path_tile}), int64_t({paths}) - begin));",
+                 f"    const int columns = min({column_tile}, {channels} - column);"]
+        for qi, q in enumerate(queries):
+            lines += [f"    if (threadIdx.x < {path_tile} && begin + threadIdx.x < {paths}) {{",
+                      f"        const int64_t p = begin + threadIdx.x, u = p / {spec['edge_channels']}, v = p % {spec['edge_channels']};"]
+            lines += [f"        float z{k} = 0.f;" for k in range(d3)]
+            lines.append(textwrap.indent(emit_cg_source(meta, spec, pairs=program["cg"][q], x_row="source_node"), '        '))
+            lines += [f"        q[{qi}][threadIdx.x][{k}] = z{k};" for k in range(d3)]
+            lines.append("    }")
+        for gi, grad in enumerate(gradients):
+            lines += [f"    for (int i = threadIdx.x; i < {column_tile * d3}; i += {threads}) {{",
+                      f"        const int c = i / {d3}, k = i % {d3};",
+                      f"        if (column + c < {channels}) grad[{gi}][c][k] = __ldg({grad} + int64_t(dest_node) * {meta['out_dim']} + {spec['out_offset']} + (column + c) * {d3} + k);",
+                      "    }"]
+        lines.append("    __syncthreads();")
+        worker = ["const int column_shift=min(5,32-__clz(unsigned(columns-1)));",
+                  "const int column_width=1<<column_shift;",
+                  "const int c=threadIdx.x&(column_width-1);",
+                  f"const int row_stride={threads}>>column_shift;"]
+        column_parts = (column_tile + 31) // 32
+        for gi, g in enumerate(gradients):
+            for part in range(column_parts):
+                for k in range(d3):
+                    worker.append(f"const float cached_{g}_{part}_{k}=c+{part}*column_width<columns?grad[{gi}][c+{part}*column_width][{k}]:0.f;")
+        worker += [f"for(int row=threadIdx.x>>column_shift;row<rows;row+=row_stride) {{"]
+        for qi, query in enumerate(queries):
+            for k in range(d3):
+                worker.append(f"    const float row_{query}_{k}=q[{qi}][row][{k}];")
+        for part in range(column_parts):
+            worker += [f"    if(c+{part}*column_width<columns) {{"]
+            for target in outputs:
+                worker.append(f"        float value_{target}=0.f;")
+                for query, grad in program["w"][target]:
+                    for k in range(d3):
+                        worker.append(f"        value_{target}=fmaf(row_{query}_{k},cached_{grad}_{part}_{k},value_{target});")
+                worker.append(f"        {target}[int64_t(item)*{meta['weight_numel']}+{spec['weight_offset']}+(begin+row)*{channels}+column+c+{part}*column_width]=value_{target};")
+            worker.append("    }")
+        worker.append("}")
+        if static_columns:
+            lines += ["    auto store_columns = [&](auto column_count) {",
+                      "        constexpr int columns = decltype(column_count)::value;"]
+            lines += worker
+            lines.append("    };")
+            tail = channels % column_tile
+            if channels <= column_tile:
+                lines.append(f"    store_columns(std::integral_constant<int,{channels}>{{}});")
+            elif tail:
+                lines += [f"    if (column < {channels - tail}) store_columns(std::integral_constant<int,{column_tile}>{{}});",
+                          f"    else store_columns(std::integral_constant<int,{tail}>{{}});"]
+            else:
+                lines.append(f"    store_columns(std::integral_constant<int,{column_tile}>{{}});")
+        else:
+            lines += worker
+        lines += ["    return;", "}"]
+        cases.append("\n".join(lines))
+        tasks += count
+    parameters = [f"const float* {name}" for name in inputs]
+    parameters += ["const int32_t* graph_src", "const int32_t* graph_dst"]
+    parameters += [f"float* {name}" for name in outputs]
+    source = f"""
+__global__ __launch_bounds__({threads})
+    void {kernel_name}({','.join(parameters)}) {{
+    const int64_t task = blockIdx.x, item = task / {tasks}, local = task % {tasks};
+    const int source_node = graph_src[item], dest_node = graph_dst[item];
+    __shared__ float q[{len(queries)}][{path_tile}][{max_components}];
+    __shared__ float grad[{len(gradients)}][{column_tile}][{max_components}];
+{textwrap.indent(chr(10).join(cases), '    ')}
+}}
+"""
+    if static_columns:
+        source = "#include <type_traits>\n" + source
+    return cuda_source_for_dtype(source, meta.get("dtype", torch.float32)), tasks, threads
 
 
 def make_external_backward_source(meta, program, inputs, outputs, phase, *, env=False):
-    """Bind one derivative program and emit its per-edge contractions."""
+    """Launch fused T/R paths and separate native gradient branches."""
+    requested_outputs = outputs
+    outputs = tuple(name for name in outputs
+                    if (name == "gg" and program["forward"])
+                    or any(name in program.get(axis, {}) for axis in ("x", "y", "w", "e")))
     prefix = f"lunatp_uvwconv_{phase}_external"
-    # Fuse the output derivative when its per-lane fragments fit the register budget.
-    # Wider contractions use a separate forward emitter.
-    forward_budget = max(
-        ((s["out_channels"] + 7) // 8) * s["d3"] for s in meta["generated_specs"]
-    )
-    fuse_forward = phase == "double_bwd" and "gg" in outputs and forward_budget <= 40
-    matrix_outputs = tuple(name for name in outputs if name != "gg" or fuse_forward)
-    max_d3 = max(s["d3"] for s in meta["generated_specs"])
-    fragment_count = len(program["z"]) + len(program["cg"])
-    if env:
-        # Envelope-only CG terms are consumed after the matrix loop; they do
-        # not keep WMma fragments live. Count only the actual fused consumers.
-        needed_q = {
-            q for target in matrix_outputs for q, _ in program["w"].get(target, ())
-        }
-        if fuse_forward:
-            needed_q.update(q for q, _ in program["forward"])
-        needed_z = {
-            term[1]
-            for axis in ("x", "y", "e")
-            for target in matrix_outputs
-            for term in program[axis].get(target, ())
-        }
-        fragment_count = len(needed_z) + len(needed_q)
-    # Separate XY and weight work when their combined fragments would crowd
-    # registers. Both phases use this same emitter and write final outputs.
-    if fragment_count * max_d3 > 64:
-        phases = (
-            tuple(k for k in matrix_outputs if k not in program["w"]),
-            tuple(k for k in matrix_outputs if k in program["w"]),
-        )
-    else:
-        phases = (matrix_outputs,)
+    # Separate dense weight-gradient kernels own specs outside the T/R paths.
+    matrix_outputs = tuple(name for name in outputs if name != "gg")
+    input_outputs=tuple(k for k in matrix_outputs if k not in program["w"])
+    fused_output="gg" in outputs and bool(input_outputs)
+    native_outputs = tuple(name for name in outputs
+                           if name not in program["w"] and (name != "gg" or fused_output))
+    weight_outputs = tuple(name for name in outputs if name in program["w"])
+    native_first = phase == "bwd" and not env and meta.get("dtype", torch.float32) == torch.float32
     kernels, branches = [], []
-    for index, phase_outputs in enumerate(phases):
-        if not phase_outputs:
-            continue
-        name = f"{prefix}_fused_{index}_fp32"
-        kernels.append(
-            make_uvw_conv_backward_external_kernel(
-                meta, program, inputs, phase_outputs, name
+    if native_first:
+        phases = (input_outputs, weight_outputs)
+        t_specs = select_uvw_conv_t_specs(meta, outputs)
+        if t_specs:
+            phases = (phases[0] + phases[1], phases[1])
+        for index, phase_outputs in enumerate(phases):
+            if not phase_outputs:
+                continue
+            phase_meta = meta
+            if t_specs and index == 1:
+                phase_meta = {**meta, "generated_specs": tuple(
+                    spec for spec in meta["generated_specs"] if spec not in t_specs
+                )}
+                if not phase_meta["generated_specs"]:
+                    continue
+            name = f"{prefix}_fused_{index}_fp32"
+            if index == 0:
+                kernel, tasks, threads = make_uvw_conv_input_gradient_kernel(
+                    phase_meta, program, inputs, phase_outputs, name
+                )
+            else:
+                name = f"{prefix}_weight_fp32"
+                kernel, tasks, threads = make_uvw_conv_weight_gradient_kernel(
+                    phase_meta, program, inputs, phase_outputs, name, static_columns=True
+                )
+            kernels.append(kernel)
+            args = ",".join(f"{name}.data_ptr<float>()" for name in inputs)
+            args += ",src.data_ptr<int32_t>(),dst.data_ptr<int32_t>()," + ",".join(
+                f"{name}.data_ptr<float>()" for name in phase_outputs
             )
-        )
-        args = ",".join(f"{name}.data_ptr<float>()" for name in inputs)
-        args += ",src.data_ptr<int32_t>(),dst.data_ptr<int32_t>()," + ",".join(
-            f"{name}.data_ptr<float>()" for name in phase_outputs
-        )
-        branches.append([
-            f"""{name}<<<dim3(items,{len(meta["generated_specs"])}),128,0,stream>>>({args});"""
-        ])
-    if "gg" in outputs and not fuse_forward:
+            branch_stream = "stream" if not branches else f"state.streams[{len(branches) - 1}]"
+            branches.append([f"{name}<<<items*{tasks},{threads},0,{branch_stream}>>>({args});"])
+    else:
+        groups = {}
+        for spec in meta["generated_specs"]:
+            layout = get_uvw_conv_tr_layout(meta, program, outputs, spec)
+            key = ("tr", spec["d1"], spec["d3"]) if layout is not None else ("z", spec["d3"])
+            groups.setdefault(key, []).append(spec)
+        main_branch, weight_groups = [], {}
+        for key, specs in groups.items():
+            tr_axis = key[0] == "tr"
+            phase_outputs = outputs if tr_axis else native_outputs
+            group_meta = {**meta, "generated_specs": specs}
+            if phase_outputs:
+                suffix = "_".join(str(part) for part in key)
+                name = f"{prefix}_fused_{suffix}_fp32"
+                generate = make_uvw_conv_tr_kernel if tr_axis else make_uvw_conv_backward_external_kernel
+                kernel, tasks, threads = generate(group_meta, program, inputs, phase_outputs, name)
+                kernels.append(kernel)
+                node_centered = not tr_axis and any(name in program["x"] for name in phase_outputs)
+                args = ",".join(f"{name}.data_ptr<float>()" for name in inputs)
+                args += ",src.data_ptr<int32_t>(),dst.data_ptr<int32_t>()"
+                if node_centered:
+                    args += ",src_rowptr.data_ptr<EdgeIndex>(),edge_by_src.data_ptr<EdgeIndex>()"
+                args += "," + ",".join(f"{name}.data_ptr<float>()" for name in phase_outputs)
+                grid = f"nodes*{BACKWARD_NEIGHBOR_SPLITS}" if node_centered else "items"
+                branch_stream = "stream" if not main_branch else f"state.streams[{len(main_branch) - 1}]"
+                main_branch.append(f"{name}<<<{grid}*{tasks},{threads},0,{branch_stream}>>>({args});")
+            if not tr_axis and weight_outputs:
+                weight_groups.setdefault(key[1], []).extend(specs)
+        branches.extend([launch] for launch in main_branch)
+        weight_branch = []
+        branch_stream = "stream" if not branches else f"state.streams[{len(branches) - 1}]"
+        for components, specs in weight_groups.items():
+            name = f"{prefix}_weight_d{components}_fp32"
+            group_meta = {**meta, "generated_specs": specs}
+            kernel, tasks, threads = make_uvw_conv_weight_gradient_kernel(
+                group_meta, program, inputs, weight_outputs, name
+            )
+            kernels.append(kernel)
+            args = ",".join(f"{name}.data_ptr<float>()" for name in inputs)
+            args += ",src.data_ptr<int32_t>(),dst.data_ptr<int32_t>()"
+            args += "," + ",".join(f"{name}.data_ptr<float>()" for name in weight_outputs)
+            weight_branch.append(f"{name}<<<items*{tasks},{threads},0,{branch_stream}>>>({args});")
+        if weight_branch:
+            branches.append(weight_branch)
+    if "gg" in outputs and not fused_output:
         products = tuple((program["cg"][q], w) for q, w in program["forward"])
         name = f"{prefix}_g_fp32"
-        kernel, grid, clear, pointer_order = make_uvw_conv_forward_external_kernel(
+        kernel, grid, clear, pointer_order, forward_threads = make_uvw_conv_forward_external_kernel(
             meta, products, name
         )
         kernels.insert(0, kernel)
         output_branch = []
+        branch_stream = "stream" if not branches else f"state.streams[{len(branches) - 1}]"
         if clear:
             output_branch.append(
-                "C10_CUDA_CHECK(cudaMemsetAsync(gg.data_ptr<float>(),0,gg.numel()*sizeof(float),stream));"
+                f"C10_CUDA_CHECK(cudaMemsetAsync(gg.data_ptr<float>(),0,gg.numel()*sizeof(float),{branch_stream}));"
             )
         args = ",".join(f"{name}.data_ptr<float>()" for name in pointer_order)
         output_branch.append(
-            f"{name}<<<{grid},128,0,stream>>>({args},src.data_ptr<int32_t>(),dst.data_ptr<int32_t>(),gg.data_ptr<float>(),items);"
+            f"{name}<<<{grid},{forward_threads},0,{branch_stream}>>>({args},src.data_ptr<int32_t>(),edge_by_dst.data_ptr<EdgeIndex>(),dst_rowptr.data_ptr<EdgeIndex>(),gg.data_ptr<float>(),nodes);"
         )
         branches.append(output_branch)
     launches = [line for branch in branches for line in branch]
     stream_state, state_parameter, stream_binding = "", "", ""
-    # Each branch writes distinct outputs. Fork after zeroing the accumulators,
-    # and join before returning them to the caller's stream.
+    # Contributions use atomic sums or disjoint weight slices. Fork after
+    # zeroing accumulators, and join before returning to the caller's stream.
     if len(branches) > 1:
         count = len(branches) - 1
-        stream_state = r"""
-struct BranchStreams {
-    BranchStreams(int device, const std::vector<int64_t>& handles) {
+        stream_state = f"""
+struct BranchStreams {{
+    BranchStreams(int device, const std::vector<int64_t> &handles) {{
         c10::cuda::CUDAGuard guard(device);
         C10_CUDA_CHECK(cudaEventCreateWithFlags(&start, cudaEventDisableTiming));
         for (auto handle : handles)
             streams.push_back(at::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(handle), device));
-        for (auto& event : done)
+        for (auto &event : done)
             C10_CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
-    }
-    ~BranchStreams() noexcept {
+    }}
+    ~BranchStreams() noexcept {{
         int previous = -1;
-        if (cudaGetDevice(&previous) != cudaSuccess) return;
+        if (cudaGetDevice(&previous) != cudaSuccess)
+            return;
         const int device = streams.front().device_index();
-        if (previous != device && cudaSetDevice(device) != cudaSuccess) return;
+        if (previous != device && cudaSetDevice(device) != cudaSuccess)
+            return;
         cudaEventDestroy(start);
-        for (auto event : done) cudaEventDestroy(event);
-        if (previous != device) cudaSetDevice(previous);
-    }
-    BranchStreams(const BranchStreams&) = delete;
-    BranchStreams& operator=(const BranchStreams&) = delete;
+        for (auto event : done)
+            cudaEventDestroy(event);
+        if (previous != device)
+            cudaSetDevice(previous);
+    }}
+    BranchStreams(const BranchStreams &) = delete;
+    BranchStreams &operator=(const BranchStreams &) = delete;
     std::vector<at::cuda::CUDAStream> streams;
     cudaEvent_t start = nullptr;
-    cudaEvent_t done[COUNT] = {};
-};
-""".replace("COUNT", str(count))
+    cudaEvent_t done[{count}] = {{}};
+}};
+"""
         state_parameter = "BranchStreams& state,"
         stream_binding = f"""
-pybind11::class_<BranchStreams>(m,"_Streams",pybind11::module_local())
-    .def(pybind11::init<int,const std::vector<int64_t>&>());
-m.attr("_Streams").attr("stream_count")={count};
-m.attr("_Streams").attr("stream_priority")=0;
+    pybind11::class_<BranchStreams>(m, "_Streams", pybind11::module_local())
+        .def(pybind11::init<int, const std::vector<int64_t> &>());
+    m.attr("_Streams").attr("stream_count") = {count};
+    m.attr("_Streams").attr("stream_priority") = 0;
 """
-        launches = ["C10_CUDA_CHECK(cudaEventRecord(state.start, stream));"]
+        launches = ["C10_CUDA_CHECK(cudaEventRecord(state.start, stream));"] + branches[0]
         for index, branch in enumerate(branches[1:]):
             launches += [f"C10_CUDA_CHECK(cudaStreamWaitEvent(state.streams[{index}], state.start, 0));"]
-            launches += [line.replace(",0,stream", f",0,state.streams[{index}]")
-                         .replace(",stream));", f",state.streams[{index}]));") for line in branch]
+            launches += branch
             launches += [f"C10_CUDA_CHECK(cudaEventRecord(state.done[{index}], state.streams[{index}]));"]
-        launches += branches[0]
         launches += [f"C10_CUDA_CHECK(cudaStreamWaitEvent(stream, state.done[{index}], 0));" for index in range(count)]
     output_shapes = ENV_OUTPUT_SHAPES if env else OUTPUT_SHAPES
     allocations = [
-        f"auto {name}=at::empty_like({output_shapes[name]});" for name in outputs
+        f"auto {name}=at::empty_like({output_shapes[name]});" for name in requested_outputs
     ]
     clears = [
         f"C10_CUDA_CHECK(cudaMemsetAsync({name}.data_ptr<float>(),0,{name}.numel()*sizeof(float),stream));"
-        for name in outputs
-        if name in (*program["x"], *program["y"], *program.get("e", {}))
-        or (name == "gg" and fuse_forward)
+        for name in requested_outputs
+        if name not in outputs or name in (*program["x"], *program["y"], *program.get("e", {})) or (name=="gg" and fused_output)
     ]
     return cuda_source_for_dtype(
         r"""
@@ -1898,41 +2017,89 @@ m.attr("_Streams").attr("stream_priority")=0;
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
-#include <cutlass/gemm/thread/mma.h>
 #include <vector>
 """
         + "\n".join(kernels) + stream_state
         + r"""
-std::vector<at::Tensor> launch({state_parameter}{input_parameters},at::Tensor src,at::Tensor dst) {{
+std::vector<at::Tensor> launch({state_parameter}{input_parameters}, at::Tensor src, at::Tensor dst, at::Tensor src_rowptr,
+       at::Tensor edge_by_src, at::Tensor dst_rowptr, at::Tensor edge_by_dst) {{
     c10::cuda::CUDAGuard guard(x.device());
-    const int64_t items=y.size(0);
-    {allocations}
-    if(items==0) {{
-        {clear_outputs}
+    const int64_t items = y.size(0), nodes = src_rowptr.numel() - 1;
+{allocations}
+    if (items == 0) {{
+{clear_outputs}
         return {{{outputs}}};
     }}
-    auto stream=at::cuda::getCurrentCUDAStream();
-    {clears}
-    {launches}
+    auto stream = at::cuda::getCurrentCUDAStream();
+{clears}
+{launches}
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {{{outputs}}};
 }}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{{stream_binding}m.def("launch",&launch);}}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    {stream_binding}m.def("launch", &launch);
+}}
 """.format(
             state_parameter=state_parameter,
             stream_binding=stream_binding,
             input_parameters=",".join((f"at::Tensor {name}" for name in inputs)),
-            allocations=chr(10).join(allocations),
-            clear_outputs=chr(10).join((f"{name}.zero_();" for name in outputs)),
-            outputs=",".join(outputs),
-            clears=chr(10).join(clears),
-            launches=chr(10).join(launches),
+            allocations=textwrap.indent(chr(10).join(allocations), '    '),
+            clear_outputs=textwrap.indent(chr(10).join((f"{name}.zero_();" for name in requested_outputs)), '        '),
+            outputs=",".join(requested_outputs),
+            clears=textwrap.indent(chr(10).join(clears), '    '),
+            launches=textwrap.indent(chr(10).join(launches), '    '),
         ),
         meta.get("dtype", torch.float32),
     )
 
 
-def run_external(op, order, inputs, src, dst, *, needs=None, env=False):
+def without_zero_directions(program, zero_roles):
+    """Remove products containing a direction that autograd supplied as None."""
+    if not zero_roles:
+        return program
+    # A literal None inside an ENV product means an identity factor.
+    cg = {name: tuple(product for product in products
+                      if all(role not in zero_roles for role in product if role is not None))
+          for name, products in program["cg"].items()}
+    z = {name: tuple(product for product in products
+                     if all(role not in zero_roles for role in product))
+         for name, products in program["z"].items()}
+    filtered = {"cg": {name: products for name, products in cg.items() if products},
+                "z": {name: products for name, products in z.items() if products}}
+    for axis in ("x", "y"):
+        consumers = {}
+        for name, products in program[axis].items():
+            products = tuple(pair for pair in products
+                             if pair[0] not in zero_roles and z.get(pair[1])
+                             and all(role not in zero_roles for role in pair[2:] if role is not None))
+            if products:
+                consumers[name] = products
+        filtered[axis] = consumers
+    filtered["w"] = {
+        name: tuple((query, grad) for query, grad in products if cg.get(query) and grad not in zero_roles)
+        for name, products in program["w"].items()
+    }
+    filtered["w"] = {name: products for name, products in filtered["w"].items() if products}
+    if "e" in program:
+        filtered["e"] = {
+            name: tuple((query, contraction) for query, contraction in products
+                        if cg.get(query) and z.get(contraction))
+            for name, products in program["e"].items()
+        }
+        filtered["e"] = {name: products for name, products in filtered["e"].items() if products}
+    filtered["forward"] = tuple((query, weight) for query, weight in program["forward"]
+                                if cg.get(query) and weight not in zero_roles)
+    needed_q = {query for products in filtered["w"].values() for query, _ in products}
+    needed_q.update(query for query, _ in filtered["forward"])
+    needed_q.update(query for products in filtered.get("e", {}).values() for query, _ in products)
+    needed_z = {pair[1] for axis in ("x", "y", "e")
+                for products in filtered.get(axis, {}).values() for pair in products}
+    filtered["cg"] = {name: products for name, products in filtered["cg"].items() if name in needed_q}
+    filtered["z"] = {name: products for name, products in filtered["z"].items() if name in needed_z}
+    return {**program, **filtered}
+
+
+def run_external(op, order, inputs, graph, *, needs=None, env=False):
     """Native graph gather/scatter with common first-, second- and third-order expressions."""
     outputs = (ENV_PROGRAMS if env else PROGRAMS)[order]["outputs"]
     selected = (
@@ -1941,20 +2108,22 @@ def run_external(op, order, inputs, src, dst, *, needs=None, env=False):
         else tuple(name for name, need in zip(outputs, needs) if need)
     )
 
+    roles = (ENV_INPUTS if env else INPUTS)[:len(inputs)]
+    zero_roles = tuple(name for name, value in zip(roles, inputs) if value is None)
     key = (order, selected)
     if env:
         key += (True,)
+    if zero_roles:
+        key += (zero_roles,)
     launch = op.external_kernels.get(key)
     if launch is None:
         meta = op.meta
-        program = (ENV_PROGRAMS if env else PROGRAMS)[order]
-        roles = (ENV_INPUTS if env else INPUTS)[
-            : (5, 9, 14)[order - 1] if env else (4, 7, 11)[order - 1]
-        ]
+        program = without_zero_directions((ENV_PROGRAMS if env else PROGRAMS)[order], zero_roles)
+        active_roles = tuple(name for name, value in zip(roles, inputs) if value is not None)
         source = make_external_backward_source(
             meta,
             program,
-            roles,
+            active_roles,
             selected,
             ("bwd", "double_bwd", "triple_bwd")[order - 1],
             env=env,
@@ -1970,11 +2139,14 @@ def run_external(op, order, inputs, src, dst, *, needs=None, env=False):
         op.external_kernels[key] = launch
 
     function, stream_factory = launch
+    arguments = tuple(value for value in inputs if value is not None) if zero_roles else inputs
+    graph_inputs = (graph.src, graph.dst, graph.src_rowptr, graph.edge_ids_by_src,
+                    graph.dst_rowptr, graph.edge_ids_by_dst)
     if stream_factory is None:
-        result = function(*inputs, src, dst)
+        result = function(*arguments, *graph_inputs)
     else:
         state = get_overlap_state(op, inputs[0].device, stream_factory)
-        result = function(state, *inputs, src, dst)
+        result = function(state, *arguments, *graph_inputs)
     if needs is None:
         return tuple(result)
     values = iter(result)
@@ -1992,7 +2164,7 @@ def run(op, x, edge_attr, weight, grad_out, *, graph, needs=None):
             if op.input_gradient is None:
                 extension = load_cuda_extension(
                     f"lunatp_uvwconv_bwd_x_shared_{op.dtype_tag}",
-                    make_uvw_conv_backward_dx_shared_source(op.meta, arch=op.arch),
+                    make_uvw_conv_backward_dx_shared_source(op.meta),
                     arch=op.arch,
                     use_fast_math=False,
                     index_bits=op.index_bits,
@@ -2013,6 +2185,13 @@ def run(op, x, edge_attr, weight, grad_out, *, graph, needs=None):
             return grad_x, None, None
         if op.node_contraction is None:
             load_node_contraction(op)
+        if needs is not None and not needs[2]:
+            grad_x, grad_edge = op.launch_dxdy(
+                x, edge_attr, weight, grad_out,
+                graph.src, graph.dst, graph.src_rowptr,
+                graph.edge_ids_by_src, num_nodes,
+            )
+            return grad_x, grad_edge, None
         if op.weight_contraction is None:
             load_weight_contraction(op)
 
@@ -2048,15 +2227,13 @@ def run(op, x, edge_attr, weight, grad_out, *, graph, needs=None):
         current_stream.wait_stream(weight_stream)
         grad_weight.record_stream(current_stream)
         return grad_x, grad_edge, grad_weight
-    return tuple(
-        run_external(op, 1, (x, edge_attr, weight, grad_out), src, dst, needs=needs)
-    )
+    return run_external(op, 1, (x, edge_attr, weight, grad_out), graph, needs=needs)
 
 
 def load_node_contraction(op):
     extension = load_cuda_extension(
         f"lunatp_uvwconv_bwd_xy_shared_{op.dtype_tag}",
-        make_uvw_conv_backward_dxdy_shared_source(op.meta, arch=op.arch),
+        make_uvw_conv_backward_dxdy_shared_source(op.meta),
         arch=op.arch,
         use_fast_math=False,
         index_bits=op.index_bits,
@@ -2092,7 +2269,7 @@ def load_weight_contraction(op):
     )
     op.weight_reduce = load_cuda_extension(
         f"lunatp_uvwconv_bwd_weight_shared_{op.dtype_tag}",
-        make_uvw_conv_backward_dw_reduce_shared_source(op.meta, arch=op.arch),
+        make_uvw_conv_weight_cutlass_source(op.meta),
         arch=op.arch,
         use_fast_math=False,
         index_bits=op.index_bits,

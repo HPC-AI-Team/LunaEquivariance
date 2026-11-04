@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import torch
+from textwrap import indent
 
 from ....utils.precision import float_literal
 from .utils import TASK_ALIGNMENT
@@ -26,20 +26,22 @@ def emit_weight_group(meta, targets, *, path_major=True):
             spec[key] for key in ("in_channels", "out_channels", "components", "weight_offset")
         )
         if item_major:
-            lines.append((r"""if(q>={task_offset} && q<{end}) {{
-int u=(q-{task_offset})/{columns},v=(q-{task_offset})%{columns};
-Index destination=item*{weights}+{offset}+q-{task_offset};""").format(
+            lines.append((r"""if (q >= {task_offset} && q < {end}) {{
+    int u = (q - {task_offset}) / {columns}, v = (q - {task_offset}) % {columns};
+    Index destination = item * {weights} + {offset} + q - {task_offset};""").format(
                 task_offset=task_offset, end=task_offset+cin*cout, columns=cout, weights=weights, offset=wi,
             ))
         else:
             # Round tasks once per path to keep small external matrices' warps occupied.
             extent = f"((Index(num_items)*{cin*cout}+{TASK_ALIGNMENT-1})/{TASK_ALIGNMENT})*{TASK_ALIGNMENT}"
             end = f"weight_path_end_{path}"
-            lines.append((r"""const Index {end_name}={previous}+({extent});
-if(local>={previous} && local<{previous}+Index(num_items)*{count}) {{
-Index pair=local-{previous}; Index item=pair/{count}; int q=pair%{count};
-int u=q/{columns},v=q%{columns};
-Index destination=item*{weights}+{offset}+q;""").format(
+            lines.append((r"""const Index {end_name} = {previous} + ({extent});
+if (local >= {previous} && local < {previous} + Index(num_items) * {count}) {{
+    Index pair = local - {previous};
+    Index item = pair / {count};
+    int q = pair % {count};
+    int u = q / {columns}, v = q % {columns};
+    Index destination = item * {weights} + {offset} + q;""").format(
                 end_name=end, previous=previous, extent=extent, count=cin*cout,
                 columns=cout, weights=weights, offset=wi,
             ))
@@ -48,31 +50,31 @@ Index destination=item*{weights}+{offset}+q;""").format(
         begin, end = ("0", "num_items") if shared else ("item", "item+1")
         alpha = float_literal(spec["path_weight"], meta["dtype"])
         lines.append((r"""{accumulators}
-for(Index n={begin};n<{end};++n) {{
+    for (Index n = {begin}; n < {end}; ++n) {{
 #pragma unroll
-for(int m=0;m<{components};++m) {{
+        for (int m = 0; m < {components}; ++m) {{
 {source_loads}
 {seed_loads}
 {products}
-}}
-}}
+        }}
+    }}
 {stores}
 }}""").format(
-            accumulators="\n".join(("Element part_{target}=Element(0);").format(target=target) for target in targets),
+            accumulators=indent("\n".join(("Element part_{target}=Element(0);").format(target=target) for target in targets), "    "),
             begin=begin, end=end, components=d,
-            source_loads="\n".join(
+            source_loads=indent("\n".join(
                 ("Element source_{role}={role}[n*{dimension}+{offset}+u*{components}+m];").format(role=role, dimension=meta['in_dim'], offset=spec['x_offset'], components=d)
                 for role in sources
-            ),
-            seed_loads="\n".join(
+            ), '            '),
+            seed_loads=indent("\n".join(
                 ("Element seed_{role}={role}[n*{dimension}+{offset}+v*{components}+m];").format(role=role, dimension=meta['out_dim'], offset=spec['out_offset'], components=d)
                 for role in seeds
-            ),
-            products="\n".join(
+            ), '            '),
+            products=indent("\n".join(
                 ("part_{target}=fma(source_{a},seed_{g},part_{target});").format(target=target, a=a, g=g)
                 for target, terms in targets.items() for a, g in terms
-            ),
-            stores="\n".join(("out_{target}[destination]=part_{target}*Element({alpha});").format(target=target, alpha=alpha) for target in targets),
+            ), '            '),
+            stores=indent("\n".join(("out_{target}[destination]=part_{target}*Element({alpha});").format(target=target, alpha=alpha) for target in targets), "    "),
         ))
         task_offset += ((cin * cout + TASK_ALIGNMENT - 1) // TASK_ALIGNMENT) * TASK_ALIGNMENT
     count = (
@@ -91,10 +93,10 @@ def emit_bias_group(meta, targets):
 {sums}
 }}""").format(
             start=start, end=start+count,
-            sums="\n".join(
+            sums=indent("\n".join(
                 ("for(Index n=0;n<num_items;++n) value_{target}+={g}[n*{dimension}+q-{start}+{offset}];").format(target=target, g=g, dimension=meta['out_dim'], start=start, offset=spec['out_offset'])
                 for target, terms in targets.items() for (g,) in terms
-            ),
+            ), "    "),
         ))
     lines.extend(("out_{target}[local]=value_{target};").format(target=target) for target in targets)
     return "\n".join(lines)
@@ -114,8 +116,8 @@ def emit_feature_group(meta, targets, broadcast, *, backward):
     lines = [("Index n=local/{dimension}; int q=local%{dimension};").format(dimension=dimension)]
     lines.extend(("Element value_{target}=Element(0);").format(target=target) for target in targets)
     for (offset, channels, d), specs in groups.items():
-        lines.append((r"""if(q>={offset} && q<{end}) {{
-int channel=(q-{offset})/{components},component=(q-{offset})%{components};""").format(offset=offset, end=offset+channels*d, components=d))
+        lines.append((r"""if (q >= {offset} && q < {end}) {{
+    int channel = (q - {offset}) / {components}, component = (q - {offset}) % {components};""").format(offset=offset, end=offset+channels*d, components=d))
         for spec in specs:
             source_offset = spec["out_offset" if backward else "x_offset"]
             width = spec["out_channels" if backward else "in_channels"]
@@ -127,31 +129,31 @@ int channel=(q-{offset})/{components},component=(q-{offset})%{components};""").f
             sources = tuple(dict.fromkeys(term[0] for terms in targets.values() for term in terms))
             weights = tuple(dict.fromkeys(term[1] for terms in targets.values() for term in terms))
             alpha = float_literal(spec["path_weight"], meta["dtype"])
-            lines.append((r"""{{
+            lines.append((r"""    {{
 {accumulators}
 #pragma unroll {unroll}
-for(int k=0;k<{width};++k) {{
+        for (int k = 0; k < {width}; ++k) {{
 {source_loads}
 {matrix_loads}
 {products}
-}}
+        }}
 {path_sums}
-}}""").format(
-                accumulators="\n".join(("Element part_{target}=Element(0);").format(target=target) for target in targets),
+    }}""").format(
+                accumulators=indent("\n".join(("Element part_{target}=Element(0);").format(target=target) for target in targets), "        "),
                 unroll=4 if width <= 32 else 1, width=width,
-                source_loads="\n".join(
+                source_loads=indent("\n".join(
                     ("Element source_{role}={role}[n*{dimension}+{offset}+k*{components}+component];").format(role=role, dimension=source_dim, offset=source_offset, components=d)
                     for role in sources
-                ),
-                matrix_loads="\n".join(
+                ), '            '),
+                matrix_loads=indent("\n".join(
                     ("Element matrix_{role}={role}[{batch}{offset}+{index}];").format(role=role, batch=batch, offset=spec['weight_offset'], index=windex)
                     for role in weights
-                ),
-                products="\n".join(
+                ), '            '),
+                products=indent("\n".join(
                     ("part_{target}=fma(source_{a},matrix_{w},part_{target});").format(target=target, a=a, w=w)
                     for target, terms in targets.items() for a, w in terms
-                ),
-                path_sums="\n".join(("value_{target}=fma(part_{target},Element({alpha}),value_{target});").format(target=target, alpha=alpha) for target in targets),
+                ), '            '),
+                path_sums=indent("\n".join(("value_{target}=fma(part_{target},Element({alpha}),value_{target});").format(target=target, alpha=alpha) for target in targets), '        '),
             ))
         lines.append("}")
     if not backward:
@@ -213,12 +215,13 @@ def make_dx_dw_dg_db_source(meta, program):
             body, count = emit_weight_group(meta, targets, path_major=False)
             if dispatch_weights:
                 body_new, count_new = emit_weight_group(meta, targets, path_major=True)
-                body = f"if constexpr(use_path_major) {{\n{body_new}\n}} else {{\n{body}\n}}"
+                body = ("if constexpr(use_path_major) {\n" + indent(body_new, "    ")
+                        + "\n} else {\n" + indent(body, "    ") + "\n}")
                 count = f"(use_path_major?({count_new}):({count}))"
         else:
             body = emit_bias_group(meta, targets)
         if kind != "weight":
-            body = f"if(local<({count})) {{\n{body}\n}}"
+            body = f"if(local<({count})) {{\n" + indent(body, "    ") + "\n}"
             count = f"((({count})+{TASK_ALIGNMENT-1})/{TASK_ALIGNMENT})*{TASK_ALIGNMENT}"
         path_major_counts.append(count_new if kind == "weight" and dispatch_weights else count)
         groups.append((kind, count, body))
@@ -233,9 +236,10 @@ def make_dx_dw_dg_db_source(meta, program):
         end = f"end_{kind}"
         declarations.append(f"const Index {end}={previous}+({count});")
         branches.append(
-            (r"""if(index>={previous} && index<{end}) {{ Index local=index-{previous};
+            (r"""if (index >= {previous} && index < {end}) {{
+    Index local = index - {previous};
 {body}
-}}""").format(previous=previous, end=end, body=body)
+}}""").format(previous=previous, end=end, body=indent(body, '    '))
         )
         previous = end
 
@@ -276,7 +280,7 @@ def make_dx_dw_dg_db_source(meta, program):
     ]
 
     first = program["inputs"][0]
-    scalar = "double" if meta["dtype"] == torch.float64 else "float"
+    scalar = "double"
     phase = 'double_backward' if program['order'] == 2 else 'triple_backward'
     kernel = f"linear_{phase}_dx_dw_dg_db"
     template_prefix = "template<bool PathMajor>\n" if dispatch_weights else ""
@@ -294,10 +298,12 @@ def make_dx_dw_dg_db_source(meta, program):
         f"if({previous}>0) {kernel}<<<{launch_grid},128,0,stream>>>({launch_arguments});"
     )
     if dispatch_weights:
-        launch_statement = (r"""if({previous}>0) {{
-        if(use_path_major) {kernel}<true><<<{launch_grid},128,0,stream>>>({launch_arguments});
-        else {kernel}<false><<<{launch_grid},128,0,stream>>>({launch_arguments});
-    }}""").format(
+        launch_statement = (r"""if ({previous} > 0) {{
+    if (use_path_major)
+        {kernel}<true><<<{launch_grid}, 128, 0, stream>>>({launch_arguments});
+    else
+        {kernel}<false><<<{launch_grid}, 128, 0, stream>>>({launch_arguments});
+}}""").format(
             previous=previous,
             kernel=kernel,
             launch_grid=launch_grid,
@@ -312,38 +318,41 @@ def make_dx_dw_dg_db_source(meta, program):
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
-using Element={scalar};
-{template_prefix}__global__ __launch_bounds__(128,4) void {kernel}(
-    {parameters},int64_t num_items) {{{template_flag}
-    {group_extents}
-    for(Index index=Index(blockIdx.x)*128+threadIdx.x;index<{previous};index+=Index(gridDim.x)*128) {{
-        {contractions}
+using Element = {scalar};
+{template_prefix}__global__ __launch_bounds__(128, 4) void {kernel}({parameters}, int64_t num_items) {{
+{template_flag}
+{group_extents}
+    for (Index index = Index(blockIdx.x) * 128 + threadIdx.x; index < {previous}; index += Index(gridDim.x) * 128) {{
+{contractions}
     }}
 }}
-pybind11::tuple launch({launch_parameters},int64_t num_items) {{
+pybind11::tuple launch({launch_parameters}, int64_t num_items) {{
     c10::cuda::CUDAGuard guard({first}.device());
-    auto options={first}.options();{dispatch_statement}
-    {allocations}
-    {group_extents}
-    cudaStream_t stream=at::cuda::getCurrentCUDAStream();
-    {launch_statement}
+    auto options = {first}.options();
+{dispatch_statement}
+{allocations}
+{group_extents}
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+{launch_statement}
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return pybind11::make_tuple({results});
 }}
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {{m.def("launch",&launch);}}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("launch", &launch);
+}}
 """).format(
         scalar=scalar,
         template_prefix=template_prefix,
         kernel=kernel,
         parameters=','.join(parameters),
         template_flag=template_flag,
-        group_extents="\n".join(declarations),
+        group_extents=indent("\n".join(declarations), '    '),
         previous=previous,
-        contractions="\n".join(branches),
+        contractions=indent("\n".join(branches), '        '),
         launch_parameters=','.join((f'torch::Tensor {role}' for role in program['inputs'])),
         first=first,
         dispatch_statement=dispatch_statement,
-        allocations="\n".join(allocations),
-        launch_statement=launch_statement,
+        allocations=indent("\n".join(allocations), '    '),
+        launch_statement=indent(launch_statement, '    '),
         results=','.join(returns),
     )

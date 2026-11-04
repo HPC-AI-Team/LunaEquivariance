@@ -4,7 +4,10 @@ import torch
 
 from ....utils.extension import get_cuda_arch, combine_cuda_sources, load_cuda_extension
 
-from .utils import make_path_types, make_binding, get_kernel_config, launch_kernel
+from .utils import (
+    BINDING, MODULE_BINDING, TENSOR_BINDING, TRAINING_MODULE_BINDING,
+    make_path_types, make_binding, get_kernel_config, launch_kernel,
+)
 
 
 FORWARD_MATH = r'''template<ActivationKind Kind, bool Normalize>
@@ -88,7 +91,8 @@ void run_activation_forward(
     const Element* x, Element* out, int64_t num_items, cudaStream_t stream) {
     if (num_items == 0) return;
     if constexpr (Vectorized) {
-        if (num_items >= 16384 && reinterpret_cast<uintptr_t>(x) % 16 == 0) {
+        if (num_items * Width >= VectorMinElements &&
+            reinterpret_cast<uintptr_t>(x) % 16 == 0) {
             const int64_t count = num_items * (Width / 4);
             const unsigned blocks = std::min<int64_t>(65535, (count + 127) / 128);
             activation_forward_vectorized_kernel<Width, Paths...><<<blocks, 128, 0, stream>>>(
@@ -225,14 +229,6 @@ FORWARD_CALL = r'''
 '''
 
 
-CUDA_HEADERS = r'''#include <torch/extension.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda_runtime.h>
-#include <algorithm>'''
-
-
 ACTIVATION_TYPES = r'''enum class ActivationKind {
     Identity, Tanh, Sigmoid, Silu, Softplus, Relu, Abs, Gelu, GeluTanh
 };
@@ -242,49 +238,6 @@ struct ActivationParameters {
     Element beta;
     Element threshold;
 };'''
-
-
-BINDING = r'''using Element={scalar};{layout_declarations}
-{declarations}
-{kernel_body}
-{result_type} launch({tensor_parameters},int64_t num_items) {{
-    c10::cuda::CUDAGuard guard({first}.device());
-    auto options={first}.options();
-    {allocations}
-    cudaStream_t stream=at::cuda::getCurrentCUDAStream();{layout_host}
-    {launch}
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {result_return};
-}}
-'''
-
-
-MODULE_BINDING = r'''PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("launch",&launch);}
-'''
-
-
-TENSOR_BINDING = r'''
-torch::Tensor launch_tensor({args}) {{
-    c10::cuda::CUDAGuard guard(x.device());
-    const int64_t num_items=x.numel()/{width};
-    constexpr int64_t padding=65535*128;
-    TORCH_CHECK(num_items<=(std::numeric_limits<int64_t>::max()-padding)/{max_width},"Pointwise task offsets exceed int64");
-{checks}
-{call}
-    auto result={result_value};
-    std::vector<int64_t> shape(x.sizes().begin(),x.sizes().end());
-    shape.back()={result_width};
-    // The fresh output owns its storage. Remove the host reshape's view
-    // metadata before Python autograd attaches the custom backward.
-    return result.reshape(shape).detach();
-}}
-'''
-
-
-TENSOR_MODULE_BINDING = r'''
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
-    m.def("launch_forward",&forward_impl::launch_tensor);
-'''
 
 
 def make_source(activation_paths, in_dim, config, *, strided=False, tensor_only=False, fragments=False):
@@ -325,8 +278,7 @@ def make_forward_backward_source(activation_paths, in_dim, forward_config, backw
             backward.BACKWARD_CALL.format(width=width, out_width=width)
             if order else FORWARD_CALL.format(results_type="torch::Tensor", width=width)
         )
-        binding = backward.TENSOR_BINDING if order else TENSOR_BINDING
-        wrapper = binding.format(
+        wrapper = TENSOR_BINDING.format(
             args="torch::Tensor x" + (",torch::Tensor grad_out" if order else ""),
             scalar="Double" if config["dtype"] == torch.float64 else "Float",
             width=width, max_width=width,
@@ -335,19 +287,15 @@ def make_forward_backward_source(activation_paths, in_dim, forward_config, backw
         )
         namespaces.append("namespace " + ("backward_impl" if order else "forward_impl") + " {\n" + native + wrapper + "\n}\n")
     headers += ["#include <limits>", "#include <vector>"]
-    return "\n".join(dict.fromkeys(headers)) + "\n" + "\n".join(namespaces) + TENSOR_MODULE_BINDING + backward.TENSOR_MODULE_BINDING
+    return "\n".join(dict.fromkeys(headers)) + "\n" + "\n".join(namespaces) + TRAINING_MODULE_BINDING
 
 
-def activation_forward(features, activation_paths, index_bits, kernel_cache, gate_layout=None):
+def activation_forward(features, activation_paths, index_bits, kernel_cache):
     """Load forward and both first-backward modes in one extension."""
     dtype = features.dtype
     device = features.device
     numel = features.numel()
     bound = numel + 65535 * 128
-    if gate_layout is not None:
-        in_dim, out_dim = gate_layout["in_dim"], gate_layout["out_dim"]
-        if out_dim > in_dim and in_dim:
-            bound = (numel // in_dim) * out_dim + 65535 * 128
     if not features.is_contiguous():
         bound = max(bound, sum(
             (size - 1) * stride for size, stride in zip(features.shape, features.stride())
@@ -357,71 +305,48 @@ def activation_forward(features, activation_paths, index_bits, kernel_cache, gat
     key = "forward_backward", dtype, device, bits
     entry = kernel_cache.get(key)
     if entry is None:
-        arch = get_cuda_arch(device)
+        from . import backward
 
-        if gate_layout is None:
-            in_dim = out_dim = sum(width for width, _ in activation_paths)
-        forward_config = get_kernel_config(activation_paths, 0, dtype, kernel_cache, gate_layout=gate_layout)
+        arch = get_cuda_arch(device)
+        in_dim = sum(width for width, _ in activation_paths)
+        forward_config = get_kernel_config(activation_paths, 0, dtype, kernel_cache)
         backward_config = get_kernel_config(
-            activation_paths, 1, dtype, kernel_cache, available=("x", "grad_out"), gate_layout=gate_layout
+            activation_paths, 1, dtype, kernel_cache, available=("x", "grad_out")
         )
         differentiable_config = get_kernel_config(
-            activation_paths, 1, dtype, kernel_cache, grad_mode=True, gate_layout=gate_layout
+            activation_paths, 1, dtype, kernel_cache, grad_mode=True
         )
 
         differentiable = bool(differentiable_config["active_outputs"])
         forward_kernel = backward_kernel = None
         if (
-            in_dim and out_dim and bound <= (1 << 63) - 1
+            in_dim and bound <= (1 << 63) - 1
             and forward_config["inputs"] == ("x",)
             and forward_config["active_outputs"] == ("out",)
             and backward_config["inputs"] in (("x", "grad_out"), ("grad_out",))
             and backward_config["active_outputs"] == ("dx",)
         ):
-            if gate_layout is not None:
-                from ...gate.kernels import forward as gate_forward, backward as gate_backward
-                layout = {**gate_layout, "dtype": dtype}
-                backward_source = gate_backward.make_source(layout, differentiable_config)
-            else:
-                from . import backward
-                backward_source = backward.make_source(activation_paths, in_dim, differentiable_config)
-            sources = {"differentiable_backward": backward_source}
+            sources = {"differentiable_backward": backward.make_source(
+                activation_paths, in_dim, differentiable_config
+            )}
             if backward_config["inputs"] == ("x", "grad_out"):
-                sources["training"] = (
-                    gate_forward.make_training_source(layout, forward_config, backward_config)
-                    if gate_layout is not None else
-                    make_forward_backward_source(activation_paths, in_dim, forward_config, backward_config)
+                sources["training"] = make_forward_backward_source(
+                    activation_paths, in_dim, forward_config, backward_config
                 )
-            elif gate_layout is not None:
-                sources["backward"] = gate_backward.make_source(layout, backward_config)
-                if dtype == torch.float32:
-                    sources["host_forward"] = gate_forward.make_host_source(layout, forward_config)
-                else:
-                    sources["forward"] = gate_forward.make_source(layout, forward_config)
-                    sources["strided_forward"] = gate_forward.make_source(layout, forward_config, strided=True)
             else:
                 sources["forward"] = make_source(activation_paths, in_dim, forward_config)
                 sources["strided_forward"] = make_source(activation_paths, in_dim, forward_config, strided=True)
                 sources["backward"] = backward.make_source(activation_paths, in_dim, backward_config)
-
-            kind = "gate" if gate_layout is not None else "activation"
             extension = load_cuda_extension(
-                "lunaeq_" + kind + "_forward_backward", combine_cuda_sources(sources),
+                "lunaeq_activation_forward_backward", combine_cuda_sources(sources),
                 index_bits=bits, arch=arch, use_fast_math=False, minimal_headers=True,
             )
             kernel_cache[("forward_backward_module", dtype, device, bits)] = extension
             if "training" in sources:
                 forward_kernel = extension.training.launch_forward
                 backward_kernel = extension.training.launch_backward
-            elif "host_forward" in sources:
-                kernel_cache[("gate_forward", dtype, device, bits)] = extension.host_forward.launch_fast_forward
 
-        if gate_layout is None:
-            save_input = any(spec["kind"] != "identity" for _, spec in activation_paths)
-        else:
-            save_input = bool(gate_layout["gated_paths"]) or any(
-                path["activation"]["kind"] != "identity" for path in gate_layout["scalar_paths"]
-            )
+        save_input = any(spec["kind"] != "identity" for _, spec in activation_paths)
         save_input |= backward_kernel is not None
         entry = forward_kernel, backward_kernel, differentiable, save_input, forward_config
         kernel_cache[key] = entry
@@ -431,21 +356,8 @@ def activation_forward(features, activation_paths, index_bits, kernel_cache, gat
     forward_kernel, backward_kernel, differentiable, save_input, config = entry
     if forward_kernel is not None:
         result = forward_kernel(features)
-    elif gate_layout is not None and dtype == torch.float32 and in_dim and out_dim:
-        key = "gate_forward", dtype, device, bits
-        launch = kernel_cache.get(key)
-        if launch is None:
-            from ...gate.kernels.forward import make_host_source
-
-            arch = get_cuda_arch(device)
-            launch = load_cuda_extension(
-                "gate_host_forward", make_host_source({**gate_layout, "dtype": dtype}, config),
-                index_bits=bits, arch=arch, use_fast_math=False, minimal_headers=True,
-            ).launch_fast_forward
-            kernel_cache[key] = launch
-        result = launch(features).detach()
     else:
         result = launch_kernel(
-            (features,), config, activation_paths, index_bits, kernel_cache, make_source, gate_layout
+            (features,), config, activation_paths, index_bits, kernel_cache, make_source
         )[0].detach()
     return result, backward_kernel, differentiable, save_input

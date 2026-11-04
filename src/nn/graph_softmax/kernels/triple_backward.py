@@ -141,19 +141,19 @@ __global__ void __launch_bounds__(Threads, 1) graph_softmax_triple_backward_kern
             for (int j = 0; j < 7; ++j) row_moments[j+2][0][lane] = state.moments[j] * inverse;
         }
         __syncthreads();
-        maximum = row_moments[0][0][lane];
-        inverse = row_moments[1][0][lane];
-        a = row_moments[2][0][lane]; c = row_moments[3][0][lane];
-        total = row_moments[4][0][lane]; k = row_moments[5][0][lane];
-        l = row_moments[6][0][lane]; m = row_moments[7][0][lane];
-        n = row_moments[8][0][lane];
-    }
-    const T da = T(2) * c * k - l;
-    const T dc = T(2) * a * k - m;
-    const T dt = -k;
-    const T q_total = n - T(2) * (a * l + c * m)
-                    + k * (T(6) * a * c - T(2) * total);
-    for (int64_t edge = begin + warp; edge < end; edge += Warps) {
+            maximum = row_moments[0][0][lane];
+            inverse = row_moments[1][0][lane];
+            a = row_moments[2][0][lane]; c = row_moments[3][0][lane];
+            total = row_moments[4][0][lane]; k = row_moments[5][0][lane];
+            l = row_moments[6][0][lane]; m = row_moments[7][0][lane];
+            n = row_moments[8][0][lane];
+        }
+        const T da = T(2) * c * k - l;
+        const T dc = T(2) * a * k - m;
+        const T dt = -k;
+        const T q_total = n - T(2) * (a * l + c * m)
+                        + k * (T(6) * a * c - T(2) * total);
+        for (int64_t edge = begin + warp; edge < end; edge += Warps) {
             T local_dv = T(0), local_de = T(0);
             if (active) {
                 const int64_t off = edge * dim + feature;

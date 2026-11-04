@@ -12,6 +12,7 @@ from ...utils.layout import UvuTensorPathSpec
 
 
 SHARED_WEIGHT_ROWS = 64
+UVU_FUSED_REGISTER_BUDGET = 128
 
 def build_uvu_metadata(tp, dtype):
     internal = bool(tp.internal_weights)
@@ -154,7 +155,6 @@ def make_grid_source(source: str, channel_tile: int) -> str:
 def get_uvu_launch_config(
     max_channels: int, channels: object | None = None
 ) -> tuple[int, int, int]:
-    # heuristic config
     if channels is not None:
         channel_set = set(channels)
         if len(channel_set) > 1:
@@ -177,8 +177,8 @@ def run_backward(op, order, *inputs, make_source, only_x=False, needs=None):
     if cached is None:
         from .backward import use_uvu_dx_dy_dw_fusion
 
-        # The tiled schedules already select W/rW. Keep their existing feature
-        # consumers; exact output subsets reuse only the bounded fused schedule.
+        # Tiled kernels prune weight gradients but retain all feature outputs.
+        # Only the fused kernel supports arbitrary output subsets.
         outputs = list(native_needs if use_uvu_dx_dy_dw_fusion(op.meta, order)
                        else (True,) * len(native_needs))
         outputs[2] = native_needs[2]

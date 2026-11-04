@@ -17,6 +17,9 @@ The following operators are available as modules and functions. See the
    * - :doc:`o3.SphericalHarmonics <operators/spherical_harmonics>`
      - FP32/FP64
      - Vector input; degrees 0-12
+   * - :doc:`o3.SymmetricContraction <operators/symmetric_contraction>`
+     - FP32/FP64
+     - Weighted contractions of repeated equivariant features
    * - :doc:`o3.Norm <operators/norm>`
      - FP32/FP64
      - One norm per irrep copy

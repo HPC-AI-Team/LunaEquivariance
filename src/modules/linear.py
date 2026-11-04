@@ -167,7 +167,6 @@ class LunaEqLinear(torch.nn.Module):
         self.f_in, self.f_out = f_in, f_out
         self.irreps_in, self.irreps_out = self.tp.irreps_in, self.tp.irreps_out
         self.instructions = self.tp.instructions
-        self.weight_index_slices = self.tp.weight_index_slices
         self._optimize_einsums = self.tp._optimize_einsums
         self.weight_numel, self.bias_numel = self.tp.weight_numel, self.tp.bias_numel
         self.internal_weights, self.shared_weights = (
@@ -193,10 +192,6 @@ class LunaEqLinear(torch.nn.Module):
     @property
     def kernels(self):
         return self.config.kernels
-
-    @property
-    def raw_layout_kernels(self):
-        return self.config.raw_layout_kernels
 
     @property
     def last_execution_backend(self):

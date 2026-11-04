@@ -1,6 +1,7 @@
 """UUU convolution forward CUDA."""
 
 from __future__ import annotations
+import textwrap
 import torch
 from ....utils.precision import float_literal
 from ...utils.layout import build_signed_ij_classes
@@ -49,14 +50,15 @@ def emit_contraction(
             )
     return r"""{{
 {input_loads}
-const {scalar} scale = {weight_envelope};
-{scaled_features}{pair_contractions}
+    const {scalar} scale = {weight_envelope};
+{scaled_features}
+{pair_contractions}
 }}""".format(
         input_loads=input_loads,
         scalar=scalar,
         weight_envelope=factor,
-        scaled_features=scaled_features,
-        pair_contractions="\n" + "\n".join(lines) if lines else "",
+        scaled_features=textwrap.indent(scaled_features, "    "),
+        pair_contractions=textwrap.indent("\n".join(lines), "    "),
     )
 
 
@@ -75,24 +77,24 @@ def make_forward_node_planes(op):
         tiles = (channels + 31) // 32
         decode += [
             f"""{("if" if group == 0 else "else if")} (tile < {base + tiles}) {{""",
-            f"group = {group}; channel_base = (tile - {base}) * 32;",
+            f"    group = {group}; channel_base = (tile - {base}) * 32;",
             "}",
         ]
         base += tiles
         cases += [
             r"""case {group}: {{
 #pragma unroll
-for (int j = 0; j < 32; j += 8) {{
-if (channel_base + ty + j < {channels} && tx < {dim})
-planes[ty + j][tx] = __ldg(original_x + Index(node) * {in1_dim} + {offset} + (channel_base + ty + j) * {dim} + tx);
-}}
-__syncthreads();
+    for (int j = 0; j < 32; j += 8) {{
+        if (channel_base + ty + j < {channels} && tx < {dim})
+            planes[ty + j][tx] = __ldg(original_x + Index(node) * {in1_dim} + {offset} + (channel_base + ty + j) * {dim} + tx);
+    }}
+    __syncthreads();
 #pragma unroll
-for (int j = 0; j < 32; j += 8) {{
-if (channel_base + tx < {channels} && ty + j < {dim})
-plane_x[Index(node) * {in1_dim} + {offset} + (ty + j) * {channels} + channel_base + tx] = planes[tx][ty + j];
-}}
-break;
+    for (int j = 0; j < 32; j += 8) {{
+        if (channel_base + tx < {channels} && ty + j < {dim})
+            plane_x[Index(node) * {in1_dim} + {offset} + (ty + j) * {channels} + channel_base + tx] = planes[tx][ty + j];
+    }}
+    break;
 }}""".format(
                 group=group,
                 channels=channels,
@@ -102,29 +104,30 @@ break;
             )
         ]
     setup = [r"""const Index task = blockIdx.x;
-if (task >= Index(num_nodes) * {total_tiles}) return;
+if (task >= Index(num_nodes) * {total_tiles})
+return;
 const int node = int(task / {total_tiles});
 const int tile = int(task % {total_tiles});
 const int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
 int group = 0, channel_base = 0;
 __shared__ {scalar} planes[32][33];""".format(total_tiles=total_tiles, scalar=scalar)]
     name = "lunatp_uuuconv_forward_node_planes"
-    kernel = r"""__global__ __launch_bounds__(256)
-void {name}(const {scalar}* original_x, {scalar}* plane_x, int num_nodes) {{
+    kernel = r"""__global__ __launch_bounds__(256) void {name}(const {scalar} *original_x, {scalar} *plane_x,
+                                                     int num_nodes) {{
 {setup}
-switch (group) {{
+    switch (group) {{
 {cases}
-}}
+    }}
 }}""".format(
         name=name,
         scalar=scalar,
-        setup="\n".join(setup + decode),
-        cases="\n".join(cases),
+        setup=textwrap.indent("\n".join(setup + decode), '    '),
+        cases=textwrap.indent("\n".join(cases), '        '),
     )
     calls = [
         r"""if (num_nodes > 0) {{
-dim3 grid(Index(num_nodes) * {total_tiles});
-{name}<<<grid, 256, 0, stream>>>(x, packed_forward_x.data_ptr<{scalar}>(), num_nodes);
+    dim3 grid(Index(num_nodes) * {total_tiles});
+    {name}<<<grid, 256, 0, stream>>>(x, packed_forward_x.data_ptr<{scalar}>(), num_nodes);
 }}
 x = packed_forward_x.data_ptr<{scalar}>();""".format(total_tiles=total_tiles, name=name, scalar=scalar)
     ]
@@ -154,17 +157,17 @@ def make_grouped_forward_partition(
         width = (channels + 31) // 32
         decode += [
             f"""{("if" if group == 0 else "else if")} (tile < {base + width}) {{""",
-            f"group = {group}; channel_base = (tile - {base}) * 32;",
+            f"    group = {group}; channel_base = (tile - {base}) * 32;",
             "}",
         ]
         base += width
-        lines = [f"case {group}: {{", "const int u = channel_base + lane;"]
+        lines = [f"case {group}: {{", "    const int u = channel_base + lane;"]
         for path, spec in paths:
             for k in range(int(spec["d3"])):
-                lines.append(f"{scalar} acc_{path}_{k} = 0.0;")
-        lines.append(r"""if (u < {channels}) {{
-for (Index edge = dst_rowptr[node] + neighbor_worker; edge < dst_rowptr[node + 1]; edge += {workers}) {{
-const int s = __ldg(src + edge);
+                lines.append(f"    {scalar} acc_{path}_{k} = 0.0;")
+        lines.append(r"""    if (u < {channels}) {{
+        for (Index edge = dst_rowptr[node] + neighbor_worker; edge < dst_rowptr[node + 1]; edge += {workers}) {{
+            const int s = __ldg(src + edge);
 """.format(channels=channels, workers=workers))
         if group_axis == "x":
             for i in range(d1):
@@ -174,7 +177,7 @@ const int s = __ldg(src + edge);
                     else f"{x_offset} + u * {d1} + {i}"
                 )
                 lines.append(
-                    f"const {scalar} resident_x{i} = __ldg(x + Index(s) * {op.in1_dim} + {address});"
+                    f"            const {scalar} resident_x{i} = __ldg(x + Index(s) * {op.in1_dim} + {address});"
                 )
         shared_source_input = (
             share_basis
@@ -193,7 +196,7 @@ const int s = __ldg(src + edge);
                     else f"""{int(first["x_offset"])} + u * {int(first["d1"])} + {i}"""
                 )
                 lines.append(
-                    f"const {scalar} resident_shared_x{i} = __ldg(x + Index(s) * {op.in1_dim} + {address});"
+                    f"            const {scalar} resident_shared_x{i} = __ldg(x + Index(s) * {op.in1_dim} + {address});"
                 )
         y_slices = (
             {(x_offset, d1)}
@@ -203,7 +206,7 @@ const int s = __ldg(src + edge);
         for y_offset, d2 in sorted(y_slices):
             for j in range(d2):
                 lines.append(
-                    f"const {scalar} resident_y{y_offset}_{j} = __ldg(y + Index(edge) * {op.in2_dim} + {y_offset} + u * {d2} + {j});"
+                    f"            const {scalar} resident_y{y_offset}_{j} = __ldg(y + Index(edge) * {op.in2_dim} + {y_offset} + u * {d2} + {j});"
                 )
         shared_basis = None
         if shared_source_input:
@@ -243,11 +246,11 @@ const int s = __ldg(src + edge);
                         if with_env:
                             basis_value = f"({basis_value} * __ldg(env + edge))"
                         basis_lines.append(
-                            f"const {basis_scalar} basis_weight_{path} = {basis_value};"
+                            f"    const {basis_scalar} basis_weight_{path} = {basis_value};"
                         )
                         for k in range(int(spec["d3"])):
                             basis_lines.append(
-                                f"{basis_scalar} basis_q_{path}_{k} = 0.0;"
+                                f"    {basis_scalar} basis_q_{path}_{k} = 0.0;"
                             )
                     for cls, (members, basis_consumers) in enumerate(
                         basis_pool.items()
@@ -257,16 +260,16 @@ const int s = __ldg(src + edge);
                             for i, j, sign in members
                         ]
                         basis_lines.append(
-                            f"""const {basis_scalar} basis_pair_{cls} = {" ".join(additions)};"""
+                            f"""    const {basis_scalar} basis_pair_{cls} = {" ".join(additions)};"""
                         )
                         for path, k, coefficient in basis_consumers:
                             basis_lines.append(
-                                f"basis_q_{path}_{k} += {float_literal(coefficient, op.compute_dtype)} * basis_pair_{cls};"
+                                f"    basis_q_{path}_{k} += {float_literal(coefficient, op.compute_dtype)} * basis_pair_{cls};"
                             )
                     for path, spec in paths:
                         for k in range(int(spec["d3"])):
                             basis_lines.append(
-                                f"acc_{path}_{k} += basis_weight_{path} * basis_q_{path}_{k};"
+                                f"    acc_{path}_{k} += basis_weight_{path} * basis_q_{path}_{k};"
                             )
                     basis_lines.append("}")
                     shared_basis = "\n".join(basis_lines)
@@ -300,7 +303,7 @@ const int s = __ldg(src + edge);
                     }
                 )
                 lines.append(
-                    emit_path_contractions(
+                    textwrap.indent(emit_path_contractions(
                         op,
                         spec,
                         path,
@@ -308,26 +311,26 @@ const int s = __ldg(src + edge);
                         {"gg": [f"acc_{path}_{k}" for k in range(int(spec["d3"]))]},
                         with_env=with_env,
                         resident_values=resident,
-                    )
+                    ), '            ')
                 )
-        lines += ["}", "}"]
+        lines += ["        }", "    }"]
         slot = 0
         for path, spec in paths:
             for k in range(int(spec["d3"])):
                 lines.append(
-                    f"neighbor_sums[threadIdx.x * {max_live} + {slot}] = acc_{path}_{k};"
+                    f"    neighbor_sums[threadIdx.x * {max_live} + {slot}] = acc_{path}_{k};"
                 )
                 slot += 1
-        lines += ["__syncthreads();", f"if (neighbor_worker == 0 && u < {channels}) {{"]
+        lines += ["    __syncthreads();", f"    if (neighbor_worker == 0 && u < {channels}) {{"]
         slot = 0
         for path, spec in paths:
             d3, offset = int(spec["d3"]), int(spec["out_offset"])
             for k in range(d3):
                 lines += [
-                    r"""{scalar} value_{slot} = 0.0;
+                    r"""        {scalar} value_{slot} = 0.0;
 #pragma unroll
-for (int worker = 0; worker < {workers}; ++worker) value_{slot} += neighbor_sums[(worker * 32 + lane) * {max_live} + {slot}];
-out_g[Index(node) * {out_dim} + {offset} + u * {d3} + {k}] = value_{slot};""".format(
+        for (int worker = 0; worker < {workers}; ++worker) value_{slot} += neighbor_sums[(worker * 32 + lane) * {max_live} + {slot}];
+        out_g[Index(node) * {out_dim} + {offset} + u * {d3} + {k}] = value_{slot};""".format(
                         scalar=scalar,
                         slot=slot,
                         workers=workers,
@@ -339,12 +342,13 @@ out_g[Index(node) * {out_dim} + {offset} + u * {d3} + {k}] = value_{slot};""".fo
                     )
                 ]
                 slot += 1
-        lines += ["}", "break;", "}"]
+        lines += ["    }", "    break;", "}"]
         cases.append("\n".join(lines))
 
     setup = [
         r"""const Index task = blockIdx.x;
-if (task >= Index(num_nodes) * {total_tiles}) return;
+if (task >= Index(num_nodes) * {total_tiles})
+return;
 const int lane = threadIdx.x & 31;
 const int item = int(task / {total_tiles});
 const int tile = int(task % {total_tiles});
@@ -360,23 +364,22 @@ __shared__ {scalar} neighbor_sums[{shared_width}];""".format(
     name = "lunatp_uuuconv_fwd_input_groups" + (
         f"_{partition}" if partition is not None else ""
     )
-    kernel = r"""__global__ __launch_bounds__({threads}, 2)
-void {name}({parameters}) {{
+    kernel = r"""__global__ __launch_bounds__({threads}, 2) void {name}({parameters}) {{
 {setup}
-switch (group) {{
+    switch (group) {{
 {cases}
-}}
+    }}
 }}""".format(
         threads=threads,
         name=name,
         parameters=parameters,
-        setup="\n".join(setup + decode),
-        cases="\n".join(cases),
+        setup=textwrap.indent("\n".join(setup + decode), '    '),
+        cases=textwrap.indent("\n".join(cases), '        '),
     )
     launches = [
         r"""if (num_nodes > 0) {{
-dim3 grid(Index(num_nodes) * {total_tiles});
-{name}<<<grid, {threads}, 0, stream>>>({arguments});
+    dim3 grid(Index(num_nodes) * {total_tiles});
+    {name}<<<grid, {threads}, 0, stream>>>({arguments});
 }}""".format(
             total_tiles=total_tiles,
             name=name,

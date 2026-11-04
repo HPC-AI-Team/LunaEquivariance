@@ -57,6 +57,15 @@ y = norm(x)  # (num_atoms, norm.irreps_in.num_irreps)
 y.sum().backward()
 ```
 
+## Performance
+
+FP32 benchmarks on NVIDIA H100.
+
+- Input: 2,083 atoms, 64 channels per degree, `Lmax=2–6`
+- Norm: `squared=False`
+
+![Norm FP32 throughput and peak memory](../assets/performance/norm.png)
+
 ## Limitations
 
 - GPU acceleration requires compute capability 8.0 or later.

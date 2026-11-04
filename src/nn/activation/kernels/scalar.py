@@ -45,17 +45,7 @@ def scalar_literal(value, dtype):
 
 
 def emit_activation_aten_scalar(opname, args, *, dtype, params=None, approximate_tanh=False):
-    """Return one scalar CUDA expression for a registered ATen atom.
-
-    ``args`` contains C++ expression strings for Tensor arguments.  Static
-    Scalar arguments may either occur in their ATen positions as Python
-    numbers/C++ expressions, or be supplied in ``params``.  GELU's mode is
-    supplied as ``params['approximate']``. Powers 2 and 3 retain Torch's
-    multiplication order; other static powers use CUDA's overloaded pow.
-
-    The argument order is ATen's: backward atoms receive grad_output first.
-    This preserves associations and exceptional values for the actual seed,
-    rather than evaluating a derivative at a unit seed then multiplying.
+    """Emit a scalar CUDA expression using ATen's argument order.
     """
     scalar = scalar_type(dtype)
     name = str(opname).removeprefix('aten.').split('.')[0]
@@ -149,15 +139,12 @@ def emit_activation_aten_scalar(opname, args, *, dtype, params=None, approximate
 
 
 def activation_cuda_prelude(dtype, needed_ops, *, include_header=True, approximate_tanh=False):
-    """Emit just the requested activation atoms, without derivative jets.
+    """Emit CUDA helpers for the requested ATen atoms.
 
-    ``needed_ops`` contains ATen names or ``(name, params)`` descriptors.
-    Plain GELU names include both supported static variants. A descriptor
-    can restrict them to the actual approximation. Simple math operations
-    use CUDA overloads directly and need no device helper.
-    CUDA compilation must use precise math (no --use_fast_math).  Ordinary
-    tensor operations outside these atoms require explicit RN intrinsics;
-    expressions within an ATen CUDA atom keep its original functor syntax.
+    ``needed_ops`` accepts names or ``(name, params)`` pairs. Plain GELU names
+    include both approximation modes; params can select one. Compile without
+    --use_fast_math. ATen atoms keep their expression order; tensor operations
+    outside them need explicit round-to-nearest intrinsics.
     """
     scalar = scalar_type(dtype)
     selected = set()
