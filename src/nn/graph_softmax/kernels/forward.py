@@ -80,8 +80,13 @@ __device__ __forceinline__ ForwardPacket<T, Width> load_forward_packet(
         if (dim < width) result.value[0] = pointer[offset];
     } else if (vectorized && dim + Width - 1 < width) {
         if constexpr (sizeof(T) == sizeof(float)) {
-            float4 v = *reinterpret_cast<const float4*>(pointer + offset);
-            result = {{v.x, v.y, v.z, v.w}};
+            if constexpr (Width == 4) {
+                float4 v = *reinterpret_cast<const float4*>(pointer + offset);
+                result = {{v.x, v.y, v.z, v.w}};
+            } else {
+                float2 v = *reinterpret_cast<const float2*>(pointer + offset);
+                result = {{v.x, v.y}};
+            }
         } else {
             double2 v = *reinterpret_cast<const double2*>(pointer + offset);
             result = {{v.x, v.y}};
@@ -101,18 +106,22 @@ __device__ __forceinline__ void store_forward_packet(
     bool vectorized, const ForwardPacket<T, Width>& value)
 {
     if constexpr (Width == 1) {
-        if (dim < width) pointer[offset] = value.value[0];
+        if (dim < width) __stcs(pointer + offset, value.value[0]);
     } else if (vectorized && dim + Width - 1 < width) {
         if constexpr (sizeof(T) == sizeof(float)) {
-            *reinterpret_cast<float4*>(pointer + offset) = make_float4(
-                value.value[0], value.value[1], value.value[2], value.value[3]);
+            if constexpr (Width == 4) {
+                __stcs(reinterpret_cast<float4*>(pointer + offset), make_float4(
+                    value.value[0], value.value[1], value.value[2], value.value[3]));
+            } else {
+                __stcs(reinterpret_cast<float2*>(pointer + offset), make_float2(value.value[0], value.value[1]));
+            }
         } else {
-            *reinterpret_cast<double2*>(pointer + offset) = make_double2(value.value[0], value.value[1]);
+            __stcs(reinterpret_cast<double2*>(pointer + offset), make_double2(value.value[0], value.value[1]));
         }
     } else {
 #pragma unroll
         for (int c = 0; c < Width; ++c) {
-            if (dim + c < width) pointer[offset + c] = value.value[c];
+            if (dim + c < width) __stcs(pointer + offset + c, value.value[c]);
         }
     }
 }
@@ -181,7 +190,7 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
             for (int other = 1; other < Groups; ++other) {
 #pragma unroll
                 for (int c = 0; c < Width; ++c) {
-                    states[c].merge(normals[0][other][local_dim+c], normals[1][other][local_dim+c]);
+                    states[c].add(normals[0][other][local_dim+c], normals[1][other][local_dim+c]);
                 }
             }
 #pragma unroll
@@ -230,6 +239,71 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
         __syncthreads();
     }
 }
+
+// One warp per segment; adjacent lanes cover the features of each edge.
+template <typename T, int EnvMode, int Features>
+__global__ void graph_softmax_forward_narrow_kernel(
+    const T* __restrict__ data, const T* __restrict__ env,
+    const void* __restrict__ row_ptr, bool csr_int32, T* __restrict__ output,
+    int64_t segments, int64_t embed_dim, T eps, bool smooth_out)
+{
+    constexpr int Edges = kWarpSize / Features;
+    const int64_t dim = sizeof(T) == sizeof(float) && Features <= 2 ? Features : embed_dim;
+    const int64_t segment = int64_t(blockIdx.x) * (blockDim.x / kWarpSize) + threadIdx.x / kWarpSize;
+    if (segment >= segments) return;
+    const int64_t begin = csr_int32 ? static_cast<const int32_t*>(row_ptr)[segment]
+                                   : static_cast<const int64_t*>(row_ptr)[segment];
+    const int64_t end = csr_int32 ? static_cast<const int32_t*>(row_ptr)[segment + 1]
+                                 : static_cast<const int64_t*>(row_ptr)[segment + 1];
+    if (begin == end) return;
+    const int lane = threadIdx.x % kWarpSize;
+    const int feature = lane % Features;
+    const int64_t first = begin + lane / Features;
+    OnlineNormalizer<T> state;
+    if (feature < dim) {
+        for (int64_t edge = first; edge < end; edge += Edges) {
+            const int64_t offset = edge * dim + feature;
+            state.add(data[offset], env_value<T, EnvMode>(env, edge, feature, dim));
+        }
+    }
+
+    T maximum, sum;
+    bool merged = false;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if constexpr (Features == 1 && sizeof(T) == sizeof(float)) {
+        // Reverse the negative float encodings to use the signed integer warp maximum.
+        const int bits = __float_as_int(state.maximum);
+        const int key = bits < 0 ? bits ^ 0x7fffffff : bits;
+        const int max_key = __reduce_max_sync(0xffffffff, key);
+        // Keep the online merge for +inf; it handles a single +inf without inf - inf.
+        if (max_key != 0x7f800000) {
+            maximum = __int_as_float(max_key < 0 ? max_key ^ 0x7fffffff : max_key);
+            const T scaled = state.weighted_sum * exp_op(state.maximum - maximum);
+            sum = __shfl_sync(0xffffffff, warp_reduce_sum(scaled), 0);
+            merged = true;
+        }
+    }
+#endif
+    if (!merged) {
+#pragma unroll
+        for (int stride = kWarpSize / 2; stride >= Features; stride /= 2) {
+            const T other_max = __shfl_down_sync(0xffffffff, state.maximum, stride);
+            const T other_sum = __shfl_down_sync(0xffffffff, state.weighted_sum, stride);
+            state.add(other_max, other_sum);
+        }
+        maximum = __shfl_sync(0xffffffff, state.maximum, feature);
+        sum = __shfl_sync(0xffffffff, state.weighted_sum, feature);
+    }
+    const T inverse = T(1) / (sum + eps);
+    if (feature < dim) {
+        for (int64_t edge = first; edge < end; edge += Edges) {
+            const int64_t offset = edge * dim + feature;
+            const T weight = env_value<T, EnvMode>(env, edge, feature, dim);
+            output[offset] = exp_op(data[offset] - maximum) * inverse * weight
+                * (smooth_out ? weight : T(1));
+        }
+    }
+}
 '''
 
 
@@ -241,6 +315,45 @@ void launch_graph_softmax_row_ptr(
     build_row_ptr_kernel<<<(num_edges + 255) / 256, 256, 0, stream>>>(
         segment_ids, row_ptr, num_edges, num_segments);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename T, int Features>
+void launch_graph_softmax_forward_narrow_impl(
+    const T* data, const T* env, const void* row_ptr, bool csr_int32, T* output,
+    int64_t segments, int64_t dim, T eps, int mode, bool smooth, cudaStream_t stream)
+{
+    constexpr int Rows = kSoftmaxWarpRows;
+    constexpr int Threads = Rows * kWarpSize;
+    const auto blocks = (segments + Rows - 1) / Rows;
+    if (mode == 0) {
+        graph_softmax_forward_narrow_kernel<T, 0, Features><<<blocks, Threads, 0, stream>>>(
+            data, env, row_ptr, csr_int32, output, segments, dim, eps, smooth);
+    } else if (mode == 1) {
+        graph_softmax_forward_narrow_kernel<T, 1, Features><<<blocks, Threads, 0, stream>>>(
+            data, env, row_ptr, csr_int32, output, segments, dim, eps, smooth);
+    } else {
+        graph_softmax_forward_narrow_kernel<T, 2, Features><<<blocks, Threads, 0, stream>>>(
+            data, env, row_ptr, csr_int32, output, segments, dim, eps, smooth);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename T>
+bool launch_graph_softmax_forward_narrow(
+    const T* data, const T* env, const void* row_ptr, bool csr_int32, T* output,
+    int64_t segments, int64_t dim, T eps, int mode, bool smooth, cudaStream_t stream)
+{
+    if (dim > 8) return false;
+    if (dim <= 1) {
+        launch_graph_softmax_forward_narrow_impl<T, 1>(data, env, row_ptr, csr_int32, output, segments, dim, eps, mode, smooth, stream);
+    } else if (dim <= 2) {
+        launch_graph_softmax_forward_narrow_impl<T, 2>(data, env, row_ptr, csr_int32, output, segments, dim, eps, mode, smooth, stream);
+    } else if (dim <= 4) {
+        launch_graph_softmax_forward_narrow_impl<T, 4>(data, env, row_ptr, csr_int32, output, segments, dim, eps, mode, smooth, stream);
+    } else {
+        launch_graph_softmax_forward_narrow_impl<T, 8>(data, env, row_ptr, csr_int32, output, segments, dim, eps, mode, smooth, stream);
+    }
+    return true;
 }
 
 template <typename scalar_t, int Width, int Threads>
@@ -273,7 +386,7 @@ void launch_graph_softmax_forward_rows(
     T eps, int mode, bool smooth, cudaStream_t stream)
 {
     // Bound packet work per CTA; give longer rows more cooperating warps.
-    if (edges <= segments * 64) {
+    if (edges <= segments * kRowEdgeLimit) {
         launch_graph_softmax_forward_impl<T, Width, 128>(
             data, env, row_ptr, csr_int32, output, segments, dim, eps, mode, smooth, stream);
     } else {
@@ -287,12 +400,18 @@ void launch_graph_softmax_forward(
     float* output, int64_t num_segments, int64_t embed_dim, int64_t edges,
     float eps, int env_mode, bool smooth_out, cudaStream_t stream)
 {
-    if (embed_dim <= 32 || embed_dim % 4 != 0) {
-        launch_graph_softmax_forward_rows<float, 1>(
+    if (launch_graph_softmax_forward_narrow(data, env, row_ptr, csr_int32, output,
+            num_segments, embed_dim, eps, env_mode, smooth_out, stream)) return;
+    if (embed_dim % 128 == 0) {
+        launch_graph_softmax_forward_rows<float, 4>(
+            data, env, row_ptr, csr_int32, output, num_segments, embed_dim, edges,
+            eps, env_mode, smooth_out, stream);
+    } else if (embed_dim % 64 == 0) {
+        launch_graph_softmax_forward_rows<float, 2>(
             data, env, row_ptr, csr_int32, output, num_segments, embed_dim, edges,
             eps, env_mode, smooth_out, stream);
     } else {
-        launch_graph_softmax_forward_rows<float, 4>(
+        launch_graph_softmax_forward_rows<float, 1>(
             data, env, row_ptr, csr_int32, output, num_segments, embed_dim, edges,
             eps, env_mode, smooth_out, stream);
     }
@@ -303,6 +422,8 @@ void launch_graph_softmax_forward(
     double* output, int64_t num_segments, int64_t embed_dim, int64_t edges,
     double eps, int env_mode, bool smooth_out, cudaStream_t stream)
 {
+    if (launch_graph_softmax_forward_narrow(data, env, row_ptr, csr_int32, output,
+            num_segments, embed_dim, eps, env_mode, smooth_out, stream)) return;
     if (embed_dim <= 32 || embed_dim % 2 != 0) {
         launch_graph_softmax_forward_rows<double, 1>(
             data, env, row_ptr, csr_int32, output, num_segments, embed_dim, edges,

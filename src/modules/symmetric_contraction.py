@@ -23,11 +23,12 @@ class LunaEqSymmetricContraction(torch.nn.Module):
         self.config = get_operator_config(str(self.irreps_in), str(self.irreps_out), correlation,
                                           num_elements, dtype, use_reduced_cg)
         self.meta = kernel_metadata(self.config)
+        uniform = len({mul for mul, _ in (*self.irreps_in, *self.irreps_out)}) == 1
         parts = []
         for index, count in enumerate(self.meta["path_counts"]):
             channels = self.irreps_out[index // correlation].mul
             value = torch.randn(num_elements, count, channels, device=device, dtype=dtype) / max(1, count)
-            parts.append(value if self.meta["input_layout"] == "channels" else value.flatten(1))
+            parts.append(value if uniform else value.flatten(1))
         self.weight = torch.nn.Parameter(torch.cat(parts, dim=1))
 
     def get_extra_state(self):
@@ -41,7 +42,7 @@ class LunaEqSymmetricContraction(torch.nn.Module):
         self.use_reduced_cg = spec["use_reduced_cg"]
 
     def forward(self, x, attrs):
-        return SymmetricContractionForward.apply(x, self.weight, attrs, self.config)
+        return SymmetricContractionForward.apply(x, self.weight.flatten(1), attrs, self.config)
 
 
 __all__ = ['LunaEqSymmetricContraction']

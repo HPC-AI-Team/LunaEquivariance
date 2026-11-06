@@ -68,7 +68,7 @@ constexpr int Groups = ${groups};
 constexpr int ReductionGroups = ${reduce_tile};
 constexpr int ComputeGroups = ${compute_tile};
 constexpr int ReductionChunks = ReductionGroups / ComputeGroups;
-constexpr int ChannelTile = 16;
+constexpr int ChannelTile = ${channel_tile};
 constexpr int RowsPerBlock = ${rows_per_block};
 constexpr int PacketWidth = 16 / sizeof(Element);
 constexpr int ProductStride = RowsPerBlock + PacketWidth;
@@ -141,7 +141,7 @@ __global__ __launch_bounds__(${thread_count}, AccumulateWeights ? ${fp64_block_m
             const Index batch = node_tile * RowsPerBlock;
             const Index end = batch + RowsPerBlock < rows ? batch + RowsPerBlock : rows;
             const Index row = batch + local_row;
-            int count = 0;
+/* initialize_tile_weights */            int count = 0;
             for (int first = 0; first < Elements; first += ChannelTile) {
                 const int element = first + lane;
                 const Element attribute = row < end && element < Elements
@@ -182,7 +182,7 @@ __global__ __launch_bounds__(${thread_count}, AccumulateWeights ? ${fp64_block_m
             Element gradient[WriteX ? InputDim : 1] = {};
 /* sparse_begin */            int num_windows = ${num_compute_windows};
             /* active_windows */
-            #pragma unroll 1
+            #pragma unroll ${window_unroll}
             for (int window = 0; window < num_windows; ++window) {
                 if constexpr (WriteWeights) {
                     if (/* skip_direct_scatter */window % ReductionChunks == 0) {
@@ -301,7 +301,7 @@ CUDA_BINDING = r"""std::tuple<std::optional<at::Tensor>, std::optional<at::Tenso
     const int64_t rows = x.size(0);
     std::optional<at::Tensor> dx, dw, da;
     if (need_x) dx = at::empty_like(x);
-    if (need_weights) dw = at::zeros_like(weights);
+    if (need_weights) dw = /* weight_allocation */;
     if (need_attrs) da = at::empty_like(attrs);
     if (rows == 0) return {dx, dw, da};
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -471,7 +471,7 @@ def binary_groups(meta, group_tile):
 def binary_code(meta, groups, pair_windows, reduction_groups, projected_weights=False, scatter_rows=False):
     compute_groups = len(groups) // len(pair_windows)
     windows, attribute_polynomials, attribute_gradient, weight_scatter = [], [], [], []
-    prune = meta.get("input_layout", "channels") != "channels"
+    prune = any(count != meta["channels"] for count in (*meta["input_channels"], *meta["output_channels"]))
     weight_stride = "WeightSize" if prune else "Paths * Channels"
     gradients = [f"grad[{offset} + channel * {stride}]"
                 for offset, stride in zip(meta["output_offsets"], meta["output_strides"])]
@@ -726,7 +726,6 @@ __global__ __launch_bounds__(${thread_count}, /* register_min_blocks */) void sy
 def register_backward_kernel(meta, groups, loads, stores, *, fp64=False):
     """Consume each atom's parameter products before a single CTA reduction."""
     elements = meta['num_elements']
-    packed = meta.get('input_layout', 'channels') != 'channels'
     live_groups = [index for index, (terms, members) in enumerate(groups) if terms and members]
     projection, totals, attributes, polynomials, partials, scatter = [], [], [], [], [], []
     for local, group in enumerate(live_groups):
@@ -734,10 +733,9 @@ def register_backward_kernel(meta, groups, loads, stores, *, fp64=False):
         projection += ['            for (int element = local_row; element < Elements; element += RowsPerBlock) {',
                        '                Element weight = 0;', '                if (channel < Channels) {']
         for path, coefficient in members:
-            offset = meta['path_offsets'][path] if packed else path * meta['channels']
+            offset = meta['path_offsets'][path]
             value = f'weights[Index(element) * ${{weight_element_stride}} + Index({offset}) + channel]'
-            if packed:
-                value = f'(channel < {meta["path_channels"][path]} ? {value} : Element(0))'
+            value = f'(channel < {meta["path_channels"][path]} ? {value} : Element(0))'
             projection.append(f'                    weight = fma(Element({coefficient:.17g}), {value}, weight);')
         projection += ['                }',
                        f'                projected_weights[({local} * Elements + element) * ChannelTile + lane] = weight;',
@@ -762,7 +760,7 @@ def register_backward_kernel(meta, groups, loads, stores, *, fp64=False):
             by_output[output].append((inputs, coefficient))
         for output, polynomial in sorted(by_output.items()):
             offset, stride = meta['output_offsets'][output], meta['output_strides'][output]
-            count = meta['output_channels'][output] if packed else meta['channels']
+            count = meta['output_channels'][output]
             polynomials += ['                    {', f'                        const Element output_gradient = channel < {count} ? grad[{offset} + channel * {stride}] : Element(0);',
                             '                        Element polynomial;']
             polynomials += ['                        ' + line for line in polynomial_backward_code(polynomial, 'polynomial', 'mixed_weight * output_gradient')]
@@ -808,10 +806,9 @@ def make_backward_source(meta, dtype="float32"):
         meta = polynomial
     input_dim, channels = meta["input_dim"], meta["channels"]
     elements = meta["num_elements"]
-    packed = meta.get("input_layout", "channels") != "channels"
-    input_counts = meta["input_channels"] if packed else (channels,) * input_dim
-    input_offsets = meta["input_offsets"] if packed else tuple(range(input_dim))
-    input_strides = meta["input_strides"] if packed else (input_dim,) * input_dim
+    input_counts = meta["input_channels"]
+    input_offsets = meta["input_offsets"]
+    input_strides = meta["input_strides"]
     rows_per_block = 16 // (element_bytes // 4)
     live_words = 2 * input_dim + len(meta["output_offsets"]) + WEIGHT_GROUP_TILE
     attribute_bytes = rows_per_block * (elements * (element_bytes + 4) + 4) + elements * 16
@@ -820,12 +817,17 @@ def make_backward_source(meta, dtype="float32"):
     reduction_groups = max(1, min(2 * WEIGHT_GROUP_TILE // (element_bytes // 4), 1 << (max(1, product_capacity).bit_length() - 1)))
     compute_groups = min(WEIGHT_GROUP_TILE, reduction_groups)
     groups, pair_windows = binary_groups(meta, compute_groups)
+    if (element_bytes == 4 and elements <= rows_per_block
+            and live_words <= BACKWARD_REGISTER_LIVE_WORDS
+            and min(len(groups), product_capacity) >= 2 * reduction_groups):
+        reduction_groups *= 2
     active_groups = max((index + 1 for index, (terms, members) in enumerate(groups) if terms and members), default=0)
     block_shared_bytes = ((2 * active_groups * elements * 16
                            + (reduction_groups * 16 + elements) * (rows_per_block + 16 // element_bytes))
                           * element_bytes + rows_per_block * (elements + 1) * 4)
     live_groups = [(terms, members) for terms, members in groups if terms and members]
     register_words = element_bytes // 4
+    window_register_words = (2 * input_dim + len(meta["output_offsets"]) + len(live_groups)) * register_words
     parameter_budget = (BACKWARD_FP64_REGISTER_PARAMETER_WORDS if element_bytes == 8
                         else BACKWARD_REGISTER_PARAMETER_WORDS)
     register_totals = (len(live_groups) * elements * register_words <= parameter_budget
@@ -836,22 +838,13 @@ def make_backward_source(meta, dtype="float32"):
     fp64_parameters = element_bytes == 8 and (fp64_register_totals or block_shared_bytes <= SHARED_MEMORY_BYTES)
     if register_totals and element_bytes == 4:
         rows_per_block = BACKWARD_REGISTER_ROWS
+    channel_tile = 16
+    uniform_channels = all(count == channels for count in (*input_counts, *meta["output_channels"]))
+    if element_bytes == 4 and uniform_channels:
+        channel_tile = min(16, max(4, 1 << (max(channels, input_dim) - 1).bit_length()))
     loads = [f"Element values[{input_dim}];", "if (valid) {"]
-    if packed:
-        loads += [f"    values[{component}] = channel < {count} ? features[{offset} + Index(channel) * {stride}] : Element(0);"
-                  for component, (count, offset, stride) in enumerate(zip(input_counts, input_offsets, input_strides))]
-    else:
-        vector_width = min(16 // element_bytes, input_dim & -input_dim)
-        vector_type = ("double" if element_bytes == 8 else "float") + (str(vector_width) if vector_width > 1 else "")
-        scalar_loads = [f"values[{component}] = features[{component}];" for component in range(input_dim)]
-        if vector_width > 1:
-            loads.append(f"    if ((reinterpret_cast<uintptr_t>(features) & {element_bytes * vector_width - 1}) == 0) {{")
-            for chunk in range(input_dim // vector_width):
-                loads += [f"        const {vector_type} packed{chunk} = reinterpret_cast<const {vector_type}*>(features)[{chunk}];"]
-                loads += [f"        values[{chunk * vector_width + position}] = packed{chunk}.{'xyzw'[position]};" for position in range(vector_width)]
-            loads += ["    } else {"] + ["        " + line for line in scalar_loads] + ["    }"]
-        else:
-            loads += ["    " + line for line in scalar_loads]
+    loads += [f"    values[{component}] = channel < {count} ? features[{offset} + Index(channel) * {stride}] : Element(0);"
+              for component, (count, offset, stride) in enumerate(zip(input_counts, input_offsets, input_strides))]
     loads += ["}"]
 
     stores, first = [], 0
@@ -861,7 +854,7 @@ def make_backward_source(meta, dtype="float32"):
                and input_strides[stop] == input_strides[first]
                and input_offsets[stop] == input_offsets[first] + stop - first):
             stop += 1
-        width = min(32 // element_bytes, 1 << ((stop - first).bit_length() - 1))
+        width = min(channel_tile, 32 // element_bytes, 1 << ((stop - first).bit_length() - 1))
         stores += ["{", f"    Element items[{width}] = {{" + ", ".join(f"gradient[{first + item}]" for item in range(width)) + "};",
                    f"    using Exchange = cub::WarpExchange<Element, {width}, {width}, 0, cub::WARP_EXCHANGE_SHUFFLE>;",
                    "    typename Exchange::TempStorage storage;",
@@ -869,32 +862,48 @@ def make_backward_source(meta, dtype="float32"):
                    f"    const int local_lane = lane & {width - 1};",
                    "    const int first_channel = channel - local_lane;"]
         for item in range(width):
-            if packed:
-                stores += [f"    if (row < end && first_channel + {item} < {input_counts[first]})",
-                           f"        dx[row * InputSize + {input_offsets[first]} + local_lane + Index(first_channel + {item}) * {input_strides[first]}] = items[{item}];"]
-            else:
-                stores += [f"    if (row < end && first_channel + {item} < Channels)",
-                           f"        dx[(row * Channels + first_channel + {item}) * InputDim + {first} + local_lane] = items[{item}];"]
+            stores += [f"    if (row < end && first_channel + {item} < {input_counts[first]})",
+                       f"        dx[row * InputSize + {input_offsets[first]} + local_lane + Index(first_channel + {item}) * {input_strides[first]}] = items[{item}];"]
         stores += ["}"]
         first += width
-    store_block = "if constexpr (WriteX) {\n" + ("" if packed else "                ")
-    store_block += "\n".join(stores) + "\n            }"
-    feature_values = [f"features[{component}]" for component in range(input_dim)]
-    if packed:
-        feature_values = [f"(channel < {count} ? features[{offset} + Index(channel) * {stride}] : Element(0))"
-                          for count, offset, stride in zip(input_counts, input_offsets, input_strides)]
+    block_stores = stores
+    max_stride = max(input_strides)
+    if (max_stride > 1 and (max_stride * channel_tile + 1) * rows_per_block
+            <= reduction_groups * channel_tile * (rows_per_block + 16 // element_bytes)):
+        block_stores = ["if constexpr (WriteWeights) {",
+                        f"using FeatureStorage = typename cub::WarpExchange<Element, {max_stride}, ChannelTile>::TempStorage;",
+                        "static_assert(sizeof(FeatureStorage) * RowsPerBlock <= sizeof(products));",
+                        "auto* feature_storage = reinterpret_cast<FeatureStorage*>(products);"]
+        first = 0
+        while first < input_dim:
+            stride, count, offset = input_strides[first], input_counts[first], input_offsets[first]
+            values = ", ".join(f"gradient[{first + item}]" for item in range(stride))
+            block_stores += ["{", f"Element items[{stride}] = {{{values}}};",
+                             f"using Exchange = cub::WarpExchange<Element, {stride}, ChannelTile>;",
+                             "auto& storage = *reinterpret_cast<typename Exchange::TempStorage*>(feature_storage + local_row);",
+                             "Exchange(storage).BlockedToStriped(items, items);"]
+            for item in range(stride):
+                index = f"Index(channel - lane) * {stride} + lane + {item * channel_tile}"
+                block_stores += [f"if (row < end && {index} < {count * stride})",
+                                 f"    dx[row * InputSize + {offset} + {index}] = items[{item}];"]
+            block_stores += ["__syncwarp();", "}"]
+            first += stride
+        block_stores += ["} else {", *stores, "}"]
+    store_block = "if constexpr (WriteX) {\n"
+    store_block += "\n".join(block_stores) + "\n            }"
+    feature_values = [f"(channel < {count} ? features[{offset} + Index(channel) * {stride}] : Element(0))"
+                      for count, offset, stride in zip(input_counts, input_offsets, input_strides)]
     live_words = 2 * input_dim + len(meta['output_offsets']) + compute_groups
     # Keep the original launch bounds for dense tiles.
-    weight_ctas = 3 if live_words <= 32 else (512 // (element_bytes // 4)) // (rows_per_block * 16)
+    weight_ctas = 3 if live_words <= 32 else (512 // (element_bytes // 4)) // (rows_per_block * channel_tile)
     direct_scatter = (element_bytes == 4 and not register_totals and elements > rows_per_block
                       and live_words <= DIRECT_SCATTER_LIVE_WORDS)
     sparse_begin, sparse_end = "", ""
     if direct_scatter:
         gradients = [f"grad[{offset} + channel * {stride}]"
                      for offset, stride in zip(meta["output_offsets"], meta["output_strides"])]
-        if packed:
-            gradients = [f"(channel < {count} ? {value} : Element(0))"
-                         for count, value in zip(meta["output_channels"], gradients)]
+        gradients = [f"(channel < {count} ? {value} : Element(0))"
+                     for count, value in zip(meta["output_channels"], gradients)]
         row_attribute_state = (
             "            const int num_attributes = attribute_counts[local_row];\n"
             "            const int first_element = num_attributes ? attribute_elements[local_row][0] : 0;\n"
@@ -913,13 +922,13 @@ def make_backward_source(meta, dtype="float32"):
         sparse_end = "            }\n"
     windows, attribute_polynomials, attribute_gradient, weight_scatter = binary_code(
         meta, groups, pair_windows, reduction_groups, fp64_parameters and not fp64_register_totals)
-    layout_constants, active_windows, group_guard = "", "", ""
-    if packed:
-        active_channels = [max((min(meta["output_channels"][output], *(meta["input_channels"][component] for component in inputs))
-                                for output, inputs, _ in terms), default=0) for terms, _ in groups]
-        window_channels = [max(active_channels[first:first + compute_groups]) for first in range(0, len(groups), compute_groups)]
-        layout_constants = (f"\nconstexpr int InputSize = {meta['input_size']};\n"
-                            f"constexpr int WeightSize = {meta['weight_numel']};\n")
+    active_windows, group_guard = "", ""
+    active_channels = [max((min(meta["output_channels"][output], *(meta["input_channels"][component] for component in inputs))
+                            for output, inputs, _ in terms), default=0) for terms, _ in groups]
+    window_channels = [max(active_channels[first:first + compute_groups]) for first in range(0, len(groups), compute_groups)]
+    layout_constants = (f"\nconstexpr int InputSize = {meta['input_size']};\n"
+                        f"constexpr int WeightSize = {meta['weight_numel']};\n")
+    if any(count != channels for count in (*input_counts, *meta["output_channels"])):
         layout_constants += "__device__ const int GroupChannels[] = {" + ", ".join(map(str, active_channels)) + "};\n"
         layout_constants += "__device__ const int WindowChannels[] = {" + ", ".join(map(str, window_channels)) + "};"
         active_windows = f"num_windows = 0;\n            while (num_windows < {len(pair_windows)} && channel_tile * ChannelTile < WindowChannels[num_windows]) ++num_windows;"
@@ -929,10 +938,9 @@ def make_backward_source(meta, dtype="float32"):
         for group, (_, members) in enumerate(groups):
             projection.append(f'case {group}: {{')
             for path, coefficient in members:
-                offset = meta['path_offsets'][path] if packed else path * channels
+                offset = meta['path_offsets'][path]
                 value = f'weights[base + Index({offset})]'
-                if packed:
-                    value = f'(channel < {meta["path_channels"][path]} ? {value} : Element(0))'
+                value = f'(channel < {meta["path_channels"][path]} ? {value} : Element(0))'
                 projection.append(f'    projected = fma(Element({coefficient:.17g}), {value}, projected);')
             projection += ['    break;', '}']
     # FP32 register totals replace the tiled kernel. FP64 keeps the tiled
@@ -949,7 +957,7 @@ def make_backward_source(meta, dtype="float32"):
             weights_kernel = "symmetric_contraction_bwd_block_${precision}<INDEX, WRITE_X, WRITE_W>"
         else:
             weights_kernel = "symmetric_contraction_bwd_${precision}<INDEX, WRITE_X, WRITE_W, true>"
-        channel_tiles = (channels + 15) // 16
+        channel_tiles = (channels + channel_tile - 1) // channel_tile
         waves = BACKWARD_FP64_REGISTER_CTA_WAVES if fp64_register_totals else BACKWARD_PARAMETER_CTA_WAVES
         blocks = (max(1, waves * meta["multiprocessor_count"] // channel_tiles)
                   if "multiprocessor_count" in meta else MAX_BLOCKS)
@@ -961,17 +969,37 @@ def make_backward_source(meta, dtype="float32"):
         launch = FP64_BLOCK_LAUNCH.replace("/* weights_kernel */", weights_kernel)
     elif register_totals and element_bytes == 4:
         block_kernel = register_backward_kernel(meta, groups, loads, stores)
-        channel_tiles = (channels + 15) // 16
+        channel_tiles = (channels + channel_tile - 1) // channel_tile
         sm_count = meta.get("multiprocessor_count", 1)
         blocks = max(1, BACKWARD_REGISTER_SINGLE_CTA_WAVES * sm_count // channel_tiles)
         fused_blocks = max(1, BACKWARD_REGISTER_CTA_WAVES * sm_count // channel_tiles)
         grid_x = f"std::min<int64_t>(need_x && need_weights ? {fused_blocks} : {blocks}, splits)"
         grid_y = "std::min(ChannelTiles, 65535)"
         row_limit = "int64_t(blocks.x) * RowsPerBlock"
+    block_thread_budget = (768 if element_bytes == 4 and window_register_words <= BACKWARD_REGISTER_LIVE_WORDS
+                           else 512 // register_words)
+    initialize_tile_weights = ""
+    weight_allocation = "at::zeros_like(weights)"
+    if (element_bytes == 4 and elements <= rows_per_block
+            and window_register_words <= BACKWARD_REGISTER_LIVE_WORDS
+            and uniform_channels and not register_totals):
+        weight_allocation = "(rows > 0 && rows <= RowsPerBlock ? at::empty_like(weights) : at::zeros_like(weights))"
+        initialize_tile_weights = """            if constexpr (WriteWeights) {
+                if (rows <= RowsPerBlock) {
+                    #pragma unroll 1
+                    for (int64_t item = threadIdx.x; item < int64_t(Elements) * Paths * ChannelTile; item += Threads) {
+                        const int column = channel_tile * ChannelTile + item % ChannelTile;
+                        if (column < Channels) dw[(item / ChannelTile) * Channels + column] = Element(0);
+                    }
+                    __syncthreads();
+                }
+            }
+"""
     source = CUDA_HEADER + block_kernel + ATTRIBUTE_CUDA_SOURCE + CUDA_BINDING
     reduce_weights = "(window + 1) % ReductionChunks == 0 || window + 1 == num_windows"
     for marker, code in {
         "grid_x": grid_x, "grid_y": grid_y, "row_limit": row_limit, "launch_index": launch,
+        "initialize_tile_weights": initialize_tile_weights, "weight_allocation": weight_allocation,
         "reduction_values": "\n".join(
             f"sum = fma(attributes.{component}, values.{component}, sum);"
             for component in "xyzw"[:16 // element_bytes]
@@ -1006,13 +1034,14 @@ def make_backward_source(meta, dtype="float32"):
         groups=len(groups), num_compute_windows=len(pair_windows),
         reduce_tile=reduction_groups, compute_tile=compute_groups, rows_per_block=rows_per_block,
         element_workers=min(rows_per_block, 1 << (elements - 1).bit_length()),
-        thread_count=rows_per_block * 16,
-        min_blocks=(512 // (element_bytes // 4)) // (rows_per_block * 16),
+        thread_count=rows_per_block * channel_tile, channel_tile=channel_tile,
+        min_blocks=block_thread_budget // (rows_per_block * channel_tile),
         max_blocks=MAX_BLOCKS, layout_constants=layout_constants,
         fp64_block_min_ctas=BACKWARD_FP64_BLOCK_MIN_CTAS,
         reduction_unroll="" if fp64_parameters and not fp64_register_totals else "1",
-        weight_element_stride="WeightSize" if packed else "Paths * Channels",
-        feature_row_offset="row * InputSize" if packed else "(row * Channels + channel) * InputDim",
+        window_unroll="" if window_register_words <= BACKWARD_REGISTER_LIVE_WORDS else "1",
+        weight_element_stride="WeightSize",
+        feature_row_offset="row * InputSize",
         group_support_guard=group_guard,
     )
 

@@ -49,39 +49,64 @@ MODULE_BINDING = '    m.def("graph_softmax_triple_backward_cuda", &graph_softmax
 
 
 CUDA_SOURCE = r"""
+
 // A, C, T are the three row moments in double backward.  Reverse their
 // scalar equations, then reverse q_i = exp(x_i-m)/(sum(exp(x-m)*e)+eps).
 // Smooth output only changes f=e*e, t=2*e and t'=2 in this same calculation.
-template <typename T>
-__device__ __forceinline__ T triple_env(
-    const T* ptr, int64_t edge, int64_t offset, int mode, T absent)
+template <typename T, int Mode>
+__device__ __forceinline__ T triple_env(const T *ptr, int64_t edge, int64_t offset, T absent)
 {
-    return ptr ? ptr[mode == 1 ? edge : offset] : absent;
+    if constexpr (Mode == 0)
+        return absent;
+    else
+        return ptr ? ptr[Mode == 1 ? edge : offset] : absent;
 }
 
-template <typename T, int Threads>
-__global__ void __launch_bounds__(Threads, 1) graph_softmax_triple_backward_kernel(
-    const T* wg, const T* wx, const T* we,
-    const T* u, const T* v, const T* g,
-    const T* data, const T* env,
-    const void* row_ptr, bool csr_int32, T* du, T* dv, T* dg, T* dx, T* de,
-    int64_t dim, int env_mode, bool smooth, T eps)
+template <int FeatureTile, typename T>
+__device__ __forceinline__ void warp_merge_triple_moments(OnlineMoments<T, 7>& state)
 {
-    constexpr int Warps = Threads / 32;
-    __shared__ T row_moments[9][Warps][32];
-    const int64_t segment = blockIdx.x;
-    const int64_t begin = (csr_int32 ? static_cast<const int32_t*>(row_ptr)[segment]
-        : static_cast<const int64_t*>(row_ptr)[segment]);
-    const int64_t end = (csr_int32 ? static_cast<const int32_t*>(row_ptr)[segment + 1]
-        : static_cast<const int64_t*>(row_ptr)[segment + 1]);
-    if (begin == end) return;
-    const bool scalar_grad = env_mode == 1 && (dv != nullptr || de != nullptr);
-    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+#pragma unroll
+    for (int offset = kWarpSize / 2; offset >= FeatureTile; offset /= 2) {
+        T moments[7];
+#pragma unroll
+        for (int j = 0; j < 7; ++j)
+            moments[j] = __shfl_xor_sync(0xffffffff, state.moments[j], offset);
+        state.add(__shfl_xor_sync(0xffffffff, state.maximum, offset),
+                    __shfl_xor_sync(0xffffffff, state.weighted_sum, offset), moments);
+    }
+}
 
-    // Warps partition the row; lanes own adjacent features.
-    for (int64_t feature_base = env_mode == 1 ? 0 : int64_t(blockIdx.y) * 32;
-         feature_base < dim; feature_base += env_mode == 1 ? 32 : int64_t(gridDim.y) * 32) {
-        const int64_t feature = feature_base + lane;
+template <typename T, int Threads, int EnvMode, int FeatureTile, int RowsPerBlock>
+__global__ void __launch_bounds__(Threads * RowsPerBlock, 1)
+    graph_softmax_triple_backward_kernel(const T *wg, const T *wx, const T *we, const T *u, const T *v,
+                                         const T *g, const T *data, const T *env, const void *row_ptr,
+                                         bool csr_int32, T *du, T *dv, T *dg, T *dx, T *de, int64_t dim,
+                                         bool smooth, T eps, int64_t segments)
+{
+    constexpr bool WarpRows = RowsPerBlock > 1;
+    constexpr int EdgeGroups = Threads / FeatureTile;
+    constexpr int Warps = Threads / kWarpSize;
+    constexpr int WarpEdgeGroups = kWarpSize / FeatureTile;
+    constexpr bool WarpMerge = !WarpRows && FeatureTile < kWarpSize && Warps == WarpEdgeGroups;
+    constexpr int MomentGroups = WarpMerge ? Warps : EdgeGroups;
+    __shared__ T row_moments[9][MomentGroups][FeatureTile];
+    const unsigned row_thread = WarpRows ? threadIdx.x % kWarpSize : threadIdx.x;
+    const int64_t segment = WarpRows ? int64_t(blockIdx.x) * RowsPerBlock + threadIdx.x / kWarpSize
+                             : int64_t(blockIdx.x);
+    if constexpr (WarpRows) {
+        if (segment >= segments) return;
+    }
+    const int64_t begin = (csr_int32 ? static_cast<const int32_t *>(row_ptr)[segment]
+                                     : static_cast<const int64_t *>(row_ptr)[segment]);
+    const int64_t end = (csr_int32 ? static_cast<const int32_t *>(row_ptr)[segment + 1]
+                                   : static_cast<const int64_t *>(row_ptr)[segment + 1]);
+    if (begin == end) return;
+    const bool scalar_grad = EnvMode == 1 && (dv != nullptr || de != nullptr);
+    const int feature_lane = row_thread % FeatureTile;
+    const int edge_group = row_thread / FeatureTile;
+    for (int64_t feature_base = EnvMode == 1 ? 0 : int64_t(blockIdx.y) * FeatureTile; feature_base < dim;
+         feature_base += EnvMode == 1 ? FeatureTile : int64_t(gridDim.y) * FeatureTile) {
+        const int64_t feature = feature_base + feature_lane;
         const bool active = feature < dim;
         T maximum = T(0), inverse = T(0);
         T a = T(0), c = T(0), total = T(0);
@@ -91,81 +116,126 @@ __global__ void __launch_bounds__(Threads, 1) graph_softmax_triple_backward_kern
             if (end - begin == 1) {
                 const int64_t off = begin * dim + feature;
                 maximum = data[off];
-                inverse = T(1) / (triple_env(env, begin, off, env_mode, T(1)) + eps);
+                inverse = T(1) / (triple_env<T, EnvMode>(env, begin, off, T(1)) + eps);
             } else {
-                for (int64_t edge = begin + warp; edge < end; edge += Warps) {
-                const int64_t off = edge * dim + feature;
-                const T e = triple_env(env, edge, off, env_mode, T(1));
-                const T vv = triple_env(v, edge, off, env_mode, T(0));
-                const T uu = u ? u[off] : T(0), gg = g[off];
-                const T w = wg ? wg[off] : T(0), z = wx ? wx[off] : T(0);
-                const T r = triple_env(we, edge, off, env_mode, T(0));
-                const T f = smooth ? e * e : e;
-                const T t = smooth ? T(2) * e : T(1);
-                const T tp = smooth ? T(2) : T(0);
-                const T b = uu * e + vv, h = uu * f + vv * t;
-                const T hbar = w + z * gg;
-                const T weights[7] = {
-                    gg * f, b, gg * h, z * e + r,
-                    z * b + r * uu, hbar * f + r * gg * t,
-                    hbar * h + r * gg * (uu * t + vv * tp),
-                };
-                state.add(data[off], e, weights);
+                for (int64_t edge = begin + edge_group; edge < end; edge += EdgeGroups) {
+                    const int64_t off = edge * dim + feature;
+                    const T e = triple_env<T, EnvMode>(env, edge, off, T(1));
+                    const T vv = triple_env<T, EnvMode>(v, edge, off, T(0));
+                    const T uu = u ? u[off] : T(0), gg = g[off];
+                    const T w = wg ? wg[off] : T(0), z = wx ? wx[off] : T(0);
+                    const T r = triple_env<T, EnvMode>(we, edge, off, T(0));
+                    const T f = smooth ? e * e : e;
+                    const T t = smooth ? T(2) * e : T(1);
+                    const T tp = smooth ? T(2) : T(0);
+                    const T b = uu * e + vv, h = uu * f + vv * t;
+                    const T hbar = w + z * gg;
+                    const T weights[7] = {
+                        gg * f,
+                        b,
+                        gg * h,
+                        z * e + r,
+                        z * b + r * uu,
+                        hbar * f + r * gg * t,
+                        hbar * h + r * gg * (uu * t + vv * tp),
+                    };
+                    state.add(data[off], e, weights);
+                }
             }
         }
-    }
-    if (end - begin != 1) {
-        row_moments[0][warp][lane] = state.maximum;
-        row_moments[1][warp][lane] = state.weighted_sum;
-        #pragma unroll
-        for (int j = 0; j < 7; ++j) row_moments[j+2][warp][lane] = state.moments[j];
-        __syncthreads();
-        #pragma unroll
-        for (int stride = Warps / 2; stride > 0; stride /= 2) {
-            if (warp < stride) {
-                T moments[7];
-                #pragma unroll
-                for (int j = 0; j < 7; ++j) moments[j] = row_moments[j+2][warp+stride][lane];
-                state.merge(row_moments[0][warp+stride][lane], row_moments[1][warp+stride][lane], moments);
-                row_moments[0][warp][lane] = state.maximum;
-                row_moments[1][warp][lane] = state.weighted_sum;
-                #pragma unroll
-                for (int j = 0; j < 7; ++j) row_moments[j+2][warp][lane] = state.moments[j];
+        if (end - begin != 1) {
+            if constexpr (WarpRows) {
+                warp_softmax_moments(state, FeatureTile);
+                maximum = state.maximum;
+                inverse = T(1) / (state.weighted_sum + eps);
+                a = state.moments[0] * inverse;
+                c = state.moments[1] * inverse;
+                total = state.moments[2] * inverse;
+                k = state.moments[3] * inverse;
+                l = state.moments[4] * inverse;
+                m = state.moments[5] * inverse;
+                n = state.moments[6] * inverse;
+            } else {
+                const int warp = row_thread / kWarpSize;
+                const int warp_group = edge_group % WarpEdgeGroups;
+                const int moment_group = WarpMerge ? warp : edge_group;
+                if constexpr (WarpMerge) {
+                    // Merge the edge lanes first, then the partial rows from each warp.
+                    warp_merge_triple_moments<FeatureTile>(state);
+                }
+                if (!WarpMerge || warp_group == 0) {
+                    row_moments[0][moment_group][feature_lane] = state.maximum;
+                    row_moments[1][moment_group][feature_lane] = state.weighted_sum;
+#pragma unroll
+                    for (int j = 0; j < 7; ++j)
+                        row_moments[j + 2][moment_group][feature_lane] = state.moments[j];
+                }
+                __syncthreads();
+                if constexpr (WarpMerge) {
+                    if (warp == 0) {
+                        state.maximum = row_moments[0][warp_group][feature_lane];
+                        state.weighted_sum = row_moments[1][warp_group][feature_lane];
+#pragma unroll
+                        for (int j = 0; j < 7; ++j)
+                            state.moments[j] = row_moments[j + 2][warp_group][feature_lane];
+                        warp_merge_triple_moments<FeatureTile>(state);
+                    }
+                } else {
+#pragma unroll
+                    for (int stride = EdgeGroups / 2; stride > 0; stride /= 2) {
+                        if (edge_group < stride) {
+                            T moments[7];
+#pragma unroll
+                            for (int j = 0; j < 7; ++j)
+                                moments[j] = row_moments[j + 2][edge_group + stride][feature_lane];
+                            state.add(row_moments[0][edge_group + stride][feature_lane], row_moments[1][edge_group + stride][feature_lane],
+                                        moments);
+                            row_moments[0][edge_group][feature_lane] = state.maximum;
+                            row_moments[1][edge_group][feature_lane] = state.weighted_sum;
+#pragma unroll
+                            for (int j = 0; j < 7; ++j)
+                                row_moments[j + 2][edge_group][feature_lane] = state.moments[j];
+                        }
+                        __syncthreads();
+                    }
+                }
+                if (edge_group == 0) {
+                    if constexpr (WarpMerge) row_moments[0][0][feature_lane] = state.maximum;
+                    const T inverse = T(1) / (state.weighted_sum + eps);
+                    row_moments[1][0][feature_lane] = inverse;
+#pragma unroll
+                    for (int j = 0; j < 7; ++j)
+                        row_moments[j + 2][0][feature_lane] = state.moments[j] * inverse;
+                }
+                __syncthreads();
+                maximum = row_moments[0][0][feature_lane];
+                inverse = row_moments[1][0][feature_lane];
+                a = row_moments[2][0][feature_lane];
+                c = row_moments[3][0][feature_lane];
+                total = row_moments[4][0][feature_lane];
+                k = row_moments[5][0][feature_lane];
+                l = row_moments[6][0][feature_lane];
+                m = row_moments[7][0][feature_lane];
+                n = row_moments[8][0][feature_lane];
             }
-            __syncthreads();
-        }
-        if (warp == 0) {
-            const T inverse = T(1) / (state.weighted_sum + eps);
-            row_moments[1][0][lane] = inverse;
-            #pragma unroll
-            for (int j = 0; j < 7; ++j) row_moments[j+2][0][lane] = state.moments[j] * inverse;
-        }
-        __syncthreads();
-            maximum = row_moments[0][0][lane];
-            inverse = row_moments[1][0][lane];
-            a = row_moments[2][0][lane]; c = row_moments[3][0][lane];
-            total = row_moments[4][0][lane]; k = row_moments[5][0][lane];
-            l = row_moments[6][0][lane]; m = row_moments[7][0][lane];
-            n = row_moments[8][0][lane];
         }
         const T da = T(2) * c * k - l;
         const T dc = T(2) * a * k - m;
         const T dt = -k;
-        const T q_total = n - T(2) * (a * l + c * m)
-                        + k * (T(6) * a * c - T(2) * total);
-        for (int64_t edge = begin + warp; edge < end; edge += Warps) {
+        const T q_total = n - T(2) * (a * l + c * m) + k * (T(6) * a * c - T(2) * total);
+        for (int64_t edge = begin + edge_group; edge < end; edge += EdgeGroups) {
             T local_dv = T(0), local_de = T(0);
             if (active) {
                 const int64_t off = edge * dim + feature;
                 const T q = exp_op(data[off] - maximum) * inverse;
-                const T e = triple_env(env, edge, off, env_mode, T(1));
-                const T vv = triple_env(v, edge, off, env_mode, T(0));
+                const T e = triple_env<T, EnvMode>(env, edge, off, T(1));
+                const T vv = triple_env<T, EnvMode>(v, edge, off, T(0));
                 const T uu = u ? u[off] : T(0), gg = g[off];
                 const T f = smooth ? e * e : e;
                 const T t = smooth ? T(2) * e : T(1);
                 const T tp = smooth ? T(2) : T(0);
                 const T w = wg ? wg[off] : T(0), z = wx ? wx[off] : T(0);
-                const T r = triple_env(we, edge, off, env_mode, T(0));
+                const T r = triple_env<T, EnvMode>(we, edge, off, T(0));
                 if (end - begin == 1) {
                     const T p = q * e, residual = eps * q;
                     const T residual2 = residual * residual;
@@ -176,66 +246,79 @@ __global__ void __launch_bounds__(Threads, 1) graph_softmax_triple_backward_kern
                     const T fxx = fx * (T(1) - T(2) * p);
                     const T fxxx = fx * polynomial;
                     const T fe = normal * q * residual + smoothed * p * (T(1) + residual);
-                    const T fxe = normal * q * residual * (T(1) - T(2) * p)
-                                + smoothed * T(2) * p * residual2;
+                    const T fxe = normal * q * residual * (T(1) - T(2) * p) + smoothed * T(2) * p * residual2;
                     const T fee = T(2) * q * residual * (smoothed * residual - normal * q);
-                    const T fxxe = normal * q * residual * polynomial
-                                 + smoothed * T(2) * p * residual2 * (T(1) - T(3) * p);
-                    const T fxee = T(2) * q * residual
-                                 * (smoothed * residual * (T(1) - T(3) * p)
-                                    - normal * q * (T(2) - T(3) * p));
+                    const T fxxe = normal * q * residual * polynomial +
+                                   smoothed * T(2) * p * residual2 * (T(1) - T(3) * p);
+                    const T fxee = T(2) * q * residual *
+                                   (smoothed * residual * (T(1) - T(3) * p) - normal * q * (T(2) - T(3) * p));
                     const T feee = T(6) * q * q * residual * (normal * q - smoothed * residual);
                     if (du) du[off] = w * fx + gg * (z * fxx + r * fxe);
                     local_dv = w * fe + gg * (z * fxe + r * fee);
                     dg[off] = z * (uu * fxx + vv * fxe) + r * (uu * fxe + vv * fee);
-                    dx[off] = w * (uu * fxx + vv * fxe)
-                            + gg * (z * (uu * fxxx + vv * fxxe)
-                                  + r * (uu * fxxe + vv * fxee));
-                    local_de = w * (uu * fxe + vv * fee)
-                             + gg * (z * (uu * fxxe + vv * fxee)
-                                   + r * (uu * fxee + vv * feee));
+                    dx[off] = w * (uu * fxx + vv * fxe) +
+                              gg * (z * (uu * fxxx + vv * fxxe) + r * (uu * fxxe + vv * fxee));
+                    local_de = w * (uu * fxe + vv * fee) +
+                               gg * (z * (uu * fxxe + vv * fxee) + r * (uu * fxee + vv * feee));
                 } else {
                     const T hbar = w + z * gg;
                     const T shift = -total + T(2) * a * c - a * uu;
                     const T h = (uu - c) * f + vv * t;
                     const T j = (uu - c) * t + vv * tp;
-                    const T qbar = z * (e * shift - a * vv) + hbar * h
-                                 + r * (shift + gg * j) + da * gg * f
-                                 + dc * (uu * e + vv) + dt * gg * (uu * f + vv * t);
+                    const T qbar = z * (e * shift - a * vv) + hbar * h + r * (shift + gg * j) + da * gg * f +
+                                   dc * (uu * e + vv) + dt * gg * (uu * f + vv * t);
                     // Factor q outside cancelling terms in all five gradients.
                     if (du) {
-                        du[off] = q * (r * (-a + gg * t) - z * a * e + hbar * f
-                                     + dc * e + dt * gg * f);
+                        du[off] = q * (r * (-a + gg * t) - z * a * e + hbar * f + dc * e + dt * gg * f);
                     }
                     dg[off] = q * (z * h + r * j + da * f + dt * (uu * f + vv * t));
                     dx[off] = q * (qbar - e * q_total);
                     local_dv = q * (r * gg * tp - z * a + hbar * t + dc + dt * gg * t);
-                    local_de = q * (z * shift + hbar * (uu - c) * t
-                                 + tp * (r * gg * (uu - c) + hbar * vv)
-                                 + da * gg * t + dc * uu
-                                 + dt * gg * (uu * t + vv * tp) - q_total);
+                    local_de = q * (z * shift + hbar * (uu - c) * t + tp * (r * gg * (uu - c) + hbar * vv) +
+                                    da * gg * t + dc * uu + dt * gg * (uu * t + vv * tp) - q_total);
                 }
-                if (env_mode == 2) {
-                    if (dv) dv[off] = local_dv;
-                    if (de) de[off] = local_de;
+                if (EnvMode == 2) {
+                    if (EnvMode != 0 && dv) dv[off] = local_dv;
+                    if (EnvMode != 0 && de) de[off] = local_de;
                 }
             }
             if (scalar_grad) {
-                local_dv = warp_reduce_sum(local_dv);
-                local_de = warp_reduce_sum(local_de);
-                if (lane == 0) {
-                    if (dv) dv[edge] = local_dv + (feature_base ? dv[edge] : T(0));
-                    if (de) de[edge] = local_de + (feature_base ? de[edge] : T(0));
+                local_dv = warp_softmax_envelope_sum<FeatureTile>(local_dv);
+                local_de = warp_softmax_envelope_sum<FeatureTile>(local_de);
+                if (feature_lane == 0) {
+                    if (EnvMode != 0 && dv) dv[edge] = local_dv + (feature_base ? dv[edge] : T(0));
+                    if (EnvMode != 0 && de) de[edge] = local_de + (feature_base ? de[edge] : T(0));
                 }
             }
         }
-        __syncthreads();
+        if constexpr (!WarpRows) __syncthreads();
     }
-
 }
 """
 
 LAUNCH_SOURCE = r"""
+template <typename T, int Threads, int FeatureTile = kWarpSize, int RowsPerBlock = 1>
+void launch_graph_softmax_triple_backward_impl(
+    const T* wg, const T* wx, const T* we, const T* u, const T* v, const T* g,
+    const T* data, const T* env, const void* row_ptr, bool csr_int32,
+    T* du, T* dv, T* dg, T* dx, T* de,
+    int64_t segments, int64_t dim, int mode, bool smooth, T eps, cudaStream_t stream)
+{
+    const int64_t tiles = (dim + FeatureTile - 1) / FeatureTile;
+    const int64_t blocks = (segments + RowsPerBlock - 1) / RowsPerBlock;
+    const dim3 grid(blocks, mode == 1 ? 1 : min(tiles, int64_t(65535)));
+#define LAUNCH_TRIPLE(Mode) \
+    graph_softmax_triple_backward_kernel<T, Threads, Mode, FeatureTile, RowsPerBlock> \
+        <<<grid, Threads * RowsPerBlock, 0, stream>>>( \
+            wg, wx, we, u, v, g, data, env, row_ptr, csr_int32, du, dv, dg, dx, de, dim, smooth, eps, segments)
+    switch (mode) {
+        case 0: LAUNCH_TRIPLE(0); break;
+        case 1: LAUNCH_TRIPLE(1); break;
+        default: LAUNCH_TRIPLE(2); break;
+    }
+#undef LAUNCH_TRIPLE
+}
+
 template <typename T>
 void launch_graph_softmax_triple_backward(
     const T* wg, const T* wx, const T* we, const T* u, const T* v, const T* g,
@@ -243,17 +326,31 @@ void launch_graph_softmax_triple_backward(
     T* du, T* dv, T* dg, T* dx, T* de,
     int64_t segments, int64_t dim, int64_t edges, int env_mode, bool smooth, T eps, cudaStream_t stream)
 {
-    const int64_t tiles = (dim + 31) / 32;
-    const dim3 grid(segments, env_mode == 1 ? 1 : min(tiles, int64_t(65535)));
-    if (edges <= segments * 64) {
-        graph_softmax_triple_backward_kernel<T, 256><<<grid, 256, 0, stream>>>(
+    // Wider elements and envelope derivatives need more edge lanes per warp.
+    const int packed_features = packed_gradient_features<T>(env_mode);
+    if (dim <= packed_features && edges <= segments * kRowEdgeLimit) {
+#define LAUNCH_WARP_TRIPLE(Tile) \
+        launch_graph_softmax_triple_backward_impl<T, kWarpSize, Tile, kSoftmaxWarpRows>( \
+            wg, wx, we, u, v, g, data, env, row_ptr, csr_int32, du, dv, dg, dx, de, \
+            segments, dim, env_mode, smooth, eps, stream)
+        if (dim <= 1) LAUNCH_WARP_TRIPLE(1);
+        else if (dim <= 2) LAUNCH_WARP_TRIPLE(2);
+        else if (dim <= 4) LAUNCH_WARP_TRIPLE(4);
+        else {
+            launch_graph_softmax_triple_backward_impl<T, kWarpSize * kSoftmaxWarpRows, kSoftmaxPackedFeatures>(
+                wg, wx, we, u, v, g, data, env, row_ptr, csr_int32, du, dv, dg, dx, de,
+                segments, dim, env_mode, smooth, eps, stream);
+        }
+#undef LAUNCH_WARP_TRIPLE
+    } else if (edges <= segments * kRowEdgeLimit) {
+        launch_graph_softmax_triple_backward_impl<T, 256>(
             wg, wx, we, u, v, g, data, env, row_ptr, csr_int32, du, dv, dg, dx, de,
-            dim, env_mode, smooth, eps);
+            segments, dim, env_mode, smooth, eps, stream);
     } else {
         constexpr int Threads = sizeof(T) == 4 ? 1024 : 512;
-        graph_softmax_triple_backward_kernel<T, Threads><<<grid, Threads, 0, stream>>>(
+        launch_graph_softmax_triple_backward_impl<T, Threads>(
             wg, wx, we, u, v, g, data, env, row_ptr, csr_int32, du, dv, dg, dx, de,
-            dim, env_mode, smooth, eps);
+            segments, dim, env_mode, smooth, eps, stream);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
