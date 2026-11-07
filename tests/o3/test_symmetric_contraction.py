@@ -21,13 +21,9 @@ def reference_contraction(x, weights, attrs, irreps_in, irreps_out, correlation)
     channels = max(mul for mul, _ in (*irreps_in, *irreps_out))
     features, offset = [], 0
     for copies, irrep in irreps_in:
-        if x.ndim == 3:
-            value = x[..., offset:offset + irrep.dim]
-            offset += irrep.dim
-        else:
-            value = x[:, offset:offset + copies * irrep.dim].reshape(x.shape[0], copies, irrep.dim)
-            value = torch.nn.functional.pad(value, (0, 0, 0, channels - copies))
-            offset += copies * irrep.dim
+        value = x[:, offset:offset + copies * irrep.dim].reshape(x.shape[0], copies, irrep.dim)
+        value = torch.nn.functional.pad(value, (0, 0, 0, channels - copies))
+        offset += copies * irrep.dim
         features.append((irrep, value))
     products = {1: features}
     for degree in range(2, correlation + 1):
@@ -99,10 +95,7 @@ def problem(request):
         irreps_in, irreps_out, correlation, num_elements=3,
         use_reduced_cg=False, device="cuda", dtype=torch.float32,
     )
-    channels = o3.Irreps(irreps_in)[0].mul
-    components = sum(irrep.dim for _, irrep in o3.Irreps(irreps_in))
-    shape = (7, channels, components) if module.meta["input_layout"] == "channels" else (7, module.irreps_in.dim)
-    x = (torch.randn(shape, device="cuda", dtype=torch.float32) * .3).requires_grad_()
+    x = (torch.randn(7, module.irreps_in.dim, device="cuda", dtype=torch.float32) * .3).requires_grad_()
     attrs = torch.nn.functional.one_hot(torch.randint(3, (7,), device="cuda"), 3).float()
     return module, x, attrs
 
@@ -158,9 +151,7 @@ def test_reduced_basis_parameter_gradients(irreps_in, irreps_out):
             source = raw.meta["path_offsets"][path]
             mapping[target:target + channels, source:source + channels] += coefficient * torch.eye(channels, device="cuda")
     weights = (raw.weight.flatten(1) @ mapping.t()).reshape_as(reduced.weight)
-    shape = ((3, raw.meta["channels"], raw.meta["input_dim"])
-             if raw.meta["input_layout"] == "channels" else (3, raw.meta["input_size"]))
-    x = (torch.randn(shape, device="cuda") * .7).requires_grad_()
+    x = (torch.randn(3, raw.irreps_in.dim, device="cuda") * .7).requires_grad_()
     attrs = torch.randn(3, 3, device="cuda", requires_grad=True)
     actual = lunaeq.symmetric_contraction(x, weights, attrs, irreps_in, irreps_out, 4, use_reduced_cg=True)
     expected = raw(x, attrs)
@@ -424,8 +415,7 @@ def compilation_case(channels):
     module = lunaeq.SymmetricContraction(irreps, irreps, 2, num_elements=2, device="cuda")
     samples = []
     for rows in (7, 19):
-        shape = (rows, channels, 4) if module.meta["input_layout"] == "channels" else (rows, 4 * channels)
-        x = (torch.randn(shape, device="cuda") * 0.3).requires_grad_()
+        x = (torch.randn(rows, module.irreps_in.dim, device="cuda") * 0.3).requires_grad_()
         attrs = torch.nn.functional.one_hot(torch.arange(rows, device="cuda") % 2, 2).float()
         samples.append(((x, attrs.requires_grad_()), {}))
     return module, samples

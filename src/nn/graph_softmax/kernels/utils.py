@@ -5,6 +5,14 @@ from functools import lru_cache
 from ....utils.jit import load_extension
 from ....utils.indexing import name_cuda_kernels
 
+ROW_EDGE_LIMIT = 64
+EDGE_GROUPS = 4
+LONG_EDGE_GROUPS = 16
+SCALAR_ENVELOPE_THREADS = 1024
+PACKED_ROWS = 4
+PACKED_FEATURES = 8
+
+
 CPP_SOURCE = r'''
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -15,29 +23,34 @@ CPP_SOURCE = r'''
 '''
 
 
-CUDA_SOURCE = r'''
+CUDA_SOURCE = f'''
 #include <cuda_runtime.h>
 #include <c10/cuda/CUDAException.h>
 #include <cstdint>
 #include <cfloat>
 
-namespace {
+namespace {{
 
+constexpr int kRowEdgeLimit = {ROW_EDGE_LIMIT};
+constexpr int kEdgeGroups = {EDGE_GROUPS};
+constexpr int kLongEdgeGroups = {LONG_EDGE_GROUPS};
+constexpr int kScalarEnvelopeThreads = {SCALAR_ENVELOPE_THREADS};
+constexpr int kSoftmaxWarpRows = {PACKED_ROWS};
+constexpr int kSoftmaxPackedFeatures = {PACKED_FEATURES};
+'''
+
+CUDA_SOURCE += r'''
 constexpr int kWarpSize = 32;
+
+template <typename T>
+constexpr int packed_gradient_features(int env_mode) {
+    return kSoftmaxPackedFeatures * sizeof(float) / sizeof(T) / (env_mode == 0 ? 1 : 2);
+}
 
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T value) {
     for (int offset = 16; offset; offset >>= 1) {
         value += __shfl_down_sync(0xffffffff, value, offset);
-    }
-    return value;
-}
-
-template <typename T>
-__device__ __forceinline__ T warp_reduce_max(T value) {
-    for (int offset = 16; offset; offset >>= 1) {
-        T other = __shfl_down_sync(0xffffffff, value, offset);
-        value = value > other ? value : other;
     }
     return value;
 }
@@ -66,14 +79,6 @@ struct OnlineNormalizer {
                      + weight * (replace ? T(1) : ratio);
         maximum = replace ? value : maximum;
     }
-
-    __device__ __forceinline__ void merge(T other_max, T other_sum) {
-        const bool replace = other_max > maximum;
-        const T ratio = exp_op(replace ? maximum - other_max : other_max - maximum);
-        weighted_sum = weighted_sum * (replace ? ratio : T(1))
-                     + other_sum * (replace ? T(1) : ratio);
-        maximum = replace ? other_max : maximum;
-    }
 };
 
 // Gradient moments share the normalizer's scale and input scan.
@@ -96,21 +101,46 @@ struct OnlineMoments {
         }
         maximum = replace ? value : maximum;
     }
+};
 
-    __device__ __forceinline__ void merge(
-        T other_max, T other_sum, const T (&other_moments)[Count]) {
-        const bool replace = other_max > maximum;
-        const T ratio = exp_op(replace ? maximum - other_max : other_max - maximum);
-        const T old_scale = replace ? ratio : T(1);
-        const T new_scale = replace ? T(1) : ratio;
-        weighted_sum = weighted_sum * old_scale + other_sum * new_scale;
+// Lanes with the same feature own disjoint edge slices of one CSR row.
+template <typename T, int Count>
+__device__ __forceinline__ void warp_softmax_moments(OnlineMoments<T, Count>& state, int features) {
+    T maximum = state.maximum;
+    #pragma unroll
+    for (int offset = kWarpSize / 2; offset >= features; offset /= 2) {
+        const T other = __shfl_xor_sync(0xffffffff, maximum, offset);
+        maximum = other > maximum ? other : maximum;
+    }
+    const T scale = exp_op(state.maximum - maximum);
+    state.maximum = maximum;
+    state.weighted_sum *= scale;
+    #pragma unroll
+    for (int i = 0; i < Count; ++i) state.moments[i] *= scale;
+    #pragma unroll
+    for (int offset = kWarpSize / 2; offset >= features; offset /= 2) {
+        state.weighted_sum += __shfl_xor_sync(0xffffffff, state.weighted_sum, offset);
         #pragma unroll
         for (int i = 0; i < Count; ++i) {
-            moments[i] = moments[i] * old_scale + other_moments[i] * new_scale;
+            state.moments[i] += __shfl_xor_sync(0xffffffff, state.moments[i], offset);
         }
-        maximum = replace ? other_max : maximum;
     }
-};
+}
+
+template <int Width, typename T>
+__device__ __forceinline__ T warp_softmax_envelope_sum(T value) {
+    if constexpr (Width == kWarpSize) {
+        return warp_reduce_sum(value);
+    } else {
+        const int group_start = (threadIdx.x % kWarpSize) & ~(Width - 1);
+        const unsigned mask = ((1u << Width) - 1) << group_start;
+        #pragma unroll
+        for (int offset = Width / 2; offset; offset /= 2) {
+            value += __shfl_down_sync(mask, value, offset, Width);
+        }
+        return value;
+    }
+}
 
 template <typename T, int EnvMode>
 __device__ __forceinline__ T env_value(

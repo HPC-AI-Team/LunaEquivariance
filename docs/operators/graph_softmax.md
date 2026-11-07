@@ -108,7 +108,7 @@ if softmax.smooth_out:
 
 FP32 benchmarks on NVIDIA H100.
 
-- Input: neighbor graphs of varying size, 64 channels per edge
+- Input: neighbor graphs of varying size, 4 channels per edge
 
 ![GraphSoftmax FP32 throughput and peak memory](../assets/performance/graph_softmax.png)
 

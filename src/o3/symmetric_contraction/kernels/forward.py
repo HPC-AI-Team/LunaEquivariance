@@ -35,32 +35,14 @@ constexpr int Channels = /* channels */;
 constexpr int InputDim = /* input_dim */;
 constexpr int OutputDim = /* output_dim */;
 constexpr int NumElements = /* num_elements */;
-/* path count */constexpr int Threads = /* threads */;
+constexpr int Threads = /* threads */;
 constexpr int RowThreads = /* row_threads */;
 constexpr int AttributeThreads = RowThreads < 32 ? RowThreads : 32;
+constexpr bool RegisterAttributes = /* register_attributes */;
+constexpr bool ShuffleAttributes = /* shuffle_attributes */;
 constexpr int ChannelColumns = /* channel_columns */;
 constexpr int Rows = Threads / RowThreads;
 constexpr int ChannelTiles = (Channels + ChannelColumns - 1) / ChannelColumns;
-
-using InputVector = /* input_vector */;
-constexpr int InputVectorWidth = sizeof(InputVector) / sizeof(Element);
-
-template<int Components>
-__device__ __forceinline__ void load_input(const Element* source, Element* input) {
-    if constexpr (Components % InputVectorWidth == 0) {
-        if (reinterpret_cast<uintptr_t>(source) % alignof(InputVector) == 0) {
-            #pragma unroll
-            for (int vector = 0; vector < Components / InputVectorWidth; ++vector) {
-                const InputVector value = reinterpret_cast<const InputVector*>(source)[vector];
-                /* unpack input */
-            }
-            return;
-        }
-    }
-    #pragma unroll
-    for (int component = 0; component < Components; ++component)
-        input[component] = source[component];
-}
 
 template<typename Index>
 __global__ __launch_bounds__(Threads, /* resident_threads */ / Threads)
@@ -79,10 +61,24 @@ void symmetric_contraction_fwd_/* precision */(
             const Index atom = first_atom + row;
             const int channel_start = tile * ChannelColumns;
             const int channel = channel_start + lane;
-            if (lane < AttributeThreads) {
-                const int warp_offset = (threadIdx.x % 32) - lane;
-                const unsigned lanes = (0xffffffffu >> (32 - AttributeThreads)) << warp_offset;
+            const int warp_offset = (threadIdx.x % 32) - lane;
+            const unsigned lanes = (0xffffffffu >> (32 - AttributeThreads)) << warp_offset;
+            Element attributes[RegisterAttributes ? NumElements : 1];
+            Element lane_attribute = 0;
+            unsigned attribute_mask = 0;
+            if constexpr (RegisterAttributes) {
+                const Element value = atom < atoms && lane < NumElements
+                    ? attrs[atom * NumElements + lane] : Element(0);
+                #pragma unroll
+                for (int element = 0; element < NumElements; ++element)
+                    attributes[element] = __shfl_sync(lanes, value, element, RowThreads);/* register attribute mask */
+            } else if constexpr (ShuffleAttributes) {
+                lane_attribute = atom < atoms && lane < NumElements
+                    ? attrs[atom * NumElements + lane] : Element(0);
+                attribute_mask = __ballot_sync(lanes, lane_attribute != Element(0)) >> warp_offset;
+            } else if (lane < AttributeThreads) {
                 int count = 0;
+                #pragma unroll
                 for (int begin = 0; begin < NumElements; begin += AttributeThreads) {
                     const int element = begin + lane;
                     const Element value = atom < atoms && element < NumElements
@@ -97,14 +93,23 @@ void symmetric_contraction_fwd_/* precision */(
                 }
                 if (lane == 0) active_counts[row] = count;
             }
-            __syncthreads();
+            if constexpr (!RegisterAttributes && !ShuffleAttributes) __syncwarp();
             if (atom < atoms && lane < ChannelColumns && channel < Channels) {
+                int active_count = 0, first_element = 0;
+                Element first_attribute = 0;
+                if constexpr (!RegisterAttributes && !ShuffleAttributes) {
+                    active_count = active_counts[row];
+                    if (active_count) {
+                        first_element = attr_elements[row][0];
+                        first_attribute = attr_values[row][0];
+                    }
+                }
                 /* input loads */
                 /* outputs */
                 /* contractions */
                 /* stores */
             }
-            __syncthreads();
+            if constexpr (!RegisterAttributes && !ShuffleAttributes) __syncwarp();
         }
     }
 }
@@ -229,6 +234,12 @@ def factored_polynomial_expression(terms, scalar):
     """Emit the forward expression, using add/subtract for represented ±1 coefficients."""
     if not terms:
         return "Element(0)"
+    common = abs(element_coefficient(terms[0][1], scalar))
+    if len(terms) > 1 and common not in (0, 1) and all(
+            abs(element_coefficient(coefficient, scalar)) == common for _, coefficient in terms):
+        normalized = [(inputs, 1. if coefficient > 0 else -1.) for inputs, coefficient in terms]
+        expression = factored_polynomial_expression(normalized, scalar)
+        return f"(Element({common:.17g}) * {expression})"
     if not terms[0][0]:
         return f"Element({terms[0][1]:.17g})"
     groups = defaultdict(list)
@@ -251,16 +262,14 @@ def factored_polynomial_expression(terms, scalar):
     return expression
 
 
-def contraction_loop(meta, windows, limits, channel_end=None, scalar="float"):
+def contraction_loop(meta, windows, limits, channel_end=None, scalar="float", register_attributes=False, shuffle_attributes=False, single_attribute=False):
     binary = meta["binary"]
-    packed = meta.get("input_layout", "channels") == "irreps"
-    weight_stride = "WeightSize" if packed else "NumPaths * Channels"
+    weight_stride = "WeightSize"
     bound = meta["channels"] if channel_end is None else channel_end
     blocks = []
-    register_words = meta["input_dim"] + len(meta["output_offsets"]) + sum(
-        len(consumers) for window in windows for _, consumers in window)
-    straight_line = (scalar == "float" and meta.get("use_reduced_cg", False)
-                     and meta["correlation"] <= 3 and register_words <= 48)
+    register_words = meta["input_dim"] + len(meta["output_offsets"]) + max(
+        (sum(len(consumers) for _, consumers in window) for window in windows), default=0)
+    straight_line = register_words * (2 if scalar == "double" else 1) <= 64
     for window_id, pairs in enumerate(windows):
         consumers = [consumer for _, items in pairs for consumer in items]
         members = [binary["compute_weight_paths"][basis] for basis, _ in consumers]
@@ -272,14 +281,30 @@ def contraction_loop(meta, windows, limits, channel_end=None, scalar="float"):
             else:
                 code.append(f"    if (channel >= {active}) break;")
         code.extend(f"    Element weight_{local} = 0;" for local in range(len(consumers)))
-        for first in (True, False):
-            if first:
-                code += ["    if (active_counts[row] > 0) {",
-                         f"        const Index base = Index(attr_elements[row][0]) * {weight_stride} + channel;",
-                         "        const Element attribute = attr_values[row][0];"]
+        elements = (range(meta["num_elements"]) if register_attributes else
+                    (None,) if shuffle_attributes or single_attribute else (None, None))
+        for item, element in enumerate(elements):
+            first = not item
+            if single_attribute:
+                code += ["    {", f"        const Index base = Index(first_element) * {weight_stride} + channel;",
+                         "        const Element attribute = first_attribute;"]
+            elif shuffle_attributes:
+                code += ["    unsigned remaining = attribute_mask;", "    #pragma unroll 1",
+                         "    while (remaining) {", "        const int element = __ffs(remaining) - 1;",
+                         f"        const Index base = Index(element) * {weight_stride} + channel;",
+                         "        const Element attribute = __shfl_sync(lanes, lane_attribute, element, RowThreads);"]
+            elif register_attributes:
+                code += [f"    if (attributes[{element}] != Element(0)) {{",
+                         f"        const Index base = Index({element}) * {weight_stride} + channel;",
+                         f"        const Element attribute = attributes[{element}];"]
+            elif first:
+                code += ["    if (active_count > 0) {",
+                         f"        const Index base = Index(first_element) * {weight_stride} + channel;",
+                         "        const Element attribute = first_attribute;"]
             else:
-                code += ["    #pragma unroll 1", "    for (int item = 1; item < NumElements; ++item) {",
-                         "        if (item >= active_counts[row]) break;",
+                code += [f"    #pragma unroll {2 if meta['num_elements'] > 32 else 1}",
+                         "    for (int item = 1; item < NumElements; ++item) {",
+                         "        if (item >= active_count) break;",
                          f"        const Index base = Index(attr_elements[row][item]) * {weight_stride} + channel;",
                          "        const Element attribute = attr_values[row][item];"]
             for local, items in enumerate(members):
@@ -287,8 +312,7 @@ def contraction_loop(meta, windows, limits, channel_end=None, scalar="float"):
                 guard = f"if (channel < {limit}) " if limit < bound else ""
                 code += [f"        {guard}{{", "            Element value = 0;"]
                 for position, (path, coefficient) in enumerate(items):
-                    value = (f"weights[base + Index({meta['path_offsets'][path]})]" if packed
-                             else f"weights[base + Index({path}) * Channels]")
+                    value = (f"weights[base + Index({meta['path_offsets'][path]})]")
                     if position == 0:
                         represented = element_coefficient(coefficient, scalar)
                         value = value if represented == 1 else f"-{value}" if represented == -1 else f"Element({coefficient:.17g}) * {value}"
@@ -297,8 +321,10 @@ def contraction_loop(meta, windows, limits, channel_end=None, scalar="float"):
                         code.append(f"            value {'+=' if coefficient == 1 else '-='} {value};")
                     else:
                         code.append(f"            value = fma(Element({coefficient:.17g}), {value}, value);")
-                value = "attribute * value" if first else f"fma(attribute, value, weight_{local})"
+                value = "attribute * value" if first and not register_attributes and not shuffle_attributes else f"fma(attribute, value, weight_{local})"
                 code += [f"            weight_{local} = {value};", "        }"]
+            if shuffle_attributes:
+                code.append("        remaining &= remaining - 1;")
             code.append("    }")
         local = 0
         for pair, consumers in pairs:
@@ -341,10 +367,16 @@ def contraction_loop(meta, windows, limits, channel_end=None, scalar="float"):
             blocks += code + ["    break;", "}"]
 
     if straight_line:
-        return "\n".join(blocks)
-    return ("#pragma unroll 1\n"
-            f"for (int window = 0; window < {len(windows)}; ++window) {{\n"
-            "    switch (window) {\n" + indent("\n".join(blocks), " " * 8) + "\n    }\n}")
+        body = "\n".join(blocks)
+    else:
+        body = ("#pragma unroll 1\n"
+                f"for (int window = 0; window < {len(windows)}; ++window) {{\n"
+                "    switch (window) {\n" + indent("\n".join(blocks), " " * 8) + "\n    }\n}")
+    if register_attributes:
+        sparse = contraction_loop(meta, windows, limits, channel_end, scalar, single_attribute=True)
+        return ("if (active_count == 1) {\n" + indent(sparse, " " * 4) +
+                "\n} else {\n" + indent(body, " " * 4) + "\n}")
+    return body
 
 
 def polynomial_windows(meta, allowed=None):
@@ -824,11 +856,10 @@ def make_forward_source(meta, dtype="float32"):
         meta = dict(meta, binary=dict(compute_weight_paths=weights))
     item_bytes = 8 if scalar == "double" else 4
     binary = meta["binary"]
-    packed = meta.get("input_layout", "channels") == "irreps"
     inputs = meta.get("input_channels", (meta["channels"],) * meta["input_dim"])
     output_channels = meta.get("output_channels", (meta["channels"],) * len(meta["output_offsets"]))
     if reduced_entries is not None:
-        windows = pack_forward_windows(reduced_entries)
+        windows = pack_forward_windows(reduced_entries, binary["compute_weight_paths"])
     else:
         limits = defaultdict(int)
         terms = meta["terms"] if use_binary else meta.get("polynomials", meta)["terms"]
@@ -841,34 +872,12 @@ def make_forward_source(meta, dtype="float32"):
                            for _, consumers in window for basis, _ in consumers)
                        for window in windows), default=0)
     weight_work = max(1, meta["num_elements"] * weight_work)
-    contractions = None
-    if packed:
-        boundaries = sorted({0, *limits.values(), meta["channels"]})
-        if len(boundaries) > 2:
-            branches = []
-            for upper in boundaries[1:]:
-                keep = {basis for basis, limit in limits.items() if limit >= upper}
-                if reduced_entries is not None:
-                    entries = [(pair, [item for item in consumers if item[0] in keep])
-                               for pair, consumers in reduced_entries]
-                    band_windows = pack_forward_windows([entry for entry in entries if entry[1]])
-                elif use_binary:
-                    pairs = [dict(pair, consumers=[item for item in pair["consumers"] if item[0] in keep])
-                             for pair in binary["pair_groups"]]
-                    filtered = dict(binary, selected_paths=[path for path in binary["selected_paths"] if path["basis_path"] in keep],
-                                    pair_groups=[pair for pair in pairs if pair["consumers"]])
-                    band_windows = binary_windows(dict(meta, binary=filtered))
-                else:
-                    band_windows = polynomial_windows(meta, keep)
-                body = contraction_loop(meta, band_windows, limits, upper, scalar)
-                branch = ("if" if not branches else "else if") + f" (channel < {upper}) {{"
-                branches.append(branch + "\n" + indent(body, " " * 4) + "\n}")
-            contractions = "\n".join(branches)
-    if contractions is None:
-        contractions = contraction_loop(meta, windows, limits, scalar=scalar)
-
+    weight_registers = max((sum(len(consumers) for _, consumers in window) for window in windows), default=0)
+    pair_registers = max((len({term[0] for term in pair}) for window in windows for pair, _ in window), default=0)
+    live_words = (meta["input_dim"] + len(output_channels) + weight_registers + pair_registers) * (item_bytes // 4) + 16
+    register_attributes = meta["num_elements"] * item_bytes <= 16 and live_words <= 64
     input_stride = meta["input_dim"] + (meta["input_dim"] % 2 == 0)
-    shared_bytes = SHARED_MEMORY_BYTES - (meta["input_dim"] * item_bytes if packed else 0)
+    shared_bytes = SHARED_MEMORY_BYTES - (meta["input_dim"] * item_bytes)
     available = (shared_bytes - meta["num_elements"] * (item_bytes + 4) - 16) // (input_stride * item_bytes)
     alignment = min(count & -count for count in (*inputs, *output_channels))
     work_rows = max(1, (FORWARD_WINDOW_WORK * 4 // item_bytes) // weight_work)
@@ -885,6 +894,34 @@ def make_forward_source(meta, dtype="float32"):
     rows = min(block_threads // row_threads, max(1, shared_bytes // row_bytes),
                max(min_rows, work_rows))
     threads = row_threads * (1 << (rows.bit_length() - 1))
+    shuffle_attributes = (not register_attributes and columns == row_threads and alignment >= row_threads
+                          and meta["num_elements"] <= row_threads)
+    contractions = None
+    boundaries = sorted({0, *limits.values(), meta["channels"]})
+    if len(boundaries) > 2:
+        branches = []
+        for upper in boundaries[1:]:
+            keep = {basis for basis, limit in limits.items() if limit >= upper}
+            if reduced_entries is not None:
+                entries = [(pair, [item for item in consumers if item[0] in keep])
+                           for pair, consumers in reduced_entries]
+                band_windows = pack_forward_windows([entry for entry in entries if entry[1]], binary["compute_weight_paths"])
+            elif use_binary:
+                pairs = [dict(pair, consumers=[item for item in pair["consumers"] if item[0] in keep])
+                         for pair in binary["pair_groups"]]
+                filtered = dict(binary, selected_paths=[path for path in binary["selected_paths"] if path["basis_path"] in keep],
+                                pair_groups=[pair for pair in pairs if pair["consumers"]])
+                band_windows = binary_windows(dict(meta, binary=filtered))
+            else:
+                band_windows = polynomial_windows(meta, keep)
+            body = contraction_loop(meta, band_windows, limits, upper, scalar, register_attributes, shuffle_attributes)
+            branch = ("if" if not branches else "else if") + f" (channel < {upper}) {{"
+            branches.append(branch + "\n" + indent(body, " " * 4) + "\n}")
+        contractions = "\n".join(branches)
+    if contractions is None:
+        contractions = contraction_loop(meta, windows, limits, scalar=scalar,
+                                        register_attributes=register_attributes, shuffle_attributes=shuffle_attributes)
+
     source = CUDA_SOURCE.replace("                /* outputs */", "\n".join(f"                Element out_{m} = 0;" for m in range(len(output_channels))))
     stores = [(f"if (channel < {output_channels[m]}) " if output_channels[m] < meta["channels"] else "") +
               f"output[atom * OutputDim + {offset} + Index(channel) * {stride}] = out_{m};"
@@ -892,48 +929,49 @@ def make_forward_source(meta, dtype="float32"):
     source = source.replace("                /* contractions */", indent(contractions, " " * 16))
     source = source.replace("                /* stores */", indent("\n".join(stores), " " * 16))
     replacements = {key: meta[key] for key in ("channels", "input_dim", "output_dim", "num_elements")}
-    unpack = "\n".join(f"                input[vector * InputVectorWidth + {i}] = value.{field};"
-                       for i, field in enumerate("xy" if item_bytes == 8 else "xyzw"))
-    source = source.replace("                /* unpack input */", unpack)
-    replacements.update(input_vector="double2" if item_bytes == 8 else "float4",
-                        element=scalar, threads=threads, row_threads=row_threads, channel_columns=columns,
-                        resident_threads=min((FORWARD_RESIDENT_THREADS if meta["input_dim"] * item_bytes <= 64
-                                              else FORWARD_RESIDENT_THREADS * 3 // 4) * 4 // item_bytes,
-                                             threads * 32),
-                        max_blocks=MAX_BLOCKS)
+    resident_threads = min((FORWARD_RESIDENT_THREADS if meta["input_dim"] * item_bytes <= 64
+                            else FORWARD_RESIDENT_THREADS * 3 // 4) * 4 // item_bytes, threads * 32)
+    register_tile = (live_words + 15) // 16 * 16
+    resident_threads = min(resident_threads, max(1, 65536 // (threads * register_tile)) * threads)
+    replacements.update(element=scalar, threads=threads, row_threads=row_threads, channel_columns=columns,
+                        resident_threads=resident_threads, max_blocks=MAX_BLOCKS,
+                        register_attributes=str(register_attributes).lower(),
+                        shuffle_attributes=str(shuffle_attributes).lower())
     for key, value in replacements.items():
         source = source.replace(f"/* {key} */", str(value))
-    input_loads = ["                Element input[InputDim];",
-                   "                load_input<InputDim>(x + (atom * Channels + channel) * InputDim, input);"]
-    layout_constants = ""
-    path_count = f"constexpr int NumPaths = {meta['num_paths']};\n"
-    layout_checks = """    TORCH_CHECK(x.dim() == 3 && x.size(1) == Channels && x.size(2) == InputDim,
-                "x must have shape [atoms, channels, input components]");
-    TORCH_CHECK(weights.dim() == 3 && weights.size(0) == NumElements &&
-                weights.size(1) == NumPaths && weights.size(2) == Channels,
-                "weights must have shape [elements, paths, channels]");
-"""
-    if packed:
-        layout_constants = (f"\nconstexpr int InputSize = {meta['input_size']};\n"
-                            f"constexpr int WeightSize = {meta['weight_numel']};\n")
-        path_count = ""
-        layout_checks = """    TORCH_CHECK(x.dim() == 2 && x.size(1) == InputSize,
+    layout_constants = (f"\nconstexpr int InputSize = {meta['input_size']};\n"
+                        f"constexpr int WeightSize = {meta['weight_numel']};\n")
+    layout_checks = """    TORCH_CHECK(x.dim() == 2 && x.size(1) == InputSize,
                 "x must have shape [atoms, packed input components]");
     TORCH_CHECK(weights.dim() == 2 && weights.size(0) == NumElements && weights.size(1) == WeightSize,
                 "weights must have shape [elements, packed weights]");
 """
-        input_loads = ["                Element input[InputDim];"]
-        component = offset = 0
-        for channels, irrep in o3.Irreps(meta["irreps_in"]):
-            for m in range(irrep.dim):
-                value = f"x[atom * InputSize + {offset} + Index(channel) * {irrep.dim} + {m}]"
-                if channels < meta["channels"]:
-                    value = f"channel < {channels} ? {value} : Element(0)"
-                input_loads.append(f"                input[{component + m}] = {value};")
-            component += irrep.dim
-            offset += channels * irrep.dim
+    uniform = len(set((*inputs, *output_channels))) == 1
+    input_loads = ["                Element input[InputDim];"]
+    if uniform:
+        input_loads.append("                const Element* channel_input = x + atom * InputSize + channel;")
+    component = offset = 0
+    for channels, irrep in o3.Irreps(meta["irreps_in"]):
+        for m in range(irrep.dim):
+            value = (f"__ldg(channel_input + {offset + m} + Index(channel) * {irrep.dim - 1})" if uniform else
+                     f"x[atom * InputSize + {offset} + Index(channel) * {irrep.dim} + {m}]")
+            if channels < meta["channels"]:
+                value = f"channel < {channels} ? {value} : Element(0)"
+            input_loads.append(f"                input[{component + m}] = {value};")
+        component += irrep.dim
+        offset += channels * irrep.dim
+    if uniform and full_warp_scan:
+        input_loads = [line.replace("__ldg", "__ldcs") for line in input_loads]
+    attribute_mask = ""
+    if register_attributes:
+        attribute_mask = """
+                attribute_mask = __ballot_sync(lanes, value != Element(0)) >> warp_offset;
+                lane_attribute = __shfl_sync(lanes, value, attribute_mask ? __ffs(attribute_mask) - 1 : 0, RowThreads);"""
+        input_loads[:0] = ["                active_count = __popc(attribute_mask);",
+                          "                first_element = attribute_mask ? __ffs(attribute_mask) - 1 : 0;",
+                          "                first_attribute = lane_attribute;"]
+    source = source.replace("/* register attribute mask */", attribute_mask)
     source = (source.replace("/* layout constants */", layout_constants)
-              .replace("/* path count */", path_count)
               .replace("/* layout checks */", layout_checks)
               .replace("                /* input loads */", "\n".join(input_loads)))
     return source.replace("/* precision */", f"fp{item_bytes * 8}")

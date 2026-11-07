@@ -11,8 +11,15 @@ from ....utils.jit import load_extension
 from ....utils.indexing import name_cuda_kernels
 from ....utils.precision import suffix_float32_literals
 
-
 FEATURE_THREADS = 256
+ROW_CACHE_WORDS = 64
+FORWARD_MAX_ROW_THREADS = 512
+FORWARD_PACK_THREADS = 256
+DOUBLE_BACKWARD_RESIDENT_THREADS = 512
+AFFINE_SHARED_LIMIT = 24 * 1024
+BACKWARD_CACHE_WORDS = 72
+BACKWARD_COMPONENTS_PER_LANE = 4
+BACKWARD_MAX_COMPONENT_LANES = 4
 
 TRIPLE_BACKWARD_ACTIVE_INPUTS = (0, 1, 3, 4, 5, 7, 8, 10)
 PAIRED_ROUTE_SLOT = 6
@@ -42,7 +49,8 @@ def make_reduction_prelude(
     sw = 0 if order == 1 else ns + plan.num_groups * (saved_count + 1)
 
     max_group_dim = max(
-        sum(b.channels * b.components for b in plan.blocks if b.group == g) for g in range(plan.num_groups)
+        sum(b.channels * b.components for b in plan.blocks if b.group == g)
+        for g in range(plan.num_groups)
     )
     row_threads = min(row_cap or 128, max(32, 1 << (max_group_dim - 1).bit_length()))
     offsets = []
@@ -78,11 +86,13 @@ def make_reduction_prelude(
         )
         for i, b in enumerate(plan.blocks)
     ]
-    block_cases = "\n".join(f"""case {i}:
+    block_cases = "\n".join(f"""
+case {i}:
     return {value};""" for i, value in enumerate(bdesc[:-1]))
     thread = "row_thread()" if paired else "(threadIdx.x&31)" if warp else "threadIdx.x"
     row_thread = (
-        """__device__ __forceinline__ int row_thread() {
+        """
+__device__ __forceinline__ int row_thread() {
     return int(threadIdx.x) & (ROW_THREADS - 1);
 }
 """
@@ -90,33 +100,39 @@ def make_reduction_prelude(
         else ""
     )
     sync_body = (
-        '''const int barrier = 1 + int(threadIdx.x) / ROW_THREADS;
+        '''
+const int barrier = 1 + int(threadIdx.x) / ROW_THREADS;
 asm volatile("bar.sync %0, %1;" ::"r"(barrier), "n"(ROW_THREADS) : "memory");'''
         if paired
-        else '''if constexpr (ROW_THREADS == 32)
+        else '''
+if constexpr (ROW_THREADS == 32)
     __syncwarp();
 else
     __syncthreads();'''
     )
     reduce_storage = (
-        """__shared__ Acc reduce_storage[2 * K * 32];
-Acc* shared = reduce_storage + (int(threadIdx.x) / ROW_THREADS) * K * 32;"""
+        """
+__shared__ Acc reduce_storage[2 * K * 33];
+Acc* shared = reduce_storage + (int(threadIdx.x) / ROW_THREADS) * K * 33;"""
         if paired
-        else """__shared__ Acc shared[K * 32];"""
+        else """__shared__ Acc shared[K * 33];"""
     )
     max_storage = (
-        """__shared__ Acc max_storage[2 * 32];
-Acc* shared = max_storage + (int(threadIdx.x) / ROW_THREADS) * 32;"""
+        """
+__shared__ Acc max_storage[2 * 33];
+Acc* shared = max_storage + (int(threadIdx.x) / ROW_THREADS) * 33;"""
         if paired
-        else """__shared__ Acc shared[32];"""
+        else """__shared__ Acc shared[33];"""
     )
     block_sync = """row_sync();""" if paired else """__syncthreads();"""
-    constants = f"""constexpr int D = {plan.dim}, P = {plan.param_dim}, BIAS = {plan.bias_dim};
+    constants = f"""
+constexpr Index D = {plan.dim}, P = {plan.param_dim}, BIAS = {plan.bias_dim};
 constexpr int NB = {len(plan.blocks)}, NG = {plan.num_groups}, NCENTER = {plan.num_centers};
 constexpr int FW = {(plan.num_centers + plan.num_groups)}, SW = {sw if workspace_width is None else workspace_width}, THREADS = {max(128, row_threads)}, ROW_THREADS = {row_threads};
 constexpr bool IR_MUL = {str(plan.layout == "ir_mul").lower()};
 struct Block {{
-    int offset, channels, components, param_offset, bias_offset, group, center_index, cache_offset;
+    Index offset, channels, components, param_offset, bias_offset;
+    int group, center_index, cache_offset;
     Acc weight;
 }};
 __device__ __forceinline__ Block block_at(int i) {{
@@ -127,13 +143,18 @@ __device__ __forceinline__ Block block_at(int i) {{
     }}
 }}
 """
-    maximum = r"""__device__ __forceinline__ Acc reduce_max(Acc value) {
-#pragma unroll
+    maximum = (
+        r"""
+__device__ __forceinline__ Acc reduce_max(Acc value) {
+    #pragma unroll
     for (int d = 16; d > 0; d >>= 1)
         value = fmax(value, __shfl_down_sync(0xffffffff, value, d));
     return __shfl_sync(0xffffffff, value, 0);
 }
-""" if warp else f"""__device__ __forceinline__ Acc reduce_max(Acc value) {{
+"""
+        if warp
+        else f"""
+__device__ __forceinline__ Acc reduce_max(Acc value) {{
 {indent(max_storage, '    ')}
     const int lane = {thread} & 31, warp = {thread} >> 5;
     for (int d = 16; d > 0; d >>= 1)
@@ -146,18 +167,19 @@ __device__ __forceinline__ Block block_at(int i) {{
         for (int d = ROW_THREADS / 64; d > 0; d >>= 1)
             value = fmax(value, __shfl_down_sync(0xffffffff, value, d));
         if (lane == 0)
-            shared[0] = value;
+            shared[32] = value;
     }}
     row_sync();
-    return shared[0];
+    return shared[32];
 }}
 """
+    )
     helpers = f"""
 {row_thread}
-__device__ __forceinline__ int channel(const Block& b, int j) {{
+__device__ __forceinline__ Index channel(const Block& b, Index j) {{
     return IR_MUL ? j % b.channels : j / b.components;
 }}
-__device__ __forceinline__ int local_index(const Block& b, int c, int m) {{
+__device__ __forceinline__ Index local_index(const Block& b, Index c, Index m) {{
     return IR_MUL ? m * b.channels + c : c * b.components + m;
 }}
 __device__ __forceinline__ Acc inverse_sqrt(Acc x) {{
@@ -169,9 +191,9 @@ __device__ __forceinline__ void row_sync() {{
 }}
 template <int K, int Workers = THREADS> __device__ __forceinline__ void reduce(Acc (&v)[K]) {{
     if constexpr (Workers == 32) {{
-#pragma unroll
+        #pragma unroll
         for (int k = 0; k < K; ++k) {{
-#pragma unroll
+            #pragma unroll
             for (int d = 16; d > 0; d >>= 1)
                 v[k] += __shfl_down_sync(0xffffffff, v[k], d);
             v[k] = __shfl_sync(0xffffffff, v[k], 0);
@@ -179,35 +201,35 @@ template <int K, int Workers = THREADS> __device__ __forceinline__ void reduce(A
     }} else {{
 {indent(reduce_storage, '        ')}
         const int lane = {thread} & 31, warp = {thread} >> 5;
-#pragma unroll
+        #pragma unroll
         for (int k = 0; k < K; ++k) {{
-#pragma unroll
+            #pragma unroll
             for (int d = 16; d > 0; d >>= 1)
                 v[k] += __shfl_down_sync(0xffffffff, v[k], d);
             if (lane == 0)
-                shared[k * 32 + warp] = v[k];
+                shared[k * 33 + warp] = v[k];
         }}
         {block_sync}
         if (warp == 0) {{
-#pragma unroll
+            #pragma unroll
             for (int k = 0; k < K; ++k) {{
-                Acc t = lane < Workers / 32 ? shared[k * 32 + lane] : 0.0;
-#pragma unroll
+                Acc t = lane < Workers / 32 ? shared[k * 33 + lane] : 0.0;
+                #pragma unroll
                 for (int d = Workers / 64; d > 0; d >>= 1)
                     t += __shfl_down_sync(0xffffffff, t, d);
                 if (lane == 0)
-                    shared[k * 32] = t;
+                    shared[k * 33 + 32] = t;
             }}
         }}
         {block_sync}
-#pragma unroll
+        #pragma unroll
         for (int k = 0; k < K; ++k)
-            v[k] = shared[k * 32];
+            v[k] = shared[k * 33 + 32];
     }}
 }}
 
 {maximum}
-__device__ __forceinline__ Acc centered(View v, int64_t row, const Block& b, int j, const Acc* means, int mean_slot) {{
+__device__ __forceinline__ Acc centered(View v, int64_t row, const Block& b, Index j, const Acc* means, int mean_slot) {{
     const Acc val = v.get<UnitStride>(row, b.offset + j);
     if (b.center_index < 0 || !v.data)
         return val;
@@ -249,7 +271,8 @@ def make_binding(
     """Render the native ABI and the chosen workspace contract directly."""
     scalar = "float" if dtype == torch.float32 else "double"
     parameter_guard = " || ".join(f"out.v[{i}]" for i in parameter_outputs) or "false"
-    host = f"""#include <torch/extension.h>
+    host = f"""
+#include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -273,7 +296,8 @@ void launch(Inputs, Outputs, const Acc*, Acc*, int64_t, cudaStream_t);
 
 {workspace_definition}
 """
-    host += """View view(const std::optional<torch::Tensor>& t) {
+    host += """
+View view(const std::optional<torch::Tensor>& t) {
     if (!t.has_value())
         return {nullptr, 0, 0, 0, 1};
     const auto& a = t.value();
@@ -303,7 +327,8 @@ void run(std::vector<std::optional<torch::Tensor>> inputs,
     }
     auto stream = at::cuda::getCurrentCUDAStream();
 """
-    host += f"""    TORCH_CHECK(workspace.numel() >= workspace_size(N, {parameter_guard}), "equ_norm workspace is too small");
+    host += f"""
+    TORCH_CHECK(workspace.numel() >= workspace_size(N, {parameter_guard}), "equ_norm workspace is too small");
     launch(in, out, fwd_stats.data_ptr<Acc>(), workspace.data_ptr<Acc>(), N, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }}
@@ -380,10 +405,11 @@ def make_tensor_views(plan, dtype):
     """The native input layout shared by every CUDA specialization."""
     input_c = plan.blocks[0].channels
     uniform_channels = all(b.channels == input_c for b in plan.blocks)
-    views = f"""struct View {{
+    views = f"""
+struct View {{
     const Element* data;
     int64_t s0, s1, s2, width;
-    template <bool Unit> __device__ __forceinline__ Acc get(int64_t row, int j, Acc missing = 0.0) const {{
+    template <bool Unit> __device__ __forceinline__ Acc get(int64_t row, Index j, Acc missing = 0.0) const {{
         if constexpr (Unit)
             return data ? Acc(data[row * s0 + j]) : missing;
         else {{
@@ -394,7 +420,7 @@ def make_tensor_views(plan, dtype):
             return Acc(data[row * s0 + (j / {input_c if uniform_channels else "width"}) * s1 + (j % {input_c if uniform_channels else "width"}) * s2]);
         }}
     }}
-    template <bool Unit> __device__ __forceinline__ Acc parameter(int j, Acc missing = 0.0) const {{
+    template <bool Unit> __device__ __forceinline__ Acc parameter(Index j, Acc missing = 0.0) const {{
         if constexpr (Unit)
             return data ? Acc(data[j]) : missing;
         else {{
@@ -414,6 +440,7 @@ struct Outputs {{
 def fast_view_source(source, plan, dtype, active_inputs=None):
     """Assemble tensor types, row kernels and stride dispatch."""
     scalar = "float" if dtype == torch.float32 else "double"
+    index = "int64_t" if max(plan.dim, plan.param_dim, plan.bias_dim) > 2147483647 else "int"
     views = make_tensor_views(plan, dtype)
     includes = (
         *source.get("includes", ()),
@@ -428,26 +455,37 @@ def fast_view_source(source, plan, dtype, active_inputs=None):
     body = source["body"]
     if prefix is not None:
         body = "\n" * len(source.get("includes", ())) + prefix["cuda_body_prefix"] + body
-    result = (
-        "\n".join(dict.fromkeys(includes)) + "\n"
-        + f"""using Element = {scalar};
+    result = "\n".join(dict.fromkeys(includes)) + "\n" + f"""
+using Element = {scalar};
 using Acc = {scalar};
+using Index = {index};
 """ + views + "\n"
-    )
     for name, fast in (("unit", "true"), ("general", "false")):
-        result += f"""namespace {name} {{
+        result += (
+            f"""
+namespace {name} {{
 constexpr bool UnitStride = {fast};
-""" + body + """
+"""
+            + body
+            + """
 }
 """
+        )
 
     if active_inputs is None:
         active_inputs = tuple(range(11))
-    predicate = (" && ".join(f"(!in.v[{i}].data || (in.v[{i}].width==1 && in.v[{i}].s1==1))" for i in active_inputs) or "true")
+    predicate = (
+        " && ".join(
+            f"(!in.v[{i}].data || (in.v[{i}].width==1 && in.v[{i}].s1==1))" for i in active_inputs
+        )
+        or "true"
+    )
     result += (
-        """void launch(Inputs in, Outputs out, const Acc* fs, Acc* stats, int64_t N, cudaStream_t stream) {
+        """
+void launch(Inputs in, Outputs out, const Acc* fs, Acc* stats, int64_t N, cudaStream_t stream) {
 """
-        + f"""    if ({predicate})
+        + f"""
+    if ({predicate})
         unit::launch(in, out, fs, stats, N, stream);
     else
         general::launch(in, out, fs, stats, N, stream);
@@ -455,12 +493,12 @@ constexpr bool UnitStride = {fast};
 """
     )
     if source.get("cuda_workspace", False):
-        result += """int64_t workspace_size(int64_t n, bool parameters) {
+        result += """
+int64_t workspace_size(int64_t n, bool parameters) {
     return max(unit::workspace_size(n, parameters), general::workspace_size(n, parameters));
 }
 """
     return {"cpp": source["cpp"], "cuda": result}
-
 
 
 def load_kernel(plan, order, dtype, arch):
@@ -476,7 +514,9 @@ def load_kernel(plan, order, dtype, arch):
             "forward": make_forward_source(plan, dtype),
             "backward": make_backward_source(plan, dtype),
         }
-        source = {"cpp": combine_cuda_sources({name: code["cpp"] for name, code in sources.items()})}
+        source = {
+            "cpp": combine_cuda_sources({name: code["cpp"] for name, code in sources.items()})
+        }
         includes, bodies = [], []
         for name, emitted in sources.items():
             code = name_cuda_kernels(emitted["cuda"], f"equ_norm_{name}", index_bits=64)
@@ -492,10 +532,13 @@ def load_kernel(plan, order, dtype, arch):
 
     return load_extension(
         "equ_norm",
-        cpp_sources=source["cpp"], cuda_sources=source["cuda"],
+        cpp_sources=source["cpp"],
+        cuda_sources=source["cuda"],
         extra_cflags=["-O3"],
         extra_cuda_cflags=[
-            "-O3", "--prec-div=true", "--prec-sqrt=true",
+            "-O3",
+            "--prec-div=true",
+            "--prec-sqrt=true",
             f"-gencode=arch=compute_{arch[0]}{arch[1]},code=sm_{arch[0]}{arch[1]}",
         ],
         no_implicit_headers=True,

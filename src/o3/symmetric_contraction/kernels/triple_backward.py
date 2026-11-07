@@ -3,8 +3,8 @@
 from collections import defaultdict
 from textwrap import indent
 
-from .double_backward import ContractionLayout, consumer_outputs, contraction_groups
 from .utils import (
+    ContractionLayout, consumer_outputs, contraction_groups,
     SHARED_MEMORY_BYTES, CG_SHARED_BUDGET_DIVISOR, TRIPLE_CG_SHARED_BUDGET_DIVISOR,
     bounded_cg_polynomials, reduced_pair_groups,
     build_arena_plan, packet_intervals,
@@ -15,6 +15,7 @@ CUDA_SOURCE = r"""
 #include <ATen/core/Tensor.h>
 /* row_workspace_header */#include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros_like.h>
+#include <ATen/ops/_foreach_zero.h>
 #include <torch/csrc/utils/pybind.h>
 #include <pybind11/stl.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -23,6 +24,7 @@ CUDA_SOURCE = r"""
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace symmetric_triple_backward {
 /* constants */
@@ -65,7 +67,7 @@ __device__ __forceinline__ void polynomial_triple_backward_edge(
 
 
 /* power_helpers */template<bool WriteAttrs, bool HasAttrsDirections, bool AllGrads, bool WeightDirections/* band_template */>
-__global__ void symmetric_contraction_triplebwd_pairs_/* precision */_i64(
+__global__ __launch_bounds__(NODE_THREADS) void symmetric_contraction_triplebwd_pairs_/* precision */_i64(
     const Element* __restrict__ x, const Element* __restrict__ weights,
     const Element* __restrict__ attrs, const Element* __restrict__ grad_out,
     const Element* __restrict__ rx, const Element* __restrict__ rw, const Element* __restrict__ ra,
@@ -93,6 +95,7 @@ __global__ void symmetric_contraction_triplebwd_pairs_/* precision */_i64(
         {
             const int channel_begin = channel_tile * FUSED_CHANNEL_TILE;
             const int channel = channel_begin + local_channel;
+/* initialize_weights */
 /* grouped_initialization */
             for (int word = threadIdx.x; word < ELEMENT_WORDS; word += NODE_THREADS) element_words[word] = 0;
             for (int element = threadIdx.x; element < NUM_ELEMENTS; element += NODE_THREADS) active_rows[element] = 0;
@@ -190,12 +193,13 @@ pybind11::tuple run(
     const int64_t nodes = x.size(0);
     at::Tensor tx, tw, ta, tg, trx, trw, tra;
     if (need_x) tx = at::empty_like(x);
-    if (need_weights) tw = at::zeros_like(weights);
-    if (need_attrs) ta = at::zeros_like(attrs);
+    if (need_weights) tw = at::empty_like(weights);
+    if (need_attrs) ta = at::empty_like(attrs);
     if (need_grad_out) tg = at::empty_like(grad_out);
     if (need_rx) trx = at::empty_like(x);
-    if (need_rw) trw = at::zeros_like(weights);
-    if (need_ra) tra = at::zeros_like(attrs);
+    if (need_rw) trw = at::empty_like(weights);
+    if (need_ra) tra = at::empty_like(attrs);
+/* batch_weight_initialization */
     const auto ptr = [](const c10::optional<at::Tensor>& value) {
         return value.has_value() ? value->data_ptr<Element>() : nullptr;
     };
@@ -565,9 +569,62 @@ def pack_windows(entries, tile=4):
     return windows or [[]]
 
 
+def outer_projection_items(outer, component):
+    selected = []
+    for raw, items in sorted(outer.items(), key=lambda item: -1 if item[0] is None else item[0]):
+        values = tuple((output, value) for output, inner, value in items if inner == component)
+        if values:
+            selected.append((raw, values))
+    return tuple(selected)
+
+
+def pack_projection_windows(entries, meta, limits, layout=None):
+    layout = layout or ContractionLayout(meta, limits, False, meta["channels"])
+    windows = pack_windows(entries)
+    entries = [entry for window in windows for entry in window]
+    paths = []
+    for terms, consumers in entries:
+        projections = set()
+        for component in {m for m, _, _ in terms} if terms else ():
+            for basis, outer in consumers:
+                items = outer_projection_items(outer, component)
+                if items:
+                    guard = (layout.guard("channel", limits[basis])
+                             if limits[basis] < meta["channels"] and limits[basis] < layout.end else None)
+                    projections.add((component, items, guard))
+        paths.append(projections)
+    sizes = [len(consumers) for _, consumers in entries]
+    packed, first = [], 0
+    for window in windows:
+        packed.append(list(range(first, first + len(window))))
+        first += len(window)
+
+    def loads(group):
+        return len(set().union(*(paths[item] for item in group)))
+
+    while True:
+        improvement, move = 0, None
+        for left in range(len(packed)):
+            for right in range(left + 1, len(packed)):
+                before = loads(packed[left]) + loads(packed[right])
+                for a in [None, *packed[left]]:
+                    for b in [None, *packed[right]]:
+                        if a is None and b is None:
+                            continue
+                        lhs = [item for item in packed[left] if item != a] + ([] if b is None else [b])
+                        rhs = [item for item in packed[right] if item != b] + ([] if a is None else [a])
+                        if sum(sizes[item] for item in lhs) > 4 or sum(sizes[item] for item in rhs) > 4:
+                            continue
+                        delta = loads(lhs) + loads(rhs) - before
+                        if delta < improvement:
+                            improvement, move = delta, (left, right, lhs, rhs)
+        if move is None:
+            break
+        left, right, packed[left], packed[right] = move
+    return [[entries[item] for item in group] for group in packed if group] or [[]]
+
+
 def input_groups(meta):
-    if meta.get("input_layout", "channels") == "channels":
-        return [(0, meta["input_dim"], meta["channels"], 0, meta["input_dim"])]
     counts, offsets, strides = (meta[key] for key in ("input_channels", "input_offsets", "input_strides"))
     groups, component = [], 0
     while component < meta["input_dim"]:
@@ -683,21 +740,20 @@ def launch_code(bands, shared_dims, banded, grouped_rows):
     return launch, "\n".join(configure)
 
 
-def component_blocks(terms, outputs, guards, polynomial_code):
+def component_blocks(terms, outputs, guards, polynomial_code, projection_cache=None, projection_code=None):
     count = len(outputs)
     prefix = [f"Element grad_products[{count}] = {{}}, grad_rx_products[{count}] = {{}};",
             f"Element grad_bx_products[{count}] = {{}}, grad_rx_bx_products[{count}] = {{}};"]
     blocks = []
     for component in sorted({m for m, inputs, value in terms}):
         code = ["{", "    Element ap = 0, ar = 0, ab = 0, arb = 0;"]
-        channels = []
+        channels, names = [], {}
         for slot, outer in enumerate(outputs):
-            by_raw = {raw: [(out, value) for out, inner, value in items if inner == component]
-                      for raw, items in outer.items()}
-            by_raw = {raw: items for raw, items in by_raw.items() if items}
+            by_raw = dict(outer_projection_items(outer, component))
             channels.append(by_raw)
             if not by_raw:
                 continue
+            first = len(code)
             code += [f"    Element h0_{slot} = 0, hr_{slot} = 0, hb_{slot} = 0, hbr_{slot} = 0;"]
             if guards[slot]:
                 code.append(f"    if ({guards[slot]}) {{")
@@ -717,6 +773,20 @@ def component_blocks(terms, outputs, guards, polynomial_code):
                              f"        hb_{slot} = fma(gradient, b, fma(direction, x, hb_{slot}));",
                              f"        hbr_{slot} = fma(direction, r, hbr_{slot});"]
                 code.append("    }")
+            if projection_cache is not None:
+                cached = projection_cache.setdefault(component, {})
+                key = tuple(by_raw.items()), guards[slot]
+                if key not in cached:
+                    number = len(cached)
+                    assert number < 4
+                    cached[key] = {name: f"projection_{component}_{number}_{name}"
+                                   for name in ("h0", "hr", "hb", "hbr")}
+                    projection = "\n".join(code[first:] + (["    }"] if guards[slot] else []))
+                    for before, after in cached[key].items():
+                        projection = projection.replace(f"{before}_{slot}", after)
+                    projection_code.setdefault(component, []).append(projection)
+                names.update({f"{name}_{slot}": value for name, value in cached[key].items()})
+                code[first:] = [f"    if ({guards[slot]}) {{"] if guards[slot] else []
             code += ["    if (AllGrads || tx || trx) {",
                      f"        const Element w = mixed[{slot}][0], wr = mixed[{slot}][1];",
                      f"        const Element wb = mixed[{slot}][2], wrb = mixed[{slot}][3];",
@@ -782,7 +852,10 @@ def component_blocks(terms, outputs, guards, polynomial_code):
             if guards[slot]:
                 code.append("    }")
         code.append("}")
-        blocks.append("\n".join(code))
+        block = "\n".join(code)
+        for before, after in names.items():
+            block = block.replace(before, after)
+        blocks.append(block)
     return prefix, blocks
 
 
@@ -799,32 +872,38 @@ def consumer_outer(binary, consumers):
     return outputs
 
 
-def component_math(terms, outputs, guards, locations, combine_powers=False):
+def cache_component_inputs(code, reference, reads, max_inputs=6):
+    counts = [(value, reference.count(value)) for value in reads if reference.count(value) >= 3]
+    counts.sort(key=lambda item: (-item[1], reference.index(item[0])))
+    declarations = []
+    for index, (value, _) in enumerate(counts[:max_inputs]):
+        name = f"component_input{index}"
+        declarations.append(f"const Element {name} = {value};")
+        code = code.replace(value, name)
+    return "{\n" + "\n".join(declarations) + code[1:]
+
+
+def component_math_blocks(terms, outputs, guards, locations, combine_powers=False,
+                          projection_cache=None, projection_code=None, cache_inputs=True):
     prefix, original = component_blocks(terms, outputs, guards, polynomial_triple_backward_code)
 
     def polynomial(terms, *arguments):
         return polynomial_triple_backward_code(terms, *arguments, combine_squares=True, combine_powers=combine_powers)
 
-    _, optimized = component_blocks(terms, outputs, guards, polynomial)
+    _, optimized = component_blocks(terms, outputs, guards, polynomial, projection_cache, projection_code)
     blocks = []
     for before, after in zip(original, optimized):
         for component, location in locations.items():
             for name in ("feature", "direction_rx", "direction_bx"):
                 source, target = f"{name}[{component} * (NODE_THREADS + 1)]", f"{name}[{location}]"
                 before, after = before.replace(source, target), after.replace(source, target)
-        if not any(guards):
+        if not any(guards) and cache_inputs:
             reads = [f"{name}[{location}]" for location in locations.values()
                      for name in ("feature", "direction_rx", "direction_bx")]
-            counts = [(value, before.count(value)) for value in reads if before.count(value) >= 3]
-            counts.sort(key=lambda item: (-item[1], before.index(item[0])))
-            declarations = []
-            for index, (value, _) in enumerate(counts[:6]):
-                name = f"component_input{index}"
-                declarations.append(f"const Element {name} = {value};")
-                after = after.replace(value, name)
-            after = "{\n" + "\n".join(declarations) + after[1:]
+            source = before if projection_cache is None else after
+            after = cache_component_inputs(after, source, reads)
         blocks.append(after)
-    return "\n".join(prefix + blocks)
+    return prefix, blocks
 
 
 def projected_weights(layout, consumers, weight_paths, limits, grouped_rows):
@@ -951,8 +1030,81 @@ def zero_products(slot):
             f"    products[{slot}][3][local_node][local_channel] = 0;", "}"]
 
 
+def shared_projection_window(meta, layout, packet, weight_paths, limits, locations,
+                             groups, combine_powers, grouped_rows):
+    if any(not terms for terms, _ in packet):
+        return None
+    cache, projections, records, prefixes = {}, {}, [], []
+    offset = occurrences = 0
+    guarded = any(limits[basis] < meta["channels"] and limits[basis] < layout.end
+                  for _, consumers in packet for basis, _ in consumers)
+    cache_shared_inputs = not guarded and meta["input_dim"] > 16
+    if grouped_rows and not cache_shared_inputs:
+        return None
+    for terms, consumers in packet:
+        bases = [basis for basis, _ in consumers]
+        guards = [layout.guard("channel", limits[basis])
+                  if limits[basis] < meta["channels"] and limits[basis] < layout.end else None for basis in bases]
+        outputs = [outer for _, outer in consumers]
+        prefix, blocks = component_math_blocks(terms, outputs, guards, locations, combine_powers,
+                                                cache, projections, cache_inputs=not cache_shared_inputs)
+        components = sorted({component for component, _, _ in terms})
+        occurrences += sum(bool(outer_projection_items(outer, component))
+                           for outer in outputs for component in components)
+        names = {name: f"{name}_{offset}" for name in
+                 ("grad_products", "grad_rx_products", "grad_bx_products", "grad_rx_bx_products")}
+        prefix, blocks = "\n".join(prefix), dict(zip(components, blocks))
+        for before, after in names.items():
+            prefix = prefix.replace(before, after)
+            blocks = {component: block.replace(before, after) for component, block in blocks.items()}
+        prefixes.append(prefix)
+        records.append((offset, bases, guards, blocks, names))
+        offset += len(consumers)
+    if occurrences == sum(len(items) for items in cache.values()):
+        return None
+    bases = [basis for _, consumers in packet for basis, _ in consumers]
+    code = projected_weights(layout, bases, weight_paths, limits, grouped_rows)
+    code += ["const auto* window_weights = mixed;", *prefixes]
+    for component in sorted(projections):
+        projection = "\n".join(projections[component])
+        for raw, location in locations.items():
+            for name in ("feature", "direction_rx", "direction_bx"):
+                projection = projection.replace(f"{name}[{raw} * (NODE_THREADS + 1)]", f"{name}[{location}]")
+        body = ["{", projection]
+        for first, _, _, blocks, _ in records:
+            if component in blocks:
+                body += ["{", f"const auto* mixed = window_weights + {first};", blocks[component], "}"]
+        body.append("}")
+        if cache_shared_inputs:
+            reads = [f"{name}[{location}]" for location in locations.values()
+                     for name in ("feature", "direction_rx", "direction_bx")]
+            source = "\n".join(body)
+            body = [cache_component_inputs(source, source, reads, max_inputs=24)]
+        code += body
+    for first, bases, guards, _, names in records:
+        for local, basis in enumerate(bases):
+            mapping = weight_paths[basis]
+            groups.append((mapping, limits[basis]))
+            slot = first + local
+            body = ["{", f"Element g0 = {names['grad_products']}[{local}], gr = {names['grad_rx_products']}[{local}];",
+                    f"Element gb = {names['grad_bx_products']}[{local}], grb = {names['grad_rx_bx_products']}[{local}];",
+                    *attribute_products(layout, mapping, slot), "}"]
+            if limits[basis] < meta["channels"] and guards[local]:
+                body = [f"if ({guards[local]}) {{", *body, "} else {", *zero_products(slot), "}"]
+            code += body
+    for slot in range(offset, 4):
+        groups.append(((), 0))
+        code += zero_products(slot)
+    return code
+
+
 def window_code(meta, layout, packet, binary, weight_paths, limits, locations, groups,
                 combine_powers=False, grouped_rows=False, project_window=False):
+    if project_window and not binary:
+        shared = shared_projection_window(meta, layout, packet, weight_paths, limits, locations,
+                                          groups, combine_powers, grouped_rows)
+        if shared is not None:
+            return shared
     code, offset = [], 0
     paths = {item["basis_path"]: item for item in binary["selected_paths"]} if binary else {}
     if project_window and packet:
@@ -971,7 +1123,8 @@ def window_code(meta, layout, packet, binary, weight_paths, limits, locations, g
                   if limits[basis] < meta["channels"] and limits[basis] < layout.end else None for basis in bases]
         if terms:
             outputs = consumer_outer(binary, consumers) if binary else [item[1] for item in consumers]
-            code.append(component_math(terms, outputs, guards, locations, combine_powers))
+            prefix, blocks = component_math_blocks(terms, outputs, guards, locations, combine_powers)
+            code.append("\n".join(prefix + blocks))
         for local, basis in enumerate(bases):
             mapping = weight_paths[basis]
             groups.append((mapping, limits[basis]))
@@ -1125,10 +1278,17 @@ def make_triple_backward_source(meta, dtype="float32"):
             "/* member_load */", "load_cg_member(member_id)" if packed_members else "CgMembers[member_id]").replace(
             "/* precision */", "fp64" if scalar == "double" else "fp32")
     item_bytes = 8 if scalar == "double" else 4
-    compact = meta.get("input_layout", "channels") != "channels"
+    compact = any(count != meta["channels"] for count in (*meta["input_channels"], *meta["output_channels"]))
     binary = meta.get("binary") if meta.get("correlation", 3) <= 3 else None
     inputs = meta.get("input_channels", (meta["channels"],) * meta["input_dim"])
     outputs = meta.get("output_channels", (meta["channels"],) * len(meta["output_offsets"]))
+    threads = 128
+    shared_bytes = meta.get("shared_memory_bytes", 96 * 1024)
+    while threads > 32 and (3 * meta["input_dim"] * (threads + 1) +
+                            16 * threads + 3 * meta["num_elements"] * (threads // 8)) * item_bytes > shared_bytes:
+        threads //= 2
+    grouped_rows = scalar == "float" and meta["num_elements"] > threads // 8
+    share_projections = not grouped_rows or meta["input_dim"] > 16
     if binary:
         paths = {path["basis_path"]: path for path in binary["selected_paths"]}
         limits = {basis: path_channel_count(meta, path) for basis, path in paths.items()}
@@ -1154,7 +1314,8 @@ def make_triple_backward_source(meta, dtype="float32"):
                                         for output, components, coefficient in terms)
             entries.extend((terms, converted[first:first + 4]) for first in range(0, len(converted), 4))
         if reduced_pairs:
-            base_windows = pack_windows(entries)
+            base_windows = (pack_projection_windows(entries, meta, limits) if share_projections
+                            else pack_windows(entries))
         else:
             base_windows = []
             for terms, selected in entries:
@@ -1164,19 +1325,13 @@ def make_triple_backward_source(meta, dtype="float32"):
                 else:
                     base_windows.append([(terms, selected)])
             base_windows = base_windows or [[]]
-    threads = 128
-    shared_bytes = meta.get("shared_memory_bytes", 96 * 1024)
-    while threads > 32 and (3 * meta["input_dim"] * (threads + 1) +
-                            16 * threads + 3 * meta["num_elements"] * (threads // 8)) * item_bytes > shared_bytes:
-        threads //= 2
     boundaries = sorted({0, meta["channels"], *(min(meta["channels"], ((limit + 7) // 8) * 8)
                                                for limit in limits.values() if limit)})
     banded = compact and len(boundaries) > 2
-    grouped_rows = scalar == "float" and meta["num_elements"] > threads // 8
     bands = [(begin // 8, (end + 7) // 8) for begin, end in zip(boundaries, boundaries[1:])] if banded else [(0, (meta["channels"] + 7) // 8)]
     layouts, plans = [], []
     for begin, end in bands:
-        layout = ContractionLayout(meta, limits, banded, begin * 8, end * 8)
+        layout = ContractionLayout(meta, limits, banded, end * 8)
         layouts.append(layout)
         if not banded:
             plans.append(base_windows)
@@ -1191,7 +1346,9 @@ def make_triple_backward_source(meta, dtype="float32"):
         elif reduced_pairs:
             active = [(terms, [item for item in consumers if limits[item[0]] > begin * 8])
                       for terms, consumers in entries]
-            plans.append(pack_windows(entry for entry in active if entry[1]))
+            selected = [entry for entry in active if entry[1]]
+            plans.append(pack_projection_windows(selected, meta, limits, layout) if share_projections
+                         else pack_windows(selected))
         else:
             windows = [[(terms, [item for item in consumers if limits[item[0]] > begin * 8])
                         for terms, consumers in packet] for packet in base_windows]
@@ -1336,7 +1493,34 @@ def make_triple_backward_source(meta, dtype="float32"):
             } else {""",
             grouped_attributes_end="            }",
         )
+    initialize_weights = ""
+    weight_initialization = "true"
+    if not compact:
+        weight_initialization = "!(nodes > 0 && nodes <= ATOM_TILE)"
+        initialize_weights = """            if (nodes <= ATOM_TILE) {
+                if (channel < CHANNELS) {
+                    for (int element = local_node; element < NUM_ELEMENTS; element += ATOM_TILE) {
+                        for (int path = 0; path < NUM_PATHS; ++path) {
+                            const Index index = (Index(element) * NUM_PATHS + path) * CHANNELS + channel;
+                            if (tw) tw[index] = Element(0);
+                            if (trw) trw[index] = Element(0);
+                        }
+                    }
+                }
+                __syncthreads();
+            }"""
+    batch_initialization = """    std::vector<at::Tensor> zero_outputs;
+    if (need_attrs) zero_outputs.push_back(ta);
+    if (need_ra) zero_outputs.push_back(tra);
+    if (/* weight_initialization */) {
+        if (need_weights) zero_outputs.push_back(tw);
+        if (need_rw) zero_outputs.push_back(trw);
+    }
+    if (zero_outputs.size() == 1) zero_outputs[0].zero_();
+    else if (!zero_outputs.empty()) at::_foreach_zero_(zero_outputs);""".replace(
+        "/* weight_initialization */", weight_initialization)
     replacements = dict(constants="\n".join(constants), band_template=", int ChannelBand" if banded else "",
+                        initialize_weights=initialize_weights, batch_weight_initialization=batch_initialization,
                         shared_declaration=shared, task_mapping="\n".join(mapping), feature_loads=loads,
                         saved_gradients=indent("\n".join(gradients), " " * 12), channel_contractions="\n".join(contractions),
                         gradient_staging=staging, feature_stores=stores, output_stores=indent("\n".join(output_stores), " " * 20),
@@ -1356,6 +1540,7 @@ CG_CUDA_SOURCE = r"""
 #include <ATen/core/Tensor.h>
 #include <ATen/ops/empty_like.h>
 #include <ATen/ops/zeros_like.h>
+#include <ATen/ops/_foreach_zero.h>
 #include <torch/csrc/utils/pybind.h>
 #include <pybind11/stl.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -1364,6 +1549,7 @@ CG_CUDA_SOURCE = r"""
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace symmetric_triple_backward {
 /* constants */
@@ -1663,13 +1849,25 @@ pybind11::tuple run(
 ) {
     c10::cuda::CUDAGuard guard(x.device());
     at::Tensor tx, tw, ta, tg, trx, trw, tra;
-    if (need_x) tx = ReuseWeights ? at::zeros_like(x) : at::empty_like(x);
-    if (need_weights) tw = at::zeros_like(weights);
-    if (need_attrs) ta = at::zeros_like(attrs);
-    if (need_grad_out) tg = ReuseWeights ? at::zeros_like(grad_out) : at::empty_like(grad_out);
-    if (need_rx) trx = ReuseWeights ? at::zeros_like(x) : at::empty_like(x);
-    if (need_rw) trw = at::zeros_like(weights);
-    if (need_ra) tra = at::zeros_like(attrs);
+    if (need_x) tx = at::empty_like(x);
+    if (need_weights) tw = at::empty_like(weights);
+    if (need_attrs) ta = at::empty_like(attrs);
+    if (need_grad_out) tg = at::empty_like(grad_out);
+    if (need_rx) trx = at::empty_like(x);
+    if (need_rw) trw = at::empty_like(weights);
+    if (need_ra) tra = at::empty_like(attrs);
+    std::vector<at::Tensor> zero_outputs;
+    if constexpr (ReuseWeights) {
+        if (need_x) zero_outputs.push_back(tx);
+        if (need_grad_out) zero_outputs.push_back(tg);
+        if (need_rx) zero_outputs.push_back(trx);
+    }
+    if (need_weights) zero_outputs.push_back(tw);
+    if (need_attrs) zero_outputs.push_back(ta);
+    if (need_rw) zero_outputs.push_back(trw);
+    if (need_ra) zero_outputs.push_back(tra);
+    if (zero_outputs.size() == 1) zero_outputs[0].zero_();
+    else if (!zero_outputs.empty()) at::_foreach_zero_(zero_outputs);
     const auto ptr = [](const c10::optional<at::Tensor>& value) {
         return value ? value->data_ptr<Element>() : nullptr;
     };

@@ -161,12 +161,14 @@ def symmetric_contraction(x, weights, attrs, irreps_in, irreps_out, correlation=
     config = get_operator_config(
         str(irreps_in), str(irreps_out), correlation, weights.shape[0], x.dtype, use_reduced_cg
     )
-    return SymmetricContractionForward.apply(x, weights, attrs, config)
+    return SymmetricContractionForward.apply(x, weights.flatten(1), attrs, config)
 
 
 class SymmetricContractionForward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weights, attrs, config):
+        if x.ndim != 2:
+            raise ValueError("SymmetricContraction expects a 2D input [atoms, irreps_in.dim]")
         ctx.config = config
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(x, weights, attrs)

@@ -5,8 +5,8 @@ from string import Template
 from textwrap import indent
 
 from .utils import (
+    ContractionLayout, contraction_groups,
     bounded_cg_polynomials,
-    polynomial_groups,
     reduced_pair_groups,
     CG_CONSTANT_BYTES,
     CG_MEMBER_LITERAL_LIMIT,
@@ -279,88 +279,6 @@ SPARSE_SCHEDULING = Template(r"""        if ($track_block) {
 """)
 
 
-def consumer_outputs(path, blocks, sign):
-    outer = defaultdict(list)
-    if path["degree"] == 2:
-        for component in range(path["output_components"]):
-            outer[path["output_component"] + component].append((None, component, sign))
-    elif path["degree"] == 3:
-        tensor = next(block["tensor"] for block in blocks if block["tree"] == path["tree"])
-        start = path["tree"]["args"][1]["start"]
-        for output, inner, right in tensor.nonzero().tolist():
-            outer[path["output_component"] + output].append(
-                (start + right, inner, sign * tensor[output, inner, right].item()))
-    else:
-        raise ValueError("binary pair consumers must have degree two or three")
-    return outer
-
-
-def contraction_groups(meta):
-    payload = meta.get("binary")
-    if payload is None or meta.get("correlation", 3) > 3:
-        groups, paths = [], []
-        for terms, members in polynomial_groups(meta):
-            if not terms:
-                continue
-            basis = len(paths)
-            outer = {output: [(None, output, 1.)] for output, inputs, coefficient in terms}
-            groups.append((terms, [(basis, outer)]))
-            paths.append(tuple(members))
-        return groups, tuple(paths)
-
-    selected = {item["basis_path"]: item for item in payload["selected_paths"]}
-    blocks = tuple(payload["local_cg_blocks"].values())
-    groups, weight_paths = [], list(payload["compute_weight_paths"])
-    for pair in payload["pair_groups"]:
-        if not pair["terms"]:
-            continue
-        scale = max(abs(value) for output, inputs, value in pair["terms"])
-        terms = tuple((output, tuple(inputs), value / scale) for output, inputs, value in pair["terms"])
-        consumers = []
-        for basis, original, key, sign in pair["consumers"]:
-            outer = consumer_outputs(selected[basis], blocks, sign)
-            outer_scale = max(abs(value) for items in outer.values() for raw, inner, value in items)
-            weight_paths[basis] = tuple((path, coefficient * scale * outer_scale)
-                                        for path, coefficient in payload["compute_weight_paths"][basis])
-            consumers.append((basis, {output: [(raw, inner, value / outer_scale) for raw, inner, value in items]
-                                      for output, items in outer.items()}))
-        groups.append((terms, consumers))
-    for basis, item in selected.items():
-        if item["degree"] == 1:
-            groups.append(((), [(basis, {item["output_component"] + component:
-                                         [(item["tree"]["start"] + component, None, 1.)]
-                                         for component in range(item["output_components"])})]))
-    return groups, tuple(weight_paths)
-
-
-class ContractionLayout:
-    def __init__(self, meta, limits, banded, begin, end):
-        self.meta, self.limits = meta, limits
-        self.compact = meta.get("input_layout", "channels") != "channels"
-        self.banded, self.begin, self.end = banded, begin, end
-
-    def guard(self, value, limit):
-        if not self.banded:
-            return f"{value} < {limit}"
-        count = self.meta["channels"] if limit == "CHANNELS" else limit
-        return f"(BandEnd <= {count} || (BandBegin < {count} && {value} < {count}))"
-
-    def basis_guard(self, basis):
-        if self.limits is None:
-            return None
-        limit = self.limits[basis]
-        return "true" if self.banded and limit >= self.end else self.guard("channel", limit)
-
-    def load(self, pointer, path):
-        if not self.compact:
-            return f"{pointer}[base + Index({path}) * CHANNELS]"
-        address = f"{pointer}[base + Index({self.meta['path_offsets'][path]})]"
-        limit = self.meta["path_channels"][path]
-        if self.banded and limit >= self.end:
-            return address
-        return f"({self.guard('channel', limit)} ? {address} : Element(0))"
-
-
 def polynomial_code(terms, value, direction, grad_value, grad_direction, total, depth=0,
                      combine_squares=False, combine_powers=False):
     if not terms[0][0]:
@@ -413,7 +331,7 @@ def polynomial_code(terms, value, direction, grad_value, grad_direction, total, 
     return code
 
 
-def component_code(terms, consumers, guards, scalar):
+def component_code(terms, consumers, guards, scalar, reuse_values):
     count = len(consumers)
     code = [f"Element stream_product[{count}] = {{}}, stream_direction[{count}] = {{}};"]
     components = sorted({component for component, inputs, value in terms})
@@ -432,10 +350,11 @@ def component_code(terms, consumers, guards, scalar):
                         | {raw for by_raw in channels for raw in by_raw if raw is not None})
         outputs = sorted({output for by_raw in channels for items in by_raw.values() for output, _ in items})
         code += ["{", "    Element pair_gradient = 0, pair_gradient_direction = 0;"]
-        for value, indices in (("feature", inputs), ("direction", inputs), ("output_gradient", outputs)):
-            for index in indices:
-                field = f"{value}[{index}]"
-                code.append(f'asm volatile("mov.b{bits} %0, %1;" : "={constraint}"({field}) : "{constraint}"({field}));')
+        if not reuse_values:
+            for value, indices in (("feature", inputs), ("direction", inputs), ("output_gradient", outputs)):
+                for index in indices:
+                    field = f"{value}[{index}]"
+                    code.append(f'asm volatile("mov.b{bits} %0, %1;" : "={constraint}"({field}) : "{constraint}"({field}));')
         for slot, by_raw in enumerate(channels):
             if not by_raw:
                 continue
@@ -464,7 +383,7 @@ def component_code(terms, consumers, guards, scalar):
         code += ["    Element pair_value = 0, pair_direction = 0;"]
         code += ["    " + line for line in polynomial_code(
             inner, "pair_value", "pair_direction", "pair_gradient", "pair_gradient_direction",
-            "feature_sum", combine_squares=squares >= 2, combine_powers=scalar == "double")]
+            "feature_sum", combine_squares=squares >= 1, combine_powers=scalar == "double")]
         for slot, by_raw in enumerate(channels):
             if not by_raw:
                 continue
@@ -578,7 +497,8 @@ def weight_reduction_code(chunk, weight_paths, layout, threads, inline_weights):
     return code + ["}", "}", "}", "}", "__syncthreads();", "}"]
 
 
-def pair_code(groups, weight_paths, layout, rows, threads, path_tile, scalar, inline_weights, reuse_species):
+def pair_code(groups, weight_paths, layout, rows, threads, path_tile, scalar, inline_weights, reuse_species,
+              reuse_values):
     order = [basis for terms, consumers in groups for basis, outputs in consumers]
     offsets = {basis: index for index, basis in enumerate(order)}
     tiles = [order[first:first + path_tile] for first in range(0, len(order), path_tile)]
@@ -591,11 +511,12 @@ def pair_code(groups, weight_paths, layout, rows, threads, path_tile, scalar, in
         needed = sorted({index for other_terms, others in groups[pair:] for output, inputs, value in other_terms for index in inputs}
                         | {raw for other_terms, others in groups[pair:] for basis, outputs in others
                            for items in outputs.values() for raw, inner, value in items if raw is not None})
-        for component in needed:
-            for value in ("feature", "direction"):
-                code.append(f'asm volatile("mov.b{bits} %0, %1;" : "={constraint}"({value}[{component}]) : "{constraint}"({value}[{component}]));')
-        for output in range(len(layout.meta["output_offsets"])):
-            code.append(f'asm volatile("mov.b{bits} %0, %1;" : "={constraint}"(output_gradient[{output}]) : "{constraint}"(output_gradient[{output}]));')
+        if not reuse_values or inline_weights:
+            for component in needed:
+                for value in ("feature", "direction"):
+                    code.append(f'asm volatile("mov.b{bits} %0, %1;" : "={constraint}"({value}[{component}]) : "{constraint}"({value}[{component}]));')
+            for output in range(len(layout.meta["output_offsets"])):
+                code.append(f'asm volatile("mov.b{bits} %0, %1;" : "={constraint}"(output_gradient[{output}]) : "{constraint}"(output_gradient[{output}]));')
         count = len(consumers)
         code += [f"Element mixed_weight[{count}] = {{}}, mixed_direction[{count}] = {{}};", "if (WriteX || sg) {"]
         first = 0
@@ -652,7 +573,7 @@ def pair_code(groups, weight_paths, layout, rows, threads, path_tile, scalar, in
         code.append("}")
         guards = [layout.basis_guard(basis) for basis, outputs in consumers]
         if terms:
-            code += component_code(terms, consumers, guards, scalar)
+            code += component_code(terms, consumers, guards, scalar, reuse_values)
         for slot, (basis, outputs) in enumerate(consumers):
             code.append("{")
             if terms:
@@ -728,6 +649,22 @@ def pair_code(groups, weight_paths, layout, rows, threads, path_tile, scalar, in
     return "\n".join(preload), "\n".join(body)
 
 
+def warp_exchange_code(width):
+    # CUB's square butterfly, with the whole physical warp participating.
+    code = []
+    step = width // 2
+    while step:
+        for first in range(0, width, 2 * step):
+            for offset in range(step):
+                left, right = first + offset, first + offset + step
+                code += ["{", f"const bool upper = (threadIdx.x & {step}) != 0;",
+                         f"const Element send = upper ? items[{left}] : items[{right}];",
+                         f"const Element received = __shfl_xor_sync(0xffffffff, send, {step}, {width});",
+                         f"if (upper) items[{left}] = received; else items[{right}] = received;", "}"]
+        step //= 2
+    return code
+
+
 def make_double_backward_source(meta, dtype="float32"):
     """Use reduced pairs or bounded polynomials before falling back to a CG plan."""
     reduced_pairs = "cg_dag" in meta and meta.get("use_reduced_cg") and meta["correlation"] <= 3
@@ -742,24 +679,22 @@ def make_double_backward_source(meta, dtype="float32"):
         groups, weight_paths, support = reduced_pair_groups(meta)
     else:
         groups, weight_paths = contraction_groups(meta)
-    compact = meta.get("input_layout", "channels") != "channels"
     limits = None
-    if compact:
-        if reduced_pairs:
-            computed = tuple(support[basis] for basis in range(len(weight_paths)))
-        elif not meta["terms"] and "polynomials" in meta:
-            computed = tuple(max((min(meta["output_channels"][output],
-                                       *(meta["input_channels"][index] for index in inputs))
-                                  for output, inputs, coefficient in terms), default=0)
-                             for terms, consumers in groups)
-        else:
-            support = [0] * meta["num_paths"]
-            for output, path, inputs, coefficient in meta["terms"]:
-                support[path] = max(support[path], min(meta["output_channels"][output],
-                                                      *(meta["input_channels"][index] for index in inputs)))
-            computed = tuple(max((support[path] for path, coefficient in members), default=0) for members in weight_paths)
-        if not all(limit == meta["channels"] for limit in computed):
-            limits = computed
+    if reduced_pairs:
+        computed = tuple(support[basis] for basis in range(len(weight_paths)))
+    elif not meta["terms"] and "polynomials" in meta:
+        computed = tuple(max((min(meta["output_channels"][output],
+                                   *(meta["input_channels"][index] for index in inputs))
+                              for output, inputs, coefficient in terms), default=0)
+                         for terms, consumers in groups)
+    else:
+        support = [0] * meta["num_paths"]
+        for output, path, inputs, coefficient in meta["terms"]:
+            support[path] = max(support[path], min(meta["output_channels"][output],
+                                                  *(meta["input_channels"][index] for index in inputs)))
+        computed = tuple(max((support[path] for path, coefficient in members), default=0) for members in weight_paths)
+    if not all(limit == meta["channels"] for limit in computed):
+        limits = computed
     channels = meta.get("channel_tile", 16)
     boundaries = sorted({0, meta["channels"], *(min(meta["channels"], (limit + channels - 1) // channels * channels)
                                                   for limit in (limits or ()) if limit)})
@@ -781,8 +716,11 @@ def make_double_backward_source(meta, dtype="float32"):
         path_tile = min(path_tile, (shared_limit - required - sparse_bytes) // path_bytes)
     max_consumers = max((len(consumers) for terms, consumers in groups), default=1)
     registers = 3 * meta["input_dim"] + 1 + 6 * max_consumers + 2 * len(meta["output_offsets"]) + 8 + 24
+    reuse_values = registers * item_bytes <= 128 * 4
     register_threads = max(32, (32768 // (32 * registers)) * 32)
     node_rows = min(original_rows, max(1, register_threads // channels))
+    if inline_weights:
+        node_rows = 1 << (node_rows.bit_length() - 1)
     min_blocks = 3 if inline_weights else 2
     fixed_rows = node_rows
     if banded:
@@ -793,78 +731,94 @@ def make_double_backward_source(meta, dtype="float32"):
         fixed_rows = max(node_rows, min(16, (shared_limit - fixed) // per_row))
     separate_rows = fixed_rows > node_rows
     # The fast scatter keeps the first species live for the whole tile.
-    estimated_blocks = round((2 * 32768) / (registers * max(32, fixed_rows * channels)))
-    reuse_species = inline_weights and estimated_blocks >= min_blocks
+    target_blocks = round((2 * 32768) / (registers * max(32, fixed_rows * channels)))
+    block_warps = (max(32, fixed_rows * channels) + 31) // 32
+    # Registers allocate in 256-word warp blocks across four SM partitions.
+    # The species, attribute, and 64-bit weight base need four additional words.
+    species_registers = ((registers + 4 + 7) // 8) * 256
+    species_capacity = 4 * (16384 // species_registers) // block_warps
+    reuse_species = inline_weights and target_blocks >= min_blocks and (reuse_values or species_capacity >= min_blocks)
     warps_per_block = (max(32, node_rows * channels) + 31) // 32
-    min_blocks = min(min_blocks, max(2, estimated_blocks, (12 + warps_per_block - 1) // warps_per_block))
+    min_blocks = min(min_blocks, max(2, target_blocks, (12 + warps_per_block - 1) // warps_per_block))
     rows, threads = ("node_rows", "node_threads") if separate_rows else ("NODE_TILE", "FUSED_THREADS")
     function = "symmetric_contraction_doublebwd_" + ("fp64" if scalar == "double" else "fp32") + "_i64"
-    vector_width = next(width for width in ((2, 1) if scalar == "double" else (4, 2, 1)) if meta["input_dim"] % width == 0)
     sizes = dict(CHANNELS=meta["channels"], INPUT_DIM=meta["input_dim"], OUTPUT_DIM=meta["output_dim"],
                  NUM_ELEMENTS=meta["num_elements"], NUM_PATHS=meta["num_paths"],
                  OUTPUT_COMPONENTS=len(meta["output_offsets"]), NODE_TILE=node_rows, FUSED_CHANNEL_TILE=channels,
                  FUSED_THREADS=max(32, node_rows * channels), GROUPS_PER_WORKER=4,
                  CHANNEL_TILES=(meta["channels"] + channels - 1) // channels, WEIGHT_PATH_TILE=path_tile)
-    constants = [f"using Element = {scalar};", "using Index = int64_t;",
-                 f"using FeatureVector = {scalar + str(vector_width) if vector_width > 1 else scalar};",
-                 f"constexpr int FEATURE_VECTOR_WIDTH = {vector_width};"]
+    constants = [f"using Element = {scalar};", "using Index = int64_t;"]
     for name, value in sizes.items():
         constants.append(f"constexpr int {name} = {value};")
         if name == "FUSED_THREADS" and separate_rows:
             constants += [f"constexpr int NODE_TILE_NO_ATTRS = {fixed_rows};",
                           f"constexpr int THREADS_NO_ATTRS = {max(32, fixed_rows * channels)};"]
-    if compact:
-        constants += ["", f"constexpr int INPUT_SIZE = {meta['input_size']};",
-                      f"constexpr int WEIGHT_SIZE = {meta['weight_numel']};"]
-        loader = ["__device__ __forceinline__ void load_feature(",
-                  "const Element* input, Index node, int channel, bool valid, Element* values", ") {"]
-        for component, (offset, stride, count) in enumerate(zip(meta["input_offsets"], meta["input_strides"], meta["input_channels"])):
-            loader.append(f"values[{component}] = valid && input && channel < {count} ? input[node * INPUT_SIZE + Index({offset}) + Index(channel) * {stride}] : Element(0);")
-        loader += ["}", ""]
-        feature_loads = ["Element feature[INPUT_DIM], direction[INPUT_DIM];",
-                         "load_feature(x, node, channel, valid, feature);",
-                         "load_feature(rx, node, channel, valid, direction);"]
-    else:
-        loader = ["__device__ __forceinline__ void load_feature(const Element* input, Element* values) {",
-                  "if (!input) {", "#pragma unroll",
-                  "for (int i = 0; i < INPUT_DIM; ++i) values[i] = Element(0);", "return;", "}",
-                  "if ((reinterpret_cast<uintptr_t>(input) & (sizeof(FeatureVector) - 1)) == 0) {",
-                  "#pragma unroll", "for (int i = 0; i < INPUT_DIM / FEATURE_VECTOR_WIDTH; ++i) {",
-                  "const FeatureVector value = reinterpret_cast<const FeatureVector*>(input)[i];"]
-        loader += [f"values[i * FEATURE_VECTOR_WIDTH + {index}] = value{'.' + component if vector_width > 1 else ''};"
-                   for index, component in enumerate("xyzw"[:vector_width])]
-        loader += ["}", "return;", "}", "#pragma unroll",
-                   "for (int i = 0; i < INPUT_DIM; ++i) values[i] = input[i];", "}", ""]
-        feature_loads = ["const Index input_offset = (node * CHANNELS + channel) * INPUT_DIM;",
-                         "Element feature[INPUT_DIM], direction[INPUT_DIM];",
-                         "load_feature(valid ? x + input_offset : nullptr, feature);",
-                         "load_feature(valid && (FullOutputs || rx) ? rx + input_offset : nullptr, direction);"]
-    layout = ContractionLayout(meta, limits, banded, 0, meta["channels"])
+    constants += ["", f"constexpr int INPUT_SIZE = {meta['input_size']};",
+                  f"constexpr int WEIGHT_SIZE = {meta['weight_numel']};"]
+    loader = ["__device__ __forceinline__ void load_feature(",
+              "const Element* input, Index node, int channel, bool valid, Element* values", ") {"]
+    for component, (offset, stride, count) in enumerate(zip(meta["input_offsets"], meta["input_strides"], meta["input_channels"])):
+        loader.append(f"values[{component}] = valid && input && channel < {count} ? input[node * INPUT_SIZE + Index({offset}) + Index(channel) * {stride}] : Element(0);")
+    loader += ["}", ""]
+    feature_loads = ["Element feature[INPUT_DIM], direction[INPUT_DIM];",
+                     "load_feature(x, node, channel, valid, feature);",
+                     "load_feature(rx, node, channel, valid, direction);"]
+    layout = ContractionLayout(meta, limits, banded, meta["channels"])
     gradient_loads, stores = [], []
     for output, (offset, stride) in enumerate(zip(meta["output_offsets"], meta["output_strides"])):
         address = f"node * OUTPUT_DIM + {offset} + Index(channel) * {stride}"
-        valid = "valid" + (f" && {layout.guard('channel', meta['output_channels'][output])}" if compact else "")
+        valid = "valid" + (f" && {layout.guard('channel', meta['output_channels'][output])}")
         gradient_loads.append(f"output_gradient[{output}] = {valid} ? grad_out[{address}] : Element(0);")
-        guard = f"if ({layout.guard('channel', meta['output_channels'][output])}) " if compact else ""
+        guard = f"if ({layout.guard('channel', meta['output_channels'][output])}) "
         stores.append(guard + f"sg[{address}] = output_sum[{output}];")
     feature_stores = []
-    if compact:
-        for component, (offset, stride, count) in enumerate(zip(meta["input_offsets"], meta["input_strides"], meta["input_channels"])):
-            feature_stores.append(f"if (node_row < {rows} && node < nodes && {layout.guard('channel', count)}) sx[node * INPUT_SIZE + Index({offset}) + Index(channel) * {stride}] = feature_sum[{component}];")
-    else:
-        first = 0
-        while first < meta["input_dim"]:
-            width = min(4 if scalar == "double" else 8, 1 << ((meta["input_dim"] - first).bit_length() - 1))
-            guard = f"node_row < {rows} && " if node_rows * channels < 32 else ""
-            feature_stores += ["{", f"Element items[{width}] = {{" + ", ".join(f"feature_sum[{first + item}]" for item in range(width)) + "};",
-                              f"using Exchange = cub::WarpExchange<Element, {width}, {width}, 0, cub::WARP_EXCHANGE_SHUFFLE>;",
-                              "typename Exchange::TempStorage storage;", "Exchange(storage).BlockedToStriped(items, items);",
-                              f"const int local_lane = threadIdx.x & {width - 1};", "const int first_channel = channel - local_lane;"]
+    max_stride = max(meta["input_strides"])
+    exchange_items = fixed_rows * (channels * max_stride + 1)
+    product_items = 8 * fixed_rows * channels
+    weight_items = 2 * path_tile * meta["num_elements"] * channels
+    shared_buffer = "products" if exchange_items <= product_items else "projected_weights"
+    shuffle_exchange = meta["channels"] >= channels and not layout.compact
+    shared_exchange = (1 < max_stride and exchange_items <= max(product_items, weight_items)
+                       and (not shuffle_exchange or (1 << (max_stride - 1).bit_length()) > channels))
+    if shared_exchange:
+        feature_stores += [f"using FeatureStorage = typename cub::WarpExchange<Element, {max_stride}, FUSED_CHANNEL_TILE>::TempStorage;",
+                           f"static_assert(sizeof(FeatureStorage) * {rows} <= sizeof({shared_buffer}));",
+                           f"auto* feature_storage = reinterpret_cast<FeatureStorage*>({shared_buffer});"]
+        # Weight reduction already synchronizes reuse of products.
+        if shared_buffer == "projected_weights":
+            feature_stores.append("__syncthreads();")
+    first = 0
+    while first < meta["input_dim"]:
+        offset = meta["input_offsets"][first]
+        stride = meta["input_strides"][first]
+        count = meta["input_channels"][first]
+        width = 1 << (stride - 1).bit_length()
+        if stride > 1 and shared_exchange:
+            values = [f"feature_sum[{first + item}]" for item in range(stride)]
+            feature_stores += ["{", f"Element items[{stride}] = {{" + ", ".join(values) + "};",
+                               f"using Exchange = cub::WarpExchange<Element, {stride}, FUSED_CHANNEL_TILE>;",
+                               f"if (node_row < {rows}) {{",
+                               "auto& storage = *reinterpret_cast<typename Exchange::TempStorage*>(feature_storage + node_row);",
+                               "Exchange(storage).BlockedToStriped(items, items);"]
+            for item in range(stride):
+                address = f"Index(channel_begin) * {stride} + local_channel + {item * channels}"
+                feature_stores += [f"if (node < nodes && {address} < {count * stride})",
+                                   f"sx[node * INPUT_SIZE + Index({offset}) + {address}] = items[{item}];"]
+            feature_stores += ["}", "__syncwarp();", "}"]
+        elif stride > 1 and width <= channels and shuffle_exchange:
+            values = [f"feature_sum[{first + item}]" if item < stride else "Element(0)" for item in range(width)]
+            feature_stores += ["{", f"Element items[{width}] = {{" + ", ".join(values) + "};",
+                              *warp_exchange_code(width),
+                              f"const int local_lane = threadIdx.x & {width - 1};",
+                              "const int first_channel = channel - local_lane;"]
             for item in range(width):
-                feature_stores += [f"if ({guard}node < nodes && first_channel + {item} < CHANNELS)",
-                                   f"sx[(node * CHANNELS + first_channel + {item}) * INPUT_DIM + {first} + local_lane] = items[{item}];"]
+                feature_stores += [f"if (node_row < {rows} && node < nodes && local_lane < {stride} && first_channel + {item} < {count})",
+                                   f"sx[node * INPUT_SIZE + Index({offset}) + Index(first_channel + {item}) * {stride} + local_lane] = items[{item}];"]
             feature_stores.append("}")
-            first += width
+        else:
+            for item in range(stride):
+                feature_stores.append(f"if (node_row < {rows} && node < nodes && {layout.guard('channel', count)}) sx[node * INPUT_SIZE + Index({offset + item}) + Index(channel) * {stride}] = feature_sum[{first + item}];")
+        first += stride
     preloads, contractions = [], []
     tiles = [0] + [(bound + channels - 1) // channels for bound in boundaries[1:]]
     for band, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
@@ -874,8 +828,9 @@ def make_double_backward_source(meta, dtype="float32"):
                              for terms, consumers in groups]
             active_groups = [(terms, consumers) for terms, consumers in active_groups if consumers]
         band_path_tile = min(path_tile, max(1, sum(len(consumers) for terms, consumers in active_groups)))
-        preload, contraction = pair_code(active_groups, weight_paths, ContractionLayout(meta, limits, banded, begin, end),
-                                        rows, threads, band_path_tile, scalar, inline_weights, reuse_species)
+        preload, contraction = pair_code(active_groups, weight_paths, ContractionLayout(meta, limits, banded, end),
+                                        rows, threads, band_path_tile, scalar, inline_weights, reuse_species,
+                                        reuse_values)
         if banded:
             prefix = "if constexpr" if band == 0 else "else if constexpr"
             preloads.append(f"{prefix} (ChannelBand == {band}) {{\n{preload}\n}}")
@@ -957,7 +912,7 @@ def make_double_backward_source(meta, dtype="float32"):
     if inline_weights:
         sparse_scheduling += SPARSE_SCHEDULING.substitute(rows=rows, track_block=track_block)
     if reuse_species:
-        stride = "WEIGHT_SIZE" if compact else "(NUM_PATHS * CHANNELS)"
+        stride = "WEIGHT_SIZE"
         first_species = f"""        const bool has_inline_weight = FullOutputs && load_inline && active_count;
         const int first_species = has_inline_weight ? active_species[node_row][0] : 0;
         const Element first_attribute = has_inline_weight ? attr_values[node_row][first_species] : Element(0);

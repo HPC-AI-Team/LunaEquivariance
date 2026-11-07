@@ -52,11 +52,13 @@ __device__ __forceinline__ BackwardPacket<scalar_t, Width> load_backward_packet(
         if (dim < embed_dim) packet.value[0] = pointer[offset];
     } else if (vectorized && dim + (Width - 1) < embed_dim) {
         if constexpr (sizeof(scalar_t) == sizeof(float)) {
-            float4 v = *reinterpret_cast<const float4*>(pointer + offset);
-            packet.value[0] = v.x;
-            packet.value[1] = v.y;
-            packet.value[2] = v.z;
-            packet.value[3] = v.w;
+            if constexpr (Width == 4) {
+                float4 v = *reinterpret_cast<const float4*>(pointer + offset);
+                packet = {{v.x, v.y, v.z, v.w}};
+            } else {
+                float2 v = *reinterpret_cast<const float2*>(pointer + offset);
+                packet = {{v.x, v.y}};
+            }
         } else {
             double2 lo = *reinterpret_cast<const double2*>(pointer + offset);
             if constexpr (Width == 4) {
@@ -90,8 +92,12 @@ __device__ __forceinline__ void store_backward_packet(
         if (dim < embed_dim) pointer[offset] = packet.value[0];
     } else if (vectorized && dim + (Width - 1) < embed_dim) {
         if constexpr (sizeof(scalar_t) == sizeof(float)) {
-            *reinterpret_cast<float4*>(pointer + offset) = make_float4(
-                packet.value[0], packet.value[1], packet.value[2], packet.value[3]);
+            if constexpr (Width == 4) {
+                *reinterpret_cast<float4*>(pointer + offset) = make_float4(
+                    packet.value[0], packet.value[1], packet.value[2], packet.value[3]);
+            } else {
+                *reinterpret_cast<float2*>(pointer + offset) = make_float2(packet.value[0], packet.value[1]);
+            }
         } else {
             *reinterpret_cast<double2*>(pointer + offset) = make_double2(
                 packet.value[0], packet.value[1]);
@@ -110,15 +116,15 @@ __device__ __forceinline__ void store_backward_packet(
     }
 }
 
-template <typename T, int EnvMode, int Width, int Threads>
+template <typename T, int EnvMode, int Width, int Threads, int FeatureLanes>
 __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax_backward_kernel(
     const T* __restrict__ grad_output, const T* __restrict__ data,
     const T* __restrict__ env, const void* __restrict__ row_ptr, bool csr_int32,
     T* __restrict__ grad_data, T* __restrict__ grad_env,
     int64_t embed_dim, bool smooth, T eps)
 {
-    constexpr int Warps = Threads / 32;
-    constexpr int Tile = 32 * Width;
+    constexpr int EdgeGroups = Threads / FeatureLanes;
+    constexpr int Tile = FeatureLanes * Width;
     constexpr int CacheEdges = 32;
     constexpr bool FeatureGrid = EnvMode != 1;
     using Packet = BackwardPacket<T, Width>;
@@ -128,7 +134,7 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
     const int64_t end = (csr_int32 ? static_cast<const int32_t*>(row_ptr)[segment + 1]
         : static_cast<const int64_t*>(row_ptr)[segment + 1]);
     if (begin == end) return;
-    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int lane = threadIdx.x % FeatureLanes, warp = threadIdx.x / FeatureLanes;
     const int group = warp;
     const int local_dim = lane * Width;
     const int64_t tile_start = FeatureGrid ? int64_t(blockIdx.y) * Tile : 0;
@@ -140,7 +146,7 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
     const bool vector_dx = aligned_stride && (reinterpret_cast<uintptr_t>(grad_data) & 15) == 0;
     const bool vector_de = aligned_stride && (reinterpret_cast<uintptr_t>(grad_env) & 15) == 0;
     __shared__ __align__(16) T cache[CacheEdges][Tile];
-    __shared__ T moments[3][Warps][Tile];
+    __shared__ T moments[3][EdgeGroups][Tile];
 
     for (int64_t base_dim = tile_start; base_dim < embed_dim; base_dim += tile_stride) {
         const int64_t dim = base_dim + local_dim;
@@ -148,7 +154,7 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
         T dot[Width] = {};
         if (end - begin != 1) {
             OnlineMoments<T, 1> states[Width];
-            for (int64_t edge = begin + group; edge < end; edge += Warps) {
+            for (int64_t edge = begin + group; edge < end; edge += EdgeGroups) {
                 const int64_t offset = edge * embed_dim + dim;
                 const auto x = load_backward_packet<Width>(data, offset, dim, embed_dim, vector_x);
                 const auto g = load_backward_packet<Width>(grad_output, offset, dim, embed_dim, vector_g);
@@ -173,12 +179,12 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
             }
             __syncthreads();
             #pragma unroll
-            for (int stride = Warps / 2; stride > 0; stride /= 2) {
+            for (int stride = EdgeGroups / 2; stride > 0; stride /= 2) {
                 if (warp < stride) {
                     #pragma unroll
                     for (int c = 0; c < Width; ++c) {
                         T value[1] = {moments[2][warp+stride][local_dim+c]};
-                        states[c].merge(moments[0][warp+stride][local_dim+c],
+                        states[c].add(moments[0][warp+stride][local_dim+c],
                                         moments[1][warp+stride][local_dim+c], value);
                         moments[0][warp][local_dim+c] = states[c].maximum;
                         moments[1][warp][local_dim+c] = states[c].weighted_sum;
@@ -202,7 +208,7 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
         }
 
         // Each warp writes its edge subsequence and reduces envelope channels.
-        for (int64_t edge = begin + warp; edge < end; edge += Warps) {
+        for (int64_t edge = begin + warp; edge < end; edge += EdgeGroups) {
             T env_sum = T(0);
             {
                 const int64_t offset = edge * embed_dim + dim;
@@ -249,7 +255,7 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
             }
             if constexpr (EnvMode == 1) {
                 if (grad_env) {
-                    env_sum = warp_reduce_sum(env_sum);
+                    env_sum = warp_softmax_envelope_sum<FeatureLanes>(env_sum);
                     if (lane == 0) grad_env[edge] = env_sum + (base_dim ? grad_env[edge] : T(0));
                 }
             }
@@ -258,29 +264,189 @@ __global__ void __launch_bounds__(Threads, Threads >= 512 ? 1 : 2) graph_softmax
     }
 
 }
+
+template <typename T, int EnvMode, int Dim>
+__global__ void graph_softmax_backward_warp_kernel(
+    const T* __restrict__ g, const T* __restrict__ data, const T* __restrict__ env,
+    const void* __restrict__ row_ptr, bool csr_int32,
+    T* __restrict__ dx, T* __restrict__ de,
+    int64_t segments, bool smooth, T eps)
+{
+    constexpr int Width = Dim <= 2 ? Dim : Dim / 2;
+    constexpr int Packets = Dim / Width;
+    constexpr int EdgesPerWarp = kWarpSize / Packets;
+    const int lane = threadIdx.x % kWarpSize;
+    const int64_t row = int64_t(blockIdx.x) * kSoftmaxWarpRows + threadIdx.x / kWarpSize;
+    if (row >= segments) return;
+    const int64_t begin = csr_int32 ? static_cast<const int32_t*>(row_ptr)[row]
+                                    : static_cast<const int64_t*>(row_ptr)[row];
+    const int64_t end = csr_int32 ? static_cast<const int32_t*>(row_ptr)[row + 1]
+                                  : static_cast<const int64_t*>(row_ptr)[row + 1];
+    if (begin == end) return;
+
+    // Lanes span edges when a feature tile is narrower than a warp.
+    const int packet = lane % Packets;
+    const int feature = packet * Width;
+    const int edge_lane = lane / Packets;
+    const bool singleton = end - begin == 1;
+    const bool vector_x = (reinterpret_cast<uintptr_t>(data) & 15) == 0;
+    const bool vector_g = (reinterpret_cast<uintptr_t>(g) & 15) == 0;
+    constexpr bool PackEnvelope = EnvMode == 2 && Width > 1;
+    constexpr int EnvAlignment = Width * sizeof(T);
+    const bool vector_env = (reinterpret_cast<uintptr_t>(env) & (EnvAlignment - 1)) == 0;
+    OnlineMoments<T, 1> states[Width];
+    if (!singleton) {
+        for (int64_t edge = begin + edge_lane; edge < end; edge += EdgesPerWarp) {
+            const int64_t offset = edge * Dim + feature;
+            const auto x = load_backward_packet<Width>(data, offset, 0, Width, vector_x);
+            const auto grad = load_backward_packet<Width>(g, offset, 0, Width, vector_g);
+            BackwardPacket<T, Width> weights;
+            if constexpr (PackEnvelope) {
+                weights = load_backward_packet<Width>(env, offset, 0, Width, vector_env);
+            }
+            #pragma unroll
+            for (int c = 0; c < Width; ++c) {
+                const T e = PackEnvelope ? weights.value[c] : env_value<T, EnvMode>(env, edge, feature + c, Dim);
+                const T weighted_grad[1] = {grad.value[c] * e * (smooth ? e : T(1))};
+                states[c].add(x.value[c], e, weighted_grad);
+            }
+        }
+        #pragma unroll
+        for (int c = 0; c < Width; ++c) warp_softmax_moments(states[c], Packets);
+    }
+    T inverse[Width], dot[Width];
+    #pragma unroll
+    for (int c = 0; c < Width; ++c) {
+        inverse[c] = singleton ? T(0) : T(1) / (states[c].weighted_sum + eps);
+        dot[c] = states[c].moments[0] * inverse[c];
+    }
+    for (int64_t base = begin; base < end; base += EdgesPerWarp) {
+        const int64_t edge = base + edge_lane;
+        T grad_env_sum = T(0);
+        if (edge < end) {
+            const int64_t offset = edge * Dim + feature;
+            const auto grad = load_backward_packet<Width>(g, offset, 0, Width, vector_g);
+            BackwardPacket<T, Width> weights;
+            if constexpr (PackEnvelope) {
+                weights = load_backward_packet<Width>(env, offset, 0, Width, vector_env);
+            }
+            BackwardPacket<T, Width> x = {}, grad_data, grad_env;
+            if (!singleton) x = load_backward_packet<Width>(data, offset, 0, Width, vector_x);
+            #pragma unroll
+            for (int c = 0; c < Width; ++c) {
+                const T e = PackEnvelope ? weights.value[c] : env_value<T, EnvMode>(env, edge, feature + c, Dim);
+                const T dg = grad.value[c];
+                if (singleton) {
+                    const T q = T(1) / (e + eps), p = q * e, residual = eps * q;
+                    grad_data.value[c] = dg * p * residual * (smooth ? e : T(1));
+                    grad_env.value[c] = dg * (smooth ? p * (T(1) + residual) : q * residual);
+                } else {
+                    const T q = exp_op(x.value[c] - states[c].maximum) * inverse[c];
+                    const T p = q * e, y = p * (smooth ? e : T(1));
+                    grad_data.value[c] = dg * y - p * dot[c];
+                    grad_env.value[c] = q * (dg * (smooth ? T(2) * e : T(1)) - dot[c]);
+                }
+                if constexpr (EnvMode == 1) grad_env_sum += grad_env.value[c];
+            }
+            store_backward_packet(dx, offset, 0, Width, grad_data, true);
+            if constexpr (EnvMode == 2) {
+                if (de) store_backward_packet(de, offset, 0, Width, grad_env, true);
+            }
+        }
+        if constexpr (EnvMode == 1) {
+            if (de) {
+                grad_env_sum = warp_softmax_envelope_sum<Packets>(grad_env_sum);
+                if (edge < end && packet == 0) de[edge] = grad_env_sum;
+            }
+        }
+    }
+}
+
 """
 
 LAUNCH_SOURCE = r"""
-template <typename T, int Width, int Threads>
+template <typename T, int Dim>
+void launch_graph_softmax_backward_warp(
+    const T* g, const T* data, const T* env, const void* row_ptr, bool csr_int32,
+    T* dx, T* de, int64_t segments,
+    int mode, bool smooth, T eps, cudaStream_t stream)
+{
+    constexpr int Threads = kWarpSize * kSoftmaxWarpRows;
+    const int64_t blocks = (segments + kSoftmaxWarpRows - 1) / kSoftmaxWarpRows;
+    if (mode == 0) {
+        graph_softmax_backward_warp_kernel<T, 0, Dim><<<blocks, Threads, 0, stream>>>(
+            g, data, env, row_ptr, csr_int32, dx, de, segments, smooth, eps);
+    } else if (mode == 1) {
+        graph_softmax_backward_warp_kernel<T, 1, Dim><<<blocks, Threads, 0, stream>>>(
+            g, data, env, row_ptr, csr_int32, dx, de, segments, smooth, eps);
+    } else {
+        graph_softmax_backward_warp_kernel<T, 2, Dim><<<blocks, Threads, 0, stream>>>(
+            g, data, env, row_ptr, csr_int32, dx, de, segments, smooth, eps);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename T, int Width, int Threads, int FeatureLanes = kWarpSize>
 void launch_graph_softmax_backward_impl(
     const T* grad_output, const T* data, const T* env, const void* row_ptr, bool csr_int32,
     T* grad_data, T* grad_env, int64_t segments, int64_t dim,
     int mode, bool smooth, T eps, cudaStream_t stream)
 {
-    constexpr int Tile = 32 * Width;
+    constexpr int Tile = FeatureLanes * Width;
     const int64_t tiles = (dim + Tile - 1) / Tile;
     const unsigned int grid_y = static_cast<unsigned int>(min(tiles, int64_t(65535)));
     if (mode == 0) {
-        graph_softmax_backward_kernel<T, 0, Width, Threads><<<dim3(segments, grid_y), Threads, 0, stream>>>(
+        graph_softmax_backward_kernel<T, 0, Width, Threads, FeatureLanes><<<dim3(segments, grid_y), Threads, 0, stream>>>(
             grad_output, data, env, row_ptr, csr_int32, grad_data, grad_env, dim, smooth, eps);
     } else if (mode == 1) {
-        graph_softmax_backward_kernel<T, 1, Width, Threads><<<segments, Threads, 0, stream>>>(
+        graph_softmax_backward_kernel<T, 1, Width, Threads, FeatureLanes><<<segments, Threads, 0, stream>>>(
             grad_output, data, env, row_ptr, csr_int32, grad_data, grad_env, dim, smooth, eps);
     } else {
-        graph_softmax_backward_kernel<T, 2, Width, Threads><<<dim3(segments, grid_y), Threads, 0, stream>>>(
+        graph_softmax_backward_kernel<T, 2, Width, Threads, FeatureLanes><<<dim3(segments, grid_y), Threads, 0, stream>>>(
             grad_output, data, env, row_ptr, csr_int32, grad_data, grad_env, dim, smooth, eps);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <typename T>
+void launch_graph_softmax_backward_narrow(
+    const T* g, const T* data, const T* env, const void* row_ptr, bool csr_int32,
+    T* dx, T* de, int64_t segments, int64_t dim, int64_t edges,
+    int mode, bool smooth, T eps, cudaStream_t stream)
+{
+    switch (dim) {
+    case 1:
+        launch_graph_softmax_backward_warp<T, 1>(g, data, env, row_ptr, csr_int32,
+            dx, de, segments, mode, smooth, eps, stream);
+        return;
+    case 2:
+        launch_graph_softmax_backward_warp<T, 2>(g, data, env, row_ptr, csr_int32,
+            dx, de, segments, mode, smooth, eps, stream);
+        return;
+    case 4:
+        launch_graph_softmax_backward_warp<T, 4>(g, data, env, row_ptr, csr_int32,
+            dx, de, segments, mode, smooth, eps, stream);
+        return;
+    case 8:
+        if constexpr (sizeof(T) == sizeof(float)) {
+            if (edges <= segments * kRowEdgeLimit) {
+                launch_graph_softmax_backward_warp<T, 8>(g, data, env, row_ptr, csr_int32,
+                    dx, de, segments, mode, smooth, eps, stream);
+                return;
+            }
+        }
+        break;
+    }
+
+    // Partial feature tiles and long rows use the block kernel.
+    constexpr int Threads = kWarpSize * kSoftmaxWarpRows;
+    if (dim <= kSoftmaxPackedFeatures / 2) {
+        launch_graph_softmax_backward_impl<T, 1, Threads, kSoftmaxPackedFeatures / 2>(
+            g, data, env, row_ptr, csr_int32, dx, de, segments, dim, mode, smooth, eps, stream);
+    } else {
+        launch_graph_softmax_backward_impl<T, 1, Threads, kSoftmaxPackedFeatures>(
+            g, data, env, row_ptr, csr_int32, dx, de, segments, dim, mode, smooth, eps, stream);
+    }
 }
 
 template <typename T, int Width>
@@ -289,7 +455,7 @@ void launch_graph_softmax_backward_rows(
     T* dx, T* de, int64_t segments, int64_t dim, int64_t edges,
     int mode, bool smooth, T eps, cudaStream_t stream)
 {
-    if (edges <= segments * 64) {
+    if (edges <= segments * kRowEdgeLimit) {
         launch_graph_softmax_backward_impl<T, Width, (Width == 1 ? 256 : 128)>(
             g, data, env, row_ptr, csr_int32, dx, de, segments, dim, mode, smooth, eps, stream);
     } else {
@@ -303,10 +469,15 @@ void launch_graph_softmax_backward(
     float* dx, float* de, int64_t segments, int64_t dim, int64_t edges,
     int mode, bool smooth, float eps, cudaStream_t stream)
 {
-    if (dim <= 32 || dim % 4 != 0) {
-        launch_graph_softmax_backward_rows<float, 1>(g, data, env, row_ptr, csr_int32, dx, de, segments, dim, edges, mode, smooth, eps, stream);
-    } else {
+    if (dim <= packed_gradient_features<float>(mode)) {
+        launch_graph_softmax_backward_narrow(g, data, env, row_ptr, csr_int32,
+            dx, de, segments, dim, edges, mode, smooth, eps, stream);
+    } else if (dim % 128 == 0) {
         launch_graph_softmax_backward_rows<float, 4>(g, data, env, row_ptr, csr_int32, dx, de, segments, dim, edges, mode, smooth, eps, stream);
+    } else if (dim % 64 == 0) {
+        launch_graph_softmax_backward_rows<float, 2>(g, data, env, row_ptr, csr_int32, dx, de, segments, dim, edges, mode, smooth, eps, stream);
+    } else {
+        launch_graph_softmax_backward_rows<float, 1>(g, data, env, row_ptr, csr_int32, dx, de, segments, dim, edges, mode, smooth, eps, stream);
     }
 }
 
@@ -315,7 +486,10 @@ void launch_graph_softmax_backward(
     double* dx, double* de, int64_t segments, int64_t dim, int64_t edges,
     int mode, bool smooth, double eps, cudaStream_t stream)
 {
-    if (dim <= 32 || dim % 2 != 0) {
+    if (dim <= packed_gradient_features<double>(mode)) {
+        launch_graph_softmax_backward_narrow(g, data, env, row_ptr, csr_int32,
+            dx, de, segments, dim, edges, mode, smooth, eps, stream);
+    } else if (dim <= 32 || dim % 2 != 0) {
         launch_graph_softmax_backward_rows<double, 1>(g, data, env, row_ptr, csr_int32, dx, de, segments, dim, edges, mode, smooth, eps, stream);
     } else {
         launch_graph_softmax_backward_rows<double, 2>(g, data, env, row_ptr, csr_int32, dx, de, segments, dim, edges, mode, smooth, eps, stream);

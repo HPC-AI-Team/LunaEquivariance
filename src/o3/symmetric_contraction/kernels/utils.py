@@ -173,6 +173,88 @@ def reduced_pair_groups(meta):
     return groups, graph["weight_members"], limits
 
 
+def consumer_outputs(path, blocks, sign):
+    outer = defaultdict(list)
+    if path["degree"] == 2:
+        for component in range(path["output_components"]):
+            outer[path["output_component"] + component].append((None, component, sign))
+    elif path["degree"] == 3:
+        tensor = next(block["tensor"] for block in blocks if block["tree"] == path["tree"])
+        start = path["tree"]["args"][1]["start"]
+        for output, inner, right in tensor.nonzero().tolist():
+            outer[path["output_component"] + output].append(
+                (start + right, inner, sign * tensor[output, inner, right].item()))
+    else:
+        raise ValueError("binary pair consumers must have degree two or three")
+    return outer
+
+
+def contraction_groups(meta):
+    payload = meta.get("binary")
+    if payload is None or meta.get("correlation", 3) > 3:
+        groups, paths = [], []
+        for terms, members in polynomial_groups(meta):
+            if not terms:
+                continue
+            basis = len(paths)
+            outer = {output: [(None, output, 1.)] for output, inputs, coefficient in terms}
+            groups.append((terms, [(basis, outer)]))
+            paths.append(tuple(members))
+        return groups, tuple(paths)
+
+    selected = {item["basis_path"]: item for item in payload["selected_paths"]}
+    blocks = tuple(payload["local_cg_blocks"].values())
+    groups, weight_paths = [], list(payload["compute_weight_paths"])
+    for pair in payload["pair_groups"]:
+        if not pair["terms"]:
+            continue
+        scale = max(abs(value) for output, inputs, value in pair["terms"])
+        terms = tuple((output, tuple(inputs), value / scale) for output, inputs, value in pair["terms"])
+        consumers = []
+        for basis, original, key, sign in pair["consumers"]:
+            outer = consumer_outputs(selected[basis], blocks, sign)
+            outer_scale = max(abs(value) for items in outer.values() for raw, inner, value in items)
+            weight_paths[basis] = tuple((path, coefficient * scale * outer_scale)
+                                        for path, coefficient in payload["compute_weight_paths"][basis])
+            consumers.append((basis, {output: [(raw, inner, value / outer_scale) for raw, inner, value in items]
+                                      for output, items in outer.items()}))
+        groups.append((terms, consumers))
+    for basis, item in selected.items():
+        if item["degree"] == 1:
+            groups.append(((), [(basis, {item["output_component"] + component:
+                                         [(item["tree"]["start"] + component, None, 1.)]
+                                         for component in range(item["output_components"])})]))
+    return groups, tuple(weight_paths)
+
+
+class ContractionLayout:
+    def __init__(self, meta, limits, banded, end):
+        self.meta, self.limits = meta, limits
+        self.compact = any(count != meta["channels"] for count in (*meta["input_channels"], *meta["output_channels"]))
+        self.banded, self.end = banded, end
+
+    def guard(self, value, limit):
+        if not self.banded:
+            return f"{value} < {limit}"
+        count = self.meta["channels"] if limit == "CHANNELS" else limit
+        return f"(BandEnd <= {count} || (BandBegin < {count} && {value} < {count}))"
+
+    def basis_guard(self, basis):
+        if self.limits is None:
+            return None
+        limit = self.limits[basis]
+        return "true" if self.banded and limit >= self.end else self.guard("channel", limit)
+
+    def load(self, pointer, path):
+        if not self.compact:
+            return f"{pointer}[base + Index({path}) * CHANNELS]"
+        address = f"{pointer}[base + Index({self.meta['path_offsets'][path]})]"
+        limit = self.meta["path_channels"][path]
+        if self.banded and limit >= self.end:
+            return address
+        return f"({self.guard('channel', limit)} ? {address} : Element(0))"
+
+
 def build_cg_plan(meta, planes_per_slot=1, shared_bytes=None, rows=CG_PLAN_ROWS, channel_columns=CG_PLAN_CHANNEL_COLUMNS):
     """Keep the CG values required by each packet's backward computation."""
     graph = meta["cg_dag"]
@@ -258,12 +340,11 @@ def build_cg_plan(meta, planes_per_slot=1, shared_bytes=None, rows=CG_PLAN_ROWS,
         max_slots = max(max_slots, next_slot)
 
     channels = meta["channels"]
-    uniform = meta.get("input_layout", "channels") == "channels"
-    if not uniform and any(key not in meta for key in ("input_offsets", "input_strides", "input_channels")):
+    if any(key not in meta for key in ("input_offsets", "input_strides", "input_channels")):
         raise ValueError("compact CG input layout requires explicit component addresses")
-    input_offsets = tuple(meta.get("input_offsets", range(input_dim)))
-    input_strides = tuple(meta.get("input_strides", (input_dim,) * input_dim))
-    input_channels = tuple(meta.get("input_channels", (channels,) * input_dim))
+    input_offsets = tuple(meta["input_offsets"])
+    input_strides = tuple(meta["input_strides"])
+    input_channels = tuple(meta["input_channels"])
     output_components = len(meta["output_offsets"])
     paths = meta["num_paths"]
     arrays = dict(CgNodes=cg_nodes, CgBlocks=cg_blocks, CgEdges=cg_edges,
@@ -503,15 +584,12 @@ def build_metadata(irreps_in, irreps_out, correlation, num_elements, dtype, use_
     meta = dict(build_couplings(tuple(str(irrep) for _, irrep in irreps_in),
                                 tuple(str(irrep) for _, irrep in irreps_out),
                                 correlation, dtype_name, use_reduced_cg=use_reduced_cg))
-    uniform = len({mul for mul, _ in (*irreps_in, *irreps_out)}) == 1
     input_offsets, input_strides, input_channels = [], [], []
-    component_offset = flat_offset = 0
+    flat_offset = 0
     for channels, irrep in irreps_in:
         input_channels.extend([channels] * irrep.dim)
-        input_offsets.extend(range(component_offset if uniform else flat_offset,
-                                   (component_offset if uniform else flat_offset) + irrep.dim))
-        input_strides.extend([meta["input_dim"] if uniform else irrep.dim] * irrep.dim)
-        component_offset += irrep.dim
+        input_offsets.extend(range(flat_offset, flat_offset + irrep.dim))
+        input_strides.extend([irrep.dim] * irrep.dim)
         flat_offset += channels * irrep.dim
 
     output_offsets, output_strides, output_channels, output_irreps = [], [], [], []
@@ -532,7 +610,7 @@ def build_metadata(irreps_in, irreps_out, correlation, num_elements, dtype, use_
         irreps_in=str(irreps_in), irreps_out=str(irreps_out), source_dtype=dtype_name,
         use_reduced_cg=use_reduced_cg,
         channels=max(mul for mul, _ in (*irreps_in, *irreps_out)), num_elements=num_elements,
-        input_layout="channels" if uniform else "irreps", input_size=irreps_in.dim,
+        input_size=irreps_in.dim,
         input_offsets=tuple(input_offsets), input_strides=tuple(input_strides),
         input_channels=tuple(input_channels), output_dim=irreps_out.dim,
         output_offsets=tuple(output_offsets), output_strides=tuple(output_strides),

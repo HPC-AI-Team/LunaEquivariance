@@ -44,7 +44,7 @@ not interchangeable.
 
 ```{py:method} forward(x, attrs)
 
-:param x: For uniform multiplicities, shape `(num_atoms, num_channels, num_components)`, with one copy of each input irrep concatenated on the last axis. For nonuniform multiplicities, shape `(num_atoms, irreps_in.dim)` in `mul_ir` layout.
+:param x: Shape `(num_atoms, irreps_in.dim)` in `mul_ir` layout, for both uniform and nonuniform multiplicities.
 :type x: `torch.Tensor`
 :param attrs: Floating-point element attributes of shape `(num_atoms, num_elements)`, with the same dtype as `x`. One-hot rows select an element; dense rows mix element weights linearly.
 :type attrs: `torch.Tensor`
@@ -78,7 +78,7 @@ contraction = o3.SymmetricContraction(
     dtype=torch.float32, device="cuda",
 )
 num_atoms = 1024
-x = torch.randn(num_atoms, 32, 9, device="cuda", dtype=torch.float32, requires_grad=True)
+x = torch.randn(num_atoms, contraction.irreps_in.dim, device="cuda", dtype=torch.float32, requires_grad=True)
 attrs = F.one_hot(torch.randint(4, (num_atoms,), device="cuda"), num_classes=4).to(x.dtype)
 y = contraction(x, attrs)  # (num_atoms, 128)
 y.square().mean().backward()
