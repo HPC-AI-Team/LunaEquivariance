@@ -19,6 +19,7 @@ TOPOLOGY_SOURCE = r"""
 #include <type_traits>
 #include <vector>
 #include <cooperative_groups.h>
+#include <cuda/std/functional>
 #include <cub/agent/single_pass_scan_operators.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cub/block/block_radix_rank.cuh>
@@ -150,7 +151,7 @@ __global__ void __launch_bounds__(256, 2) make_graph_kernel(
     using Scan = cub::BlockScan<Prefix, threads>;
     using CountScan = cub::BlockScan<Offset, threads>;
     using PrefixCallback = cub::TilePrefixCallbackOp<Prefix, AddGraphPrefix, cub::ScanTileState<Prefix>>;
-    using DegreeCallback = cub::TilePrefixCallbackOp<Offset, cub::Sum, cub::ScanTileState<Offset, false>>;
+    using DegreeCallback = cub::TilePrefixCallbackOp<Offset, cuda::std::plus<>, cub::ScanTileState<Offset, false>>;
     using EdgeState = cub::ScanTileState<Offset>;
     using RadixRank = cub::BlockRadixRankMatch<threads, max_radix_bits, false>;
     __shared__ union {
@@ -612,7 +613,7 @@ __global__ void __launch_bounds__(256, 2) make_graph_kernel(
             if (tile == 0) {
                 if (threadIdx.x == 0) graph.degree_scan_state.SetInclusive(0, total);
             } else {
-                DegreeCallback callback(graph.degree_scan_state, storage.degree_callback, cub::Sum{}, tile);
+                DegreeCallback callback(graph.degree_scan_state, storage.degree_callback, cuda::std::plus<>{}, tile);
                 if (threadIdx.x < 32) callback(total);
                 __syncthreads();
                 base = callback.GetExclusivePrefix();
