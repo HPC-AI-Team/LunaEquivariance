@@ -40,6 +40,17 @@ DIRECT_SCATTER_CHECK = r"""
 """.rstrip()
 
 
+WARP_EXCHANGE_SOURCE = r"""
+#if CUB_VERSION >= 300000
+template <typename T, int Items, int Threads>
+using ShuffleWarpExchange = cub::WarpExchange<T, Items, Threads, cub::WARP_EXCHANGE_SHUFFLE>;
+#else
+template <typename T, int Items, int Threads>
+using ShuffleWarpExchange = cub::WarpExchange<T, Items, Threads, 0, cub::WARP_EXCHANGE_SHUFFLE>;
+#endif
+"""
+
+
 CUDA_HEADER = r"""
 #include <ATen/core/Tensor.h>
 #include <ATen/ops/empty_like.h>
@@ -92,6 +103,8 @@ __device__ __forceinline__ void add_weight_gradient(
 }
 
 """
+
+CUDA_HEADER += WARP_EXCHANGE_SOURCE
 
 
 BLOCK_CUDA_SOURCE = r"""template<typename Index, bool WriteX, bool WriteWeights, bool AccumulateWeights = false>
@@ -856,7 +869,7 @@ def make_backward_source(meta, dtype="float32"):
             stop += 1
         width = min(channel_tile, 32 // element_bytes, 1 << ((stop - first).bit_length() - 1))
         stores += ["{", f"    Element items[{width}] = {{" + ", ".join(f"gradient[{first + item}]" for item in range(width)) + "};",
-                   f"    using Exchange = cub::WarpExchange<Element, {width}, {width}, 0, cub::WARP_EXCHANGE_SHUFFLE>;",
+                   f"    using Exchange = ShuffleWarpExchange<Element, {width}, {width}>;",
                    "    typename Exchange::TempStorage storage;",
                    "    Exchange(storage).BlockedToStriped(items, items);",
                    f"    const int local_lane = lane & {width - 1};",
@@ -1432,6 +1445,7 @@ def make_cg_packet_source(meta, dtype='float32'):
         members.extend(mapping)
         ranges.append((first, len(members)))
     code = ['#include <cuda_runtime.h>', '#include <cstdint>', '#include <cub/warp/warp_exchange.cuh>',
+            WARP_EXCHANGE_SOURCE,
             'namespace symmetric_backward_packets {',
             f'using Element={scalar};', f'constexpr int Threads={threads}, Columns={columns}, Rows=Threads/Columns;',
             f'constexpr int Channels={meta["channels"]}, NumElements={elements};',
@@ -1555,7 +1569,7 @@ __device__ __noinline__ void scatter_root(Element* dw,Element value,int element,
             else:
                 values = ','.join(f'totals[{slot(first+item)}]' for item in range(width))
                 code += ['            {', f'                Element items[{width}]={{{values}}};',
-                         f'                using Exchange=cub::WarpExchange<Element,{width},{width},0,cub::WARP_EXCHANGE_SHUFFLE>;',
+                         f'                using Exchange=ShuffleWarpExchange<Element,{width},{width}>;',
                          '                typename Exchange::TempStorage storage;',
                          '                Exchange(storage).BlockedToStriped(items,items);',
                          f'                const int component=threadIdx.x%{width};',
