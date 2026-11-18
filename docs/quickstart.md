@@ -142,8 +142,55 @@ For repeated calls, `prepare_tensor_product(..., convolution=True)` supplies a
 reusable `config=`. Preparation is optional for eager functional calls.
 
 See the [Public API](api.md) for parameters and examples for all operators,
-including [GraphSoftmax](operators/graph_softmax.md) and
-[VarlenAttention](operators/varlen_attention.md).
+including [GraphSoftmax](operators/graph_softmax.md),
+[VarlenAttention](operators/varlen_attention.md) and the `so2` operators.
+
+## Local-frame SO(2) convolution
+
+The `so2` operators compose an edge convolution by rotating node features into
+local edge frames, projecting and activating by angular order, and rotating back
+to receiver nodes:
+
+```python
+import torch
+from LunaEquivariance import make_graph, so2
+
+num_nodes, num_edges, lmax, mmax, c = 8, 24, 4, 2, 16
+dst = torch.randint(0, num_nodes, (num_edges,), device="cuda").sort().values
+src = (dst + torch.randint(1, num_nodes, (num_edges,), device="cuda")) % num_nodes
+graph = make_graph(src, dst, num_nodes=num_nodes)
+
+pos = torch.randn(num_nodes, 3, device="cuda")
+edge_dir = torch.nn.functional.normalize(pos[graph.src] - pos[graph.dst], dim=-1)
+ref = torch.randn_like(edge_dir)
+norm_z = torch.nn.functional.normalize(torch.linalg.cross(edge_dir, ref), dim=-1)
+norm_y = torch.linalg.cross(norm_z, edge_dir)
+frames = torch.stack((norm_z, edge_dir, norm_y), dim=1)  # (num_edges, 3, 3): row 1 aligns with the edge
+
+x = torch.randn(num_nodes, (lmax + 1) ** 2, c, device="cuda", requires_grad=True)
+rot = so2.rotation(frames, lmax=lmax, mmax=mmax)
+
+num_groups = sum(lmax + 1 - m for m in range(mmax + 1))
+radial = torch.randn(num_edges, 2 * c * num_groups, device="cuda", requires_grad=True)
+sectors = so2.rotate_gather(x, rot, radial, graph, lmax=lmax, mmax=mmax)
+
+w1 = (
+    torch.randn((2 * lmax + 1) * c, (lmax + 1) * 2 * c, device="cuda", requires_grad=True),
+    *(torch.randn(2 * (lmax + 1 - m) * c, (lmax + 1 - m) * 2 * c, device="cuda", requires_grad=True)
+      for m in range(1, mmax + 1)),
+)
+w2 = (
+    torch.randn((lmax + 1) * c, (lmax + 1) * c, device="cuda", requires_grad=True),
+    *(torch.randn(2 * (lmax + 1 - m) * c, (lmax + 1 - m) * c, device="cuda", requires_grad=True)
+      for m in range(1, mmax + 1)),
+)
+sectors, _ = so2.recombine_activate(
+    so2.linear(sectors, w1, lmax=lmax, mmax=mmax), lmax=lmax, mmax=mmax,
+)
+raw = so2.linear(sectors, w2, lmax=lmax, mmax=mmax)
+out = so2.inverse_rotate_reduce(raw, rot, graph, lmax=lmax, mmax=mmax)  # (num_nodes, (lmax + 1) ** 2, c)
+out.square().mean().backward()
+```
 
 ## Shape notation
 

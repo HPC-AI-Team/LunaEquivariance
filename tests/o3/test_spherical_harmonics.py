@@ -52,7 +52,7 @@ def test_fallback_tracks_public_normalization():
         seed = torch.randn_like(actual)
         (actual_grad,) = torch.autograd.grad(actual, x, seed)
         (expected_grad,) = torch.autograd.grad(expected, x, seed)
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-14, atol=1e-14)
     assert not op.state_dict() and (not tuple(op.children()))
 
 

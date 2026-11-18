@@ -1,5 +1,6 @@
 """Content-addressed CUDA extensions with recoverable, per-build locking."""
 
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -50,6 +51,89 @@ def compiler_identity(command, search_path):
         raise RuntimeError(f"Compiler not found: {command}")
     version = subprocess.check_output([executable, "--version"], text=True)
     return str(Path(executable).resolve()), version
+
+
+def native_cache_root():
+    root = os.environ.get("LUNAEQ_CACHE_DIR")
+    if not root:
+        extensions = os.environ.get("TORCH_EXTENSIONS_DIR") or cpp_extension.get_default_build_root()
+        root = Path(extensions) / "lunaeq"
+    return Path(root).expanduser().resolve() / "so2-inference"
+
+
+def build_cuda_library(filename, source, arch, *, flags=()):
+    """Compile a standalone CUDA or C++ translation unit with a C ABI."""
+    toolkit = os.environ.get("CUDA_HOME") or cpp_extension.CUDA_HOME
+    nvcc = str(Path(toolkit) / "bin" / "nvcc") if toolkit else shutil.which("nvcc")
+    if not nvcc or not Path(nvcc).is_file():
+        raise RuntimeError("Set CUDA_HOME or add nvcc to PATH to build SO(2) inference kernels.")
+
+    options = ("-O3", f"-arch=sm_{arch}", "--shared", "-Xcompiler=-fPIC", *flags)
+    compiler = compiler_identity(nvcc, os.environ.get("PATH", ""))
+    digest = hashlib.sha256(source.encode())
+    digest.update(repr((compiler, options)).encode())
+    for flag in flags:
+        if flag.startswith("-I"):
+            version = Path(flag[2:]) / "cutlass" / "version.h"
+            if version.is_file():
+                digest.update(version.read_bytes())
+    root = native_cache_root() / digest.hexdigest()[:24]
+    library = root / Path(filename).with_suffix(".so")
+    if not library.is_file():
+        root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=root) as directory:
+            source_path = Path(directory) / filename
+            source_path.write_text(source, encoding="utf-8")
+            output = Path(directory) / library.name
+            subprocess.run(
+                [nvcc, *options, str(source_path), "-o", str(output)],
+                env={**os.environ, "TMPDIR": directory},
+                check=True,
+            )
+            output.replace(library)
+    return library
+
+
+def load_cuda_library(filename, source, arch, *, flags=()):
+    return ctypes.CDLL(str(build_cuda_library(filename, source, arch, flags=flags)))
+
+
+def load_dispatch(name, sources, *, arch, link=()):
+    """Build and register a Torch dispatcher with an explicit CUDA target."""
+    sources = tuple(sources)
+    digest = hashlib.sha256(repr((sources, arch, link)).encode()).hexdigest()[:24]
+    directory = native_cache_root() / digest / name
+    directory.mkdir(parents=True, exist_ok=True)
+    source_paths = []
+    for filename, source in sources:
+        path = directory / filename
+        if not path.is_file():
+            with tempfile.TemporaryDirectory(dir=directory) as temporary:
+                pending = Path(temporary) / filename
+                pending.write_text(source, encoding="utf-8")
+                pending.replace(path)
+        source_paths.append(str(path))
+
+    # Torch consults this setting even when the CUDA flags include a target.
+    with compilation_jobs():
+        previous = os.environ.get("TORCH_CUDA_ARCH_LIST")
+        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{arch[:-1]}.{arch[-1]}"
+        try:
+            cpp_extension.load(
+                name=name,
+                sources=source_paths,
+                build_directory=str(directory),
+                extra_cflags=["-O3"],
+                extra_cuda_cflags=["-O3", "-lineinfo"],
+                extra_ldflags=[str(path) for path in link],
+                with_cuda=True,
+                is_python_module=False,
+            )
+        finally:
+            if previous is None:
+                del os.environ["TORCH_CUDA_ARCH_LIST"]
+            else:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = previous
 
 
 def load_extension(
