@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "LunaEquivariance"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance SO(3)-equivariant operators for graph neural networks."
 readme = "README.md"
 authors = [{name = "HPC-AI-Team"}]
