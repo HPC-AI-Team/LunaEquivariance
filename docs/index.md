@@ -1,9 +1,9 @@
 # Luna<wbr>Equivariance
 
-High-performance SO(3)-equivariant operators for graph neural networks.
+High-performance SO(3)- and SO(2)-equivariant operators for graph neural networks.
 
 - **Performance:** order-of-magnitude speedups across a range of operators.
-- **Operator coverage:** equivariant layers, fused graph convolutions and attention.
+- **Operator coverage:** equivariant layers, fused graph convolutions, local-frame SO(2) operators and attention.
 - **Differentiation and precision:** derivatives up to third order, with FP32/FP64 support.
 - **PyTorch integration:** easy integration into PyTorch models, with `torch.compile` support.
 
@@ -45,5 +45,15 @@ If you use LunaEquivariance in your research, please cite:
     eprint={2610.18393},
     archivePrefix={arXiv},
     url={https://arxiv.org/abs/2610.18393},
+}
+
+@misc{wang2026trimso2,
+    title={{TrimSO(2)}: Fast and Memory-Efficient Training of Equivariant Interatomic Potentials},
+    author={Chen Wang and Yuanchang Zhou and Guangming Tan and Mingzhen Li and Weile Jia},
+    year={2026},
+    eprint={2610.20029},
+    archivePrefix={arXiv},
+    primaryClass={cs.DC},
+    url={https://arxiv.org/abs/2610.20029},
 }
 ```

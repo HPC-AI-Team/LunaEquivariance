@@ -54,6 +54,36 @@ The following operators are available as modules and functions. See the
    * - :doc:`TensorProductConv <operators/tensor_product_conv>`
      - FP32/FP64
      - Fused graph convolutions with ``uuu``, ``uvu`` and ``uvw`` connections
+   * - :doc:`so2.rotation <operators/so2/rotation>`
+     - FP32
+     - Compact Wigner-D rotation rows from local coordinate frames
+   * - :doc:`so2.rotate_gather <operators/so2/rotate_gather>`
+     - FP32
+     - Fused endpoint gather, rotation and radial scaling by angular order
+   * - :doc:`so2.linear <operators/so2/linear>`
+     - FP16/BF16/FP32/FP64
+     - Order-wise linear projection on local-frame sectors
+   * - :doc:`so2.recombine_activate <operators/so2/recombine_activate>`
+     - FP32
+     - Complex recombination with gated or spherical-grid activation
+   * - :doc:`so2.inverse_rotate_reduce <operators/so2/inverse_rotate_reduce>`
+     - FP32
+     - Complex recombination, inverse rotation and receiver-node aggregation
+   * - :doc:`so2.attention_scores <operators/so2/attention_scores>`
+     - FP32
+     - Fused LayerNorm, SmoothLeakyReLU and head-wise attention projection
+   * - :doc:`so2.feed_forward <operators/so2/feed_forward>`
+     - FP32
+     - Gated coefficient or grid-factor equivariant feed-forward network
+   * - :doc:`so2.radial_network <operators/so2/radial_network>`
+     - FP32
+     - Fused three-layer radial MLP with optional atom-type embeddings
+   * - :doc:`so2.segmented_linear <operators/so2/segmented_linear>`
+     - FP16/BF16/FP32/FP64
+     - Segment-wise linear maps with mixed expert weights
+   * - :doc:`so2.models.optimize <operators/so2/optimize>`
+     - FP32
+     - In-place SO(2) operator integration for eSEN, UMA and EquiformerV3
 
 - Requires an NVIDIA GPU with compute capability 8.0 or later.
 - All operators support derivatives up to third order.

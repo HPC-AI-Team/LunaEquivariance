@@ -28,7 +28,7 @@ from .nn.activation.interface import activation
 from .nn.gate.interface import gate
 from .nn.norm_activation.interface import norm_activation
 from .nn.equ_norm.interface import equivariant_norm
-from . import nn, o3
+from . import nn, o3, so2
 
 # Match e3nn's spherical-harmonics function in the o3 namespace.
 o3.spherical_harmonics = spherical_harmonics
@@ -124,6 +124,7 @@ __all__ = [
     "dropout",
     "o3",
     "nn",
+    "so2",
     "LunaEq",
     "LunaEquivariance",
     "LunaEqEquivariantNorm",

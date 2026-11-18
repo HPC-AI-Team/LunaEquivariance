@@ -4,12 +4,12 @@
   <img src="docs/_static/logo.svg" alt="LunaEquivariance" width="480">
 </p>
 
-High-performance SO(3)-equivariant operators for graph neural networks.
+High-performance SO(3)- and SO(2)-equivariant operators for graph neural networks.
 
 ## Features
 
 - **Performance:** order-of-magnitude speedups (peaking at over 1000×, with 500× memory reduction).
-- **Operator coverage:** equivariant layers, fused graph convolutions and attention.
+- **Operator coverage:** equivariant layers, fused graph convolutions, local-frame SO(2) operators and attention.
 - **Differentiation and precision:** derivatives up to third order, with FP32/FP64 support.
 - **PyTorch integration:** easy integration into PyTorch models, with `torch.compile` and `AOTInductor` support.
 
@@ -32,12 +32,16 @@ See the [documentation](https://hpc-ai-team.github.io/LunaEquivariance/) for ins
 | Activations and regularization | [`nn.Activation`](https://hpc-ai-team.github.io/LunaEquivariance/operators/activation.html), [`nn.Gate`](https://hpc-ai-team.github.io/LunaEquivariance/operators/gate.html), [`nn.NormActivation`](https://hpc-ai-team.github.io/LunaEquivariance/operators/norm_activation.html), [`nn.Dropout`](https://hpc-ai-team.github.io/LunaEquivariance/operators/dropout.html) |
 | Normalization | [`nn.EquivariantNorm`](https://hpc-ai-team.github.io/LunaEquivariance/operators/equivariant_norm.html), [`nn.GraphSoftmax`](https://hpc-ai-team.github.io/LunaEquivariance/operators/graph_softmax.html) |
 | Self-attention | [`nn.VarlenAttention`](https://hpc-ai-team.github.io/LunaEquivariance/operators/varlen_attention.html), [`nn.VarlenAttentionConv`](https://hpc-ai-team.github.io/LunaEquivariance/operators/varlen_attention_conv.html) |
+| Local-frame SO(2) | [`so2.rotation`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/rotation.html), [`so2.rotate_gather`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/rotate_gather.html), [`so2.linear`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/linear.html), [`so2.recombine_activate`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/recombine_activate.html), [`so2.inverse_rotate_reduce`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/inverse_rotate_reduce.html), [`so2.attention_scores`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/attention_scores.html), [`so2.feed_forward`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/feed_forward.html), [`so2.radial_network`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/radial_network.html), [`so2.segmented_linear`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/segmented_linear.html), [`so2.models.optimize`](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/optimize.html) |
 
 ## How to use LunaEquivariance
 
 LunaEquivariance provides module and functional interfaces. See the
 [API reference](https://hpc-ai-team.github.io/LunaEquivariance/api.html) for operator usage and
 [examples](examples/) for training and e3nn integration.
+
+To apply the SO(2) operators to an existing eSEN, UMA or EquiformerV3 model, see
+the [model integration guide](https://hpc-ai-team.github.io/LunaEquivariance/operators/so2/optimize.html).
 
 UVU tensor product convolution using the module interface:
 
@@ -127,6 +131,16 @@ If you use LunaEquivariance in your research, please cite:
     eprint={2610.18393},
     archivePrefix={arXiv},
     url={https://arxiv.org/abs/2610.18393},
+}
+
+@misc{wang2026trimso2,
+    title={{TrimSO(2)}: Fast and Memory-Efficient Training of Equivariant Interatomic Potentials},
+    author={Chen Wang and Yuanchang Zhou and Guangming Tan and Mingzhen Li and Weile Jia},
+    year={2026},
+    eprint={2610.20029},
+    archivePrefix={arXiv},
+    primaryClass={cs.DC},
+    url={https://arxiv.org/abs/2610.20029},
 }
 ```
 

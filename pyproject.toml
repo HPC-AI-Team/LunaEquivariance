@@ -11,7 +11,7 @@ authors = [{name = "HPC-AI-Team"}]
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "src/third_party/cutlass/LICENSE.txt"]
 requires-python = ">=3.10"
-dependencies = ["torch>=2.8,<3", "numpy", "ninja", "e3nn>=0.5.2,<0.7"]
+dependencies = ["torch>=2.8,<3", "triton>=3.3", "numpy", "ninja", "e3nn>=0.5.2,<0.7"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: C++",
@@ -87,6 +87,30 @@ packages = [
     "LunaEquivariance.o3.spherical_harmonics.kernels",
     "LunaEquivariance.o3.symmetric_contraction",
     "LunaEquivariance.o3.symmetric_contraction.kernels",
+    "LunaEquivariance.so2",
+    "LunaEquivariance.so2.attention_scores",
+    "LunaEquivariance.so2.attention_scores.kernels",
+    "LunaEquivariance.so2.feed_forward",
+    "LunaEquivariance.so2.feed_forward.kernels",
+    "LunaEquivariance.so2.rotate_gather",
+    "LunaEquivariance.so2.rotate_gather.kernels",
+    "LunaEquivariance.so2.inverse_rotate_reduce",
+    "LunaEquivariance.so2.inverse_rotate_reduce.kernels",
+    "LunaEquivariance.so2.linear",
+    "LunaEquivariance.so2.linear.kernels",
+    "LunaEquivariance.so2.models",
+    "LunaEquivariance.so2.models.esen",
+    "LunaEquivariance.so2.models.equiformer_v3",
+    "LunaEquivariance.so2.models.uma",
+    "LunaEquivariance.so2.radial_network",
+    "LunaEquivariance.so2.radial_network.kernels",
+    "LunaEquivariance.so2.recombine_activate",
+    "LunaEquivariance.so2.recombine_activate.kernels",
+    "LunaEquivariance.so2.rotation",
+    "LunaEquivariance.so2.rotation.kernels",
+    "LunaEquivariance.so2.segmented_linear",
+    "LunaEquivariance.so2.segmented_linear.kernels",
+    "LunaEquivariance.so2.utils",
     "LunaEquivariance.utils",
 ]
 include-package-data = false
