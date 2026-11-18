@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Add [TrimSO(2)](https://arxiv.org/abs/2610.20029) operators and `so2.models.optimize(model)` for eSEN, UMA, and EquiformerV3. ([#4](https://github.com/HPC-AI-Team/LunaEquivariance/pull/4))
+- Fix CUDA 13.x build errors in graph construction and symmetric contraction. ([#3](https://github.com/HPC-AI-Team/LunaEquivariance/pull/3))
+- Optimize CUDA kernels for `EquivariantNorm`, `GraphSoftmax`, and `SymmetricContraction`. ([#2](https://github.com/HPC-AI-Team/LunaEquivariance/pull/2))
+- **API change:** `o3.SymmetricContraction` now requires 2D `mul_ir` input of shape `(num_atoms, irreps_in.dim)`. ([#2](https://github.com/HPC-AI-Team/LunaEquivariance/pull/2))
+  
 ## 0.2.0
 
 ### New operator
